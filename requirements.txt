@@ -1,0 +1,4 @@
+pdfminer
+pdfminer.six
+scikit-learn
+matplotlib

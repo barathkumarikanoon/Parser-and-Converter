@@ -81,6 +81,7 @@ class TextBuilder:
             texts = TextBuilder.extract_text_from_each_lines(box)
             if TextBuilder.is_heading(TextBuilder.get_textBox_coords(box)):
                 print(texts)
+                pass
 
     @staticmethod
     def get_stats_of_textbox(pages):
