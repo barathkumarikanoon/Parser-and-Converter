@@ -1,0 +1,11 @@
+Page    Expected                      Actual                        Result
+1       single_column_page            page_may have mulitple columns   FAIL
+2       single_column_page            single_column_page              PASS
+3       single_column_page            page_may have mulitple columns   FAIL
+4       single_column_page            page_may have mulitple columns   FAIL
+5       single_column_page            single_column_page              PASS
+6       single_column_page            page_may have mulitple columns   FAIL
+7       page_may have mulitple columns   page_may have mulitple columns   PASS
+8       page_may have mulitple columns   page_may have mulitple columns   PASS
+9       page_may have mulitple columns   page_may have mulitple columns   PASS
+10      page_may have mulitple columns   page_may have mulitple columns   PASS

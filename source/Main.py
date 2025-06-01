@@ -9,8 +9,11 @@ class Main:
         for pg in pages:
             page = Page(pg)
             page.process_textboxes(pg)
-            print(page.width_binning())
+            page.get_width_ofTB_moreThan_Half_of_pg()
+            page.get_body_width_by_binning()
+            page.get_page_layout()
 
+            
     def parsePDF(self,pdf_path):
         base_name_of_file = os.path.splitext(os.path.basename(pdf_path))[0]
         self.parserTool.convert_to_xml(pdf_path,base_name_of_file)
@@ -21,11 +24,6 @@ class Main:
 
 
 if __name__ == "__main__":
-    pdf_path = r'in-union-act-ministryofcivilaviation-2025-04-16-17-publication-document.pdf'  # 👈 Replace with your PDF path
+    pdf_path = r'naturalgas.pdf'  # 👈 Replace with your PDF path
     main = Main()
     main.parsePDF(pdf_path)
-
-
-
-    
-    
