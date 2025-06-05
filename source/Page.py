@@ -21,18 +21,27 @@ class Page:
         textBoxes = pg.findall(".//textbox")
         for tb in textBoxes:
             self.all_tbs.append(TextBox(tb))
-    
 
     def get_side_notes(self):
-        for tb in self.all_tbs:
-            if tb.coords[0]< self.body_startX or tb.coords[0] > self.body_endX:
-                self.side_notes.append(tb)
-        self.print_tbs()
+        if not hasattr(self, 'body_startX') or not hasattr(self, 'body_endX'):
+            return  # Skip if body region not defined
         
+        for tb in self.all_tbs:
+            if (tb.coords[2]< self.body_startX or tb.coords[0] > self.body_endX ) and (tb not in self.header_tbs) and tb.height < 0.25 * self.pg_height and tb.width < 0.25 * self.pg_width:
+                if  tb.extract_text_from_tb().strip():
+                    self.side_notes.append(tb)
+        
+    # def print_headers(self):
+    #     for tb in self.header_tbs:
+    #         print(tb.extract_text_from_tb())
     
-    def print_tbs(self):
-        for tb in self.side_notes:
-            print(tb.process_tb())
+    # def print_footers(self):
+    #     for tb in self.footer_tbs:
+    #         print(tb.extract_text_from_tb())
+
+    # def print_sidenotes(self):
+    #     for tb in self.side_notes:
+    #         print(tb.extract_text_from_tb())
 
     
     def  get_width_ofTB_moreThan_Half_of_pg(self):
@@ -81,9 +90,12 @@ class Page:
 
         return round((self.body_endX - self.body_startX),2)
     
-
+    
     def get_body_width_by_binning(self):
-        self.body_width = self.cluster_coord_with_max_height_span(self.fiftyPercent_moreWidth_tbs)
+        if self.fiftyPercent_moreWidth_tbs:
+            self.body_width = self.cluster_coord_with_max_height_span(self.fiftyPercent_moreWidth_tbs)
+        else:
+            self.body_width = self.cluster_coord_with_max_height_span_v1(self.all_tbs) - self.cluster_coord_with_max_height_span_v2(self.all_tbs) 
         
     
     # def get_body_width(self):

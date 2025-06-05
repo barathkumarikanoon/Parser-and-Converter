@@ -6,8 +6,9 @@ class Main:
     def __init__(self):
         self.parserTool = ParserTool()
         self.total_pgs = 0
-
-    def process_pages(self,pages):
+        self.all_pgs = {}
+    
+    def get_page_header_footer(self,pages):
         self.sorted_footer_units = []
         self.sorted_header_units = []
         self.headers_footers = []
@@ -16,13 +17,20 @@ class Main:
         for pg in pages:
             page = Page(pg)
             self.total_pgs +=1
+            self.all_pgs[self.total_pgs]=page
             page.process_textboxes(pg)
-            page.get_width_ofTB_moreThan_Half_of_pg()
             self.contour_header_footer_of_page(page)
-            page.get_body_width_by_binning()
-            page.is_single_column_page()
-        
         self.process_footer_and_header()
+        self.set_page_headers_footers()
+
+
+    def process_pages(self):
+        for page in self.all_pgs.values():
+            page.get_width_ofTB_moreThan_Half_of_pg()
+            page.get_body_width_by_binning()
+            is_single_column = page.is_single_column_page()
+            page.get_side_notes()
+            
 
 
     def contour_header_footer_of_page(self,pg):
@@ -67,21 +75,29 @@ class Main:
         header_area_units = sorted(header_area_units, key=lambda d: d['y0'], reverse=True)
         self.sorted_footer_units.append(footer_area_units)
         self.sorted_header_units.append(header_area_units)
-        headers = sorted(headers, key=lambda d: d['x0'], reverse=False )
-        headers = (el['para'] for el in headers if el['para'].strip())
+        headers = sorted(headers, key=lambda d: d['x0'], reverse=False)
         footers = sorted(footers, key=lambda d: d['x0'], reverse=False)
-        footers = (el['para'] for el in footers if el['para'].strip())
-        header = '!!??!!'.join(headers)
-        footer = '!!??!!'.join(footers)
-        # print({'page':pg.pg_num,'header':" ".join(header.split()),'footer':" ".join(footer.split())})
-        self.headers_footers.append({'page':pg.pg_num,'header':" ".join(header.split()),'footer':" ".join(footer.split())})
+        headers = [el for el in headers if el['para'].strip()]
+        footers = [el for el in footers if el['para'].strip()]
+        headers = [el for el in headers if el['para'].strip()]
+        footers = [el for el in footers if el['para'].strip()]
+        header = '!!??!!'.join(el['para'] for el in headers)
+        footer = '!!??!!'.join(el['para'] for el in footers)
+        self.headers_footers.append({
+    'page': pg.pg_num,
+    'header': " ".join(header.split()),
+    'footer': " ".join(footer.split()),
+    'header_units': headers,
+    'footer_units': footers })
+        
 
     def process_footer_and_header(self):
-        def similar(table, miner):
-            return SequenceMatcher(None, table, miner).ratio()
+        def similar(text1, text2):
+            return SequenceMatcher(None, text1, text2).ratio()
         
+        MAX_HEADER_FOOTER_DEPTH = 100
         counter_in_loop_hf = 0
-        while True:
+        while counter_in_loop_hf < MAX_HEADER_FOOTER_DEPTH:
             units_with_same_index = []
             i_break = False
             for el in self.sorted_footer_units:
@@ -107,7 +123,7 @@ class Main:
             counter_in_loop_hf +=1
         #_____________
         counter_in_loop_hf = 0
-        while True:
+        while counter_in_loop_hf < MAX_HEADER_FOOTER_DEPTH:
             units_with_same_index = []
             i_break = False
             for el in self.sorted_header_units:
@@ -142,10 +158,31 @@ class Main:
                     counter_h +=1
 
             if counter_f >= 0.05 * self.total_pgs :
-                self.footers.append({'page':el['page'],'footers':el['footer'].split(sep='!!??!!')})
-            if counter_h >= 0.05 * self.total_pgs:
-                self.headers.append({'page':el['page'],'headers':el['header'].split(sep='!!??!!')})
+                self.footers.append({
+                    'page': int(el['page']),
+                    'footers': [{'para': unit['para'], 'tb': unit['tb']} for unit in el.get('footer_units', [])]})
 
+            if counter_h >= 0.05 * self.total_pgs:
+                self.headers.append({
+                'page': int(el['page']),
+                'headers': [{'para': unit['para'], 'tb': unit['tb']} for unit in el.get('header_units', [])]
+                })
+
+
+    def set_page_headers_footers(self):
+        for pg in self.headers:
+            for textbox in pg['headers']:
+                self.all_pgs[int(pg['page'])].header_tbs.append(textbox['tb'])
+        
+        for pg in self.footers:
+            for textbox in pg['footers']:
+                self.all_pgs[int(pg['page'])].footer_tbs.append(textbox['tb'])
+
+        del self.sorted_footer_units
+        del self.sorted_header_units
+        del self.headers_footers
+        del self.headers
+        del self.footers
 
         
 
@@ -155,11 +192,11 @@ class Main:
         self.parserTool.convert_to_xml(pdf_path,base_name_of_file)
         xml_path = f"{base_name_of_file}.xml"
         pages = self.parserTool.get_pages_from_xml(xml_path)
-
-        self.process_pages(pages)
+        self.get_page_header_footer(pages)
+        self.process_pages()
 
 
 if __name__ == "__main__":
-    pdf_path = r'/home/barath-kumar/Documents/IKanoon/Parser-and-Converter/in-union-act-ministryofcivilaviation-2025-04-16-17-publication-document.pdf'  # 👈 Replace with your PDF path
+    pdf_path = r'/home/barath-kumar/Documents/IKanoon/Parser-and-Converter/test/TestSample.pdf'  # 👈 Replace with your PDF path
     main = Main()
     main.parsePDF(pdf_path)
