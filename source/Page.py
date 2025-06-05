@@ -1,11 +1,15 @@
-from source.TextBox import TextBox
+from TextBox import TextBox
 from sklearn.cluster import DBSCAN
 import numpy as np
 
 class Page:
     def __init__(self,pg):
         self.pg_width, self.pg_height = self.get_pg_coords(pg)
-        self.list_of_tbs = []
+        self.pg_num = pg.attrib["id"]
+        self.all_tbs = []
+        self.header_tbs = []
+        self.footer_tbs = []
+        self.side_notes = []
 
     def get_pg_coords(self,pg):
         coords = tuple(map(float, pg.attrib["bbox"].split(",")))
@@ -16,24 +20,33 @@ class Page:
     def process_textboxes(self,pg):
         textBoxes = pg.findall(".//textbox")
         for tb in textBoxes:
-            self.list_of_tbs.append(TextBox(tb))
+            self.all_tbs.append(TextBox(tb))
+    
+
+    def get_side_notes(self):
+        for tb in self.all_tbs:
+            if tb.coords[0]< self.body_startX or tb.coords[0] > self.body_endX:
+                self.side_notes.append(tb)
+        self.print_tbs()
+        
+    
+    def print_tbs(self):
+        for tb in self.side_notes:
+            print(tb.process_tb())
+
     
     def  get_width_ofTB_moreThan_Half_of_pg(self):
         self.fiftyPercent_moreWidth_tbs = []
-        for tb in self.list_of_tbs:
+        for tb in self.all_tbs:
             if round(tb.width,2) >= 0.5 * self.pg_width :
                 self.fiftyPercent_moreWidth_tbs.append(tb)
     
-    def get_page_layout(self):
-        try :
+    def is_single_column_page(self):
             sum_height_of_tbs = round(sum([tb.height for tb in self.fiftyPercent_moreWidth_tbs]),2)
             if sum_height_of_tbs > 0.4 * self.pg_height:
-                return "single_column_page"
+                return True 
             else:
-                return "page_may have mulitple columns"
-        
-        except Exception as e:
-            return e
+                return False
 
     def cluster_coord_with_max_height_span(self, textboxes, eps=8, min_samples=2):
         if not textboxes:
@@ -63,11 +76,30 @@ class Page:
             return None
 
         # Calculate bounding box of best cluster
-        min_x0 = min(tb.coords[0] for tb in best_cluster)
-        max_x2 = max(tb.coords[2] for tb in best_cluster)
+        self.body_startX = min(tb.coords[0] for tb in best_cluster)
+        self.body_endX = max(tb.coords[2] for tb in best_cluster)
 
-        return round((max_x2 - min_x0),2)
+        return round((self.body_endX - self.body_startX),2)
     
 
     def get_body_width_by_binning(self):
         self.body_width = self.cluster_coord_with_max_height_span(self.fiftyPercent_moreWidth_tbs)
+        
+    
+    # def get_body_width(self):
+    #     def findStartX():
+    #         minVal = float("inf")
+    #         for tb in self.fiftyPercent_moreWidth_tbs:
+    #             minVal = min(tb.coords[0],minVal)
+    #         return minVal
+        
+    #     def findEndX():
+    #         maxVal = float("-inf")
+    #         for tb in self.fiftyPercent_moreWidth_tbs:
+    #             maxVal = max(tb.coords[2],maxVal)
+    #         return maxVal
+
+    #     self.body_startX = findStartX()   
+    #     self.body_endX = findEndX() 
+    #     self.body_width = self.body_endX - self.body_startX
+    #     print("Body start and end:",self.body_startX,self.body_endX)
