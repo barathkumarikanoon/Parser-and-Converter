@@ -8,6 +8,7 @@ class Main:
         self.total_pgs = 0
         self.all_pgs = {}
     
+    # --- look for page header,footer of all pages ---
     def get_page_header_footer(self,pages):
         self.sorted_footer_units = []
         self.sorted_header_units = []
@@ -23,7 +24,7 @@ class Main:
         self.process_footer_and_header()
         self.set_page_headers_footers()
 
-
+    # --- classify the page texboxes ---
     def process_pages(self):
         for page in self.all_pgs.values():
             page.get_width_ofTB_moreThan_Half_of_pg()
@@ -31,8 +32,7 @@ class Main:
             is_single_column = page.is_single_column_page()
             page.get_side_notes()
             
-
-
+    # --- in each page do contour to detect possible header/footer content ---
     def contour_header_footer_of_page(self,pg):
         units = []
         for tb in pg.all_tbs:
@@ -90,7 +90,7 @@ class Main:
     'header_units': headers,
     'footer_units': footers })
         
-
+    #  --- Detection of proper header/footer by squence matcher across all pages ---
     def process_footer_and_header(self):
         def similar(text1, text2):
             return SequenceMatcher(None, text1, text2).ratio()
@@ -168,7 +168,7 @@ class Main:
                 'headers': [{'para': unit['para'], 'tb': unit['tb']} for unit in el.get('header_units', [])]
                 })
 
-
+    # --- once detected set the header and footer of the page, apply to their page object ---
     def set_page_headers_footers(self):
         for pg in self.headers:
             for textbox in pg['headers']:
@@ -184,9 +184,7 @@ class Main:
         del self.headers
         del self.footers
 
-        
-
-            
+    # --- parse pdf using pdfminer to convert to XML ---       
     def parsePDF(self,pdf_path):
         base_name_of_file = os.path.splitext(os.path.basename(pdf_path))[0]
         self.parserTool.convert_to_xml(pdf_path,base_name_of_file)

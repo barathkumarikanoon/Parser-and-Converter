@@ -6,7 +6,7 @@ class TextBox:
         self.width = self.coords[2] - self.coords[0]
         
 
-    
+    # --- get texts from the textbox ---
     def extract_text_from_tb(self):
         all_text = []
         for textline in self.tbox.findall('.//textline'):
