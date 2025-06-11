@@ -1,14 +1,17 @@
 from TextBox import TextBox
+from TableExtraction import TableExtraction
 from sklearn.cluster import DBSCAN
 import numpy as np
 import re
 
-
 class Page:
-    def __init__(self,pg):
+    def __init__(self,pg,pdfPath):
+        self.pdf_path = pdfPath
         self.pg_width, self.pg_height = self.get_pg_coords(pg)
         self.pg_num = pg.attrib["id"]
         self.all_tbs = {}
+        self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num)
+    
 
     # --- func for getting page coordinates, height, width ---
     def get_pg_coords(self,pg):
@@ -21,7 +24,9 @@ class Page:
     def process_textboxes(self,pg):
         textBoxes = pg.findall(".//textbox")
         for tb in textBoxes:
-            self.all_tbs[TextBox(tb)] = None
+            tb_obj = TextBox(tb)
+            if tb_obj.extract_text_from_tb().strip():
+                self.all_tbs[tb_obj] = None
 
     # --- func for gathering the sidenotes textboxes ---
     def get_side_notes(self):
@@ -55,7 +60,23 @@ class Page:
 
         for tb in self.all_tbs:
             # Skip known structural blocks
-            if self.all_tbs.get(tb) in ("header", "footer", "side notes"):
+            if self.all_tbs.get(tb) is not None:
+                continue
+
+            if  tb.is_titlecase():
+                self.all_tbs[tb] = "title"
+                continue
+
+            if  tb.textFont_is_bold():
+                self.all_tbs[tb] = "title"
+                continue
+            
+            if  tb.is_uppercase():
+                self.all_tbs[tb] = "title"
+                continue
+
+            if tb.textFont_is_italic():
+                self.all_tbs[tb] = "title"
                 continue
 
             # Centered within tolerance
@@ -75,27 +96,17 @@ class Page:
                         self.all_tbs[tb] = "title"
                         continue
 
-            if self.all_tbs[tb] is None and tb.is_titlecase():
-                self.all_tbs[tb] = "title"
-                continue
-
-            if self.all_tbs[tb] is None and tb.textFont_is_bold():
-                self.all_tbs[tb] = "title"
-                continue
             
-            if self.all_tbs[tb] is None and tb.is_uppercase():
-                self.all_tbs[tb] = "title"
-                continue
-
-            if self.all_tbs[tb] is None and tb.textFont_is_italic():
-                self.all_tbs[tb] = "title"
-                continue
 
     def print_section_para(self):
         print("i'm from section para")
         for tb,label in self.all_tbs.items():
             if label in set(["section","para","subsection","subpara"]):
                 print(tb.extract_text_from_tb())
+    
+    def print_all(self):
+        for tb,label in self.all_tbs.items():
+            print("i'm from ",label,": ",tb.extract_text_from_tb())
 
     def print_titles(self):
         print("i'm from headings")
@@ -120,6 +131,13 @@ class Page:
         print("i'm from sidenotes")
         for tb,label in self.all_tbs.items():
             if label == "side notes":
+                print(tb.extract_text_from_tb())
+
+    def print_table_content(self):
+        print("i'm from table contents")
+        for tb,label in self.all_tbs.items():
+            if isinstance(label, tuple) and label[0] == "table":
+                print("From table:",label[1])
                 print(tb.extract_text_from_tb())
 
     #  --- func to find the tbs which has more than 50% of page width ---
@@ -192,7 +210,7 @@ class Page:
 
         return round(self.body_endX - self.body_startX, 2)
     
-
+    # --- func to find section, subsection, para, subpara ---
     def get_section_para(self):
         section_re = re.compile(r'^\s*\d+\.\s*\S+', re.IGNORECASE)         # 1. Clause text
         subsection_re = re.compile(r'^\s*\(\d+\)\s*\S+', re.IGNORECASE)    # (1) Clause text
@@ -216,7 +234,24 @@ class Page:
 
             if self.all_tbs[tb] is None and subpara_re.match(texts.strip()):
                 self.all_tbs[tb] = "subpara"
-                continue
+                continue 
 
+    # --- func to label the textboxes comes in table layout ---
+    def label_table_tbs(self):
+        def bbox_satisfies(tb_box,table_box,tolerance = 2):
+            x_min_table, y_min_table, x_max_table, y_max_table = table_box
+            x_min_textbox, y_min_textbox, x_max_textbox, y_max_textbox = tb_box
 
-
+            return (
+                    round(x_min_textbox, 2) >= round(x_min_table, 2) - tolerance and
+                    round(y_min_textbox, 2) >= round(y_min_table, 2) - tolerance and
+                    round(x_max_textbox, 2) <= round(x_max_table, 2) + tolerance and
+                    round(y_max_textbox, 2) <= round(y_max_table, 2) + tolerance
+                )
+                        
+        
+        for idx,tab_bbox in self.tabular_datas.table_bbox.items():
+            for tb in self.all_tbs.keys():
+                if self.all_tbs[tb] is None and bbox_satisfies(tb.coords,tab_bbox):
+                    self.all_tbs[tb] = ("table",idx)
+                    

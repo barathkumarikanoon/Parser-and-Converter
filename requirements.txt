@@ -1,4 +1,6 @@
-pdfminer
 pdfminer.six
 scikit-learn
 matplotlib
+camelot-py[cv]
+pandas
+numpy

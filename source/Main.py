@@ -3,12 +3,13 @@ from difflib import SequenceMatcher
 from ParserTool import ParserTool
 from Page import Page
 class Main:
-    def __init__(self):
+    def __init__(self,pdfPath):
+        self.pdf_path = pdfPath
         self.parserTool = ParserTool()
         self.total_pgs = 0
         self.all_pgs = {}
     
-    # --- look for page header,footer of all pages ---
+    # --- look for page header,footer,table,section,para of all pages ---
     def get_page_header_footer(self,pages):
         self.sorted_footer_units = []
         self.sorted_header_units = []
@@ -16,16 +17,17 @@ class Main:
         self.headers = []
         self.footers = []
         for pg in pages:
-            page = Page(pg)
+            page = Page(pg,self.pdf_path)
             self.total_pgs +=1
             self.all_pgs[self.total_pgs]=page
             page.process_textboxes(pg)
+            page.label_table_tbs()
             page.get_section_para()
             self.contour_header_footer_of_page(page)
         self.process_footer_and_header()
         self.set_page_headers_footers()
 
-    # --- classify the page texboxes ---
+    # --- classify the page texboxes sidenotes , titles(headings) ---
     def process_pages(self):
         for page in self.all_pgs.values():
             print("pg_num:",page.pg_num)
@@ -34,11 +36,13 @@ class Main:
             is_single_column = page.is_single_column_page()
             page.get_side_notes()
             page.get_titles()
-            page.print_headers()
-            page.print_footers()
-            page.print_sidenotes()
-            page.print_titles()
+            # page.print_table_content()
+            # page.print_headers()
+            # page.print_footers()
+            # page.print_sidenotes()
+            # page.print_titles()
             # page.print_section_para()
+            page.print_all()
             
             
     # --- in each page do contour to detect possible header/footer content ---
@@ -99,80 +103,6 @@ class Main:
     'footer': " ".join(footer.split()),
     'header_units': headers,
     'footer_units': footers })
-
-    # def contour_header_footer_of_page(self, pg):
-    #     units = []
-    #     for tb in pg.all_tbs:
-    #         paragraph = tb.extract_text_from_tb()
-    #         if not paragraph.isspace():
-    #             units.append({
-    #                 'pg_num': pg.pg_num,
-    #                 'tb': tb,
-    #                 'para': paragraph,
-    #                 'x0': tb.coords[0],
-    #                 'y0': tb.coords[1]
-    #             })
-
-    #     if not units:
-    #         return
-
-    #     # Sort from bottom (lowest y) to top (highest y)
-    #     most_bottom_unit = sorted(units, key=lambda d: d['y0'], reverse=False)
-
-    #     footer_area_units = []
-    #     header_area_units = []
-
-    #     # Start with conditional footer inclusion
-    #     footers = []
-    #     if most_bottom_unit[0]['y0'] < 0.05 * pg.pg_height:  # bottom 0.8%
-    #         footers.append(most_bottom_unit[0])
-
-    #     headers = [most_bottom_unit[-1]]  # top-most by default
-
-    #     for ele in most_bottom_unit:
-    #         smallest = most_bottom_unit[0]['y0']
-    #         largest = most_bottom_unit[-1]['y0']
-
-    #         # Detect additional footers within bottom 2.5%
-    #         if 0 <= (ele['y0'] - smallest) < 0.025 * pg.pg_height:
-    #             if ele['para'] != most_bottom_unit[0]['para']:
-    #                 footers.append(ele)
-    #             continue
-
-    #         # Detect additional headers within top 2.5%
-    #         if 0 <= (largest - ele['y0']) < 0.025 * pg.pg_height:
-    #             if ele['para'] != most_bottom_unit[-1]['para']:
-    #                 headers.append(ele)
-    #             continue
-
-    #         # Determine mid-page units
-    #         if ele['y0'] < pg.pg_height / 2:
-    #             footer_area_units.append(ele)
-    #         else:
-    #             header_area_units.append(ele)
-
-    #     header_area_units = sorted(header_area_units, key=lambda d: d['y0'], reverse=True)
-
-    #     self.sorted_footer_units.append(footer_area_units)
-    #     self.sorted_header_units.append(header_area_units)
-
-    #     # Sort and clean header/footer units
-    #     headers = sorted(headers, key=lambda d: d['x0'])
-    #     footers = sorted(footers, key=lambda d: d['x0'])
-
-    #     headers = [el for el in headers if el['para'].strip()]
-    #     footers = [el for el in footers if el['para'].strip()]
-
-    #     header_text = '!!??!!'.join(el['para'] for el in headers)
-    #     footer_text = '!!??!!'.join(el['para'] for el in footers)
-
-    #     self.headers_footers.append({
-    #         'page': pg.pg_num,
-    #         'header': " ".join(header_text.split()),
-    #         'footer': " ".join(footer_text.split()),
-    #         'header_units': headers,
-    #         'footer_units': footers
-    #     })
 
         
     #  --- Detection of proper header/footer by squence matcher across all pages ---
@@ -270,9 +200,9 @@ class Main:
         del self.footers
 
     # --- parse pdf using pdfminer to convert to XML ---       
-    def parsePDF(self,pdf_path):
-        base_name_of_file = os.path.splitext(os.path.basename(pdf_path))[0]
-        self.parserTool.convert_to_xml(pdf_path,base_name_of_file)
+    def parsePDF(self):
+        base_name_of_file = os.path.splitext(os.path.basename(self.pdf_path))[0]
+        self.parserTool.convert_to_xml(self.pdf_path,base_name_of_file)
         xml_path = f"{base_name_of_file}.xml"
         pages = self.parserTool.get_pages_from_xml(xml_path)
         self.get_page_header_footer(pages)
@@ -280,6 +210,6 @@ class Main:
 
 
 if __name__ == "__main__":
-    pdf_path = r'test/TestSample.pdf'  # 👈 Replace with your PDF path
-    main = Main()
-    main.parsePDF(pdf_path)
+    pdf_path = r'/home/barath-kumar/Documents/IKanoon/Parser-and-Converter/test/TestSample.pdf'  #  Replace with your PDF path
+    main = Main(pdf_path)
+    main.parsePDF()

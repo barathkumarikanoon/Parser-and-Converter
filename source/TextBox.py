@@ -1,4 +1,5 @@
 import re
+import string
 
 class TextBox:
     def __init__(self, tb):
@@ -24,6 +25,7 @@ class TextBox:
         # Join all lines with space (or newline if you want separation)
         return ' '.join(all_text)
     
+    # --- func to detect the textbox having texts font in bold for heading/title detection ---
     def textFont_is_bold(self):
         bold_font_re = re.compile(r'bold', re.IGNORECASE)
         no_of_chars = 0
@@ -35,16 +37,14 @@ class TextBox:
                     no_of_chars += 1
                     font_name = text.attrib.get("font", "")
                     if bold_font_re.search(font_name):
-                        # print(text.text)
                         no_of_bold_chars += 1
 
         if no_of_chars == 0:
             return False  # Avoid division by zero
         
-        # print((no_of_bold_chars / no_of_chars) > 0.6)
         return (no_of_bold_chars / no_of_chars) > 0.1
     
-
+    # --- func to detect the textbox having texts font in italic for heading/title detection ---
     def textFont_is_italic(self):
         italic_font_re = re.compile(r'italic', re.IGNORECASE)
         no_of_chars = 0
@@ -63,7 +63,7 @@ class TextBox:
 
         return (no_of_italic_chars / no_of_chars) > 0.1
         
-    
+    # --- func to detect the textbox having texts font in Upper Case for heading/title detection ---
     def is_uppercase(self):
         total_letters = 0
         total_uppercase = 0
@@ -82,7 +82,7 @@ class TextBox:
 
         return (total_uppercase / total_letters) >= 0.25  # 60% or more letters are uppercase
     
-
+    # --- func to detect the textbox having texts font in Title Case for heading/title detection ---
     def is_titlecase(self):
         words = []
         for textline in self.tbox.findall(".//textline"):
@@ -99,11 +99,20 @@ class TextBox:
         valid_word_count = 0
 
         for word in words:
+            # Remove trailing punctuation like commas, periods, etc.
+            word = word.strip(string.punctuation)
+
+            # Skip empty words after cleaning
+            if not word:
+                continue
+
             # Check if the word contains at least one alphabetic character
             if any(c.isalpha() for c in word):
                 valid_word_count += 1
+
                 # Check if first letter uppercase and the rest lowercase
                 if len(word) == 1:
+
                     # For single letter words, just check uppercase
                     if word[0].isupper():
                         titlecase_count += 1
@@ -114,7 +123,7 @@ class TextBox:
         if valid_word_count == 0:
             return False
 
-        # Return True if at least 70% of words are titlecase
+        # Return True if at least 25% of words are titlecase
         return (titlecase_count / valid_word_count) >= 0.25
 
 
