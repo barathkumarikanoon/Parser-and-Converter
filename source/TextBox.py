@@ -1,45 +1,3 @@
-# import re
-# import string
-# import logging
-
-# class TextBox:
-    
-#     def __init__(self, tb, font_mapper):
-#         self.logger = logging.getLogger(__name__)
-#         self.tbox = tb
-#         self.coords = tuple(map(float, tb.attrib["bbox"].split(",")))
-#         self.height = self.coords[3] - self.coords[1]
-#         self.width = self.coords[2] - self.coords[0]
-#         self.font_mapper = font_mapper
-#         self.footnotes_superscript   = {}
-
-
-#     # --- get texts from the textbox ---
-#     def extract_text_from_tb(self):
-#         all_text = []
-#         try:
-#             for textline in self.tbox.findall('.//textline'):
-#                 line_texts = []
-#                 for text in textline.findall('.//text'):
-#                     # font = text.attrib.get("font", "")
-#                     # raw_text = text.text or ""
-#                     # if font and text.text:
-#                     #     resolved_text = self.font_mapper.resolve_char(font, raw_text)
-#                     #     line_texts.append(resolved_text)
-#                     if text.text:
-#                         line_texts.append(text.text)
-                
-#                 line = ''.join(line_texts).replace("\n", " ").strip()
-#                 if line:
-#                     all_text.append(line)
-            
-#             # Join all lines with space (or newline if you want separation)
-#             return ' '.join(all_text)
-#         except Exception as e:
-#             self.logger.error(f"Failed to extract text from textbox on page {getattr(self, 'pg_num', 'unknown')}: {e}")
-#             return ""
-
-
 import re
 import string
 import logging
@@ -398,9 +356,6 @@ class TextBox:
             if valid_word_count == 0:
                 return False
 
-            # Return True if at least 25% of words are titlecase
-            # if pdf_type == 'sebi':
-            #     return (titlecase_count / valid_word_count) >= 0.70
             if pdf_type == 'acts':
                 return (titlecase_count / valid_word_count) >= 0.40#0.25
             elif pdf_type == 'sebi_circulars':

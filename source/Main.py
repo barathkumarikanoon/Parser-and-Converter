@@ -32,10 +32,6 @@ class Main:
         self.amendment = Amendment()
         self.section_state = SectionState()
         self.article_state = SectionState()
-        # self.schedule_state = SectionState()
-        # self.annexure_state = SectionState()
-        # self.appendix_state = SectionState()
-        # self.form_state = SectionState()
         self.title_state = SectionState()
         self.is_preamble_reached = False
         self.section_shorttitle_notend_status = False
@@ -189,29 +185,6 @@ class Main:
             if not self.is_footnote_continuation:
 
                 active_footnote_num = None
-    
-    # def finalize_unique_images(self):
-    #     for img_hash, meta in self.unique_images.items():
-
-    #         if meta["count"] == 1:
-    #             continue
-
-    #         img_path = meta["path"]
-
-    #         if img_path and os.path.exists(img_path):
-    #             try:
-    #                 os.remove(img_path)
-    #             except Exception as e:
-    #                 self.logger.warning(
-    #                     f"Failed deleting duplicate image {img_path}: {e}"
-    #                 )
-
-    #         for pg_num in meta["pages"]:
-
-    #             page_obj = self.all_pgs.get(pg_num)
-
-    #             if page_obj and hasattr(page_obj, "figures"):
-    #                 page_obj.figures.remove_hash(img_hash)
 
     def finalize_unique_images(self):
 
@@ -329,10 +302,6 @@ class Main:
             # page.print_footers()
 
     def process_pages_sebi_circulars(self, pdf_type):
-        # sch_prev_sent_end_status = True
-        # annex_prev_sent_end_status = True
-        # appendix_prev_sent_end_status = True
-        # form_prev_sent_end_status = True
         prev_sent_end_status = True
         sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
                                                 ': or', '; and', ': and', ':––', ';––',\
@@ -347,20 +316,9 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
-            # page.get_titles(pdf_type)
             page.get_bulletins_sebi_circulars(self.section_state)
-            # page.get_section_para(self.section_state, self)
             page.get_titles(pdf_type)
-            prev_sent_end_status = page.get_title_hierarchy(self.title_state, prev_sent_end_status, sentence_completion_punctutation)
-            # sch_prev_sent_end_status = page.get_hierarchy('schedule', self.schedule_state,
-            #                     sch_prev_sent_end_status, sentence_completion_punctutation)
-            # annex_prev_sent_end_status = page.get_hierarchy('annexure', self.annexure_state, 
-            #                    annex_prev_sent_end_status, sentence_completion_punctutation)
-            # form_prev_sent_end_status = page.get_hierarchy('form', self.form_state,
-            #                     form_prev_sent_end_status, sentence_completion_punctutation)
-            # appendix_prev_sent_end_status = page.get_hierarchy('appendix', self.appendix_state, 
-            #                 appendix_prev_sent_end_status, sentence_completion_punctutation)
-                        
+            prev_sent_end_status = page.get_title_hierarchy(self.title_state, prev_sent_end_status, sentence_completion_punctutation)   
             page.sort_all_boxes()
             # page.print_blockquote()
             # page.print_headers()
@@ -1205,10 +1163,6 @@ class Main:
     
     # --- func for writing the html content to the desired output file ---
     def write_html(self, content, start_page, end_page):
-        content = self.escape_inline_markup(content)
-        if not content:
-            self.logger.warning('HTML content not available to save')
-            return
         try:
             if start_page or end_page:
                 if start_page is None:

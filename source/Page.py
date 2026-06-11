@@ -150,41 +150,6 @@ class Page:
             # Sort while preserving mapping
             self.all_tbs = dict(sorted(self.all_tbs.items(), key=sort_key))
 
-    #original     
-    # --- func for gathering the sidenotes textboxes ---
-    # def get_side_notes(self): #,startPage,endPage):
-    #     try:
-    #         # if startPage is not None and endPage is not None and int(self.pg_num) >=startPage and int(self.pg_num)<=endPage:
-    #         if self.has_side_notes:
-    #             if not hasattr(self, 'body_startX') and not hasattr(self, 'body_endX'):
-    #                 self.logger.warning("Body boundaries (body_startX, body_endX) are not defined for page %s", self.pg_num)
-    #                 return  # Skip if body region not defined
-                
-    #             pattern = re.compile(r'^(\d+\s+of\s+\d+\.|Ord\.\s*\d+\s+of\s+\d+\.)$')
-    #             for tb in list(self.all_tbs.keys()):
-    #                 try:
-    #                     if (tb.coords[2]< (self.body_startX ) or tb.coords[0] > (self.body_endX) ) \
-    #                         and (self.all_tbs[tb] is None ) \
-    #                         and tb.height < 0.25 * self.pg_height \
-    #                         and tb.width < 0.25 * self.pg_width \
-    #                         and tb.width > 0.04 * self.pg_width:
-    #                         texts = tb.extract_text_from_tb()
-    #                         if  texts.strip() and not pattern.match(texts.strip()):
-    #                             # if not texts.strip().endswith("."):
-    #                             #     continue 
-    #                             self.all_tbs[tb]="side notes"
-    #                             try:
-    #                                 tb.get_side_note_datas(self.side_notes_datas)
-    #                             except Exception as e:
-    #                                 self.logger.warning("Failed to preprocess side note data from textbox on page %s: %s", self.pg_num, e)
-    #                         else:
-    #                             del self.all_tbs[tb]
-    #                 except Exception as e:
-    #                     self.logger.warning("Error processing textbox in page %s: %s", self.pg_num, e)
-    #                     continue
-    #     except Exception as e:
-    #         self.logger.exception("Failed in get_side_notes for page %s: %s", self.pg_num, e)
-
     def get_side_notes(self): #,startPage,endPage):
         try:
             # if startPage is not None and endPage is not None and int(self.pg_num) >=startPage and int(self.pg_num)<=endPage:
@@ -692,10 +657,6 @@ class Page:
         
 
     def check_preamble_start(self, text):
-        # pattern = re.compile(
-        #     r'^\s*(?:(?:A\s+)?An\s+Act\b\s*(?:\|\s*BE\s+it\s+enacted\s+by\b)?|BE\s+it\s+enacted\s+by\b)',
-        #     re.IGNORECASE
-        # )
         pattern = re.compile(
                 r'''
                 ^\s*(
@@ -733,7 +694,6 @@ class Page:
             self.logger.debug(f"Page {self.pg_num}: Nested under section: {group} as {valueType2}")
     
     def inner_sidenote_check(self, text, sectionState, main, group_re, findtype):
-        # match = re.match(r"^(.*?[.:]\s*(?:-|—)?)(?:\s*)(.*)$", text)
         
         check_re = re.compile(
                 r"""
@@ -774,23 +734,12 @@ class Page:
             )
             return
 
-
-        # if match:
-        #     rest_text = match.group(2).strip()
-        #     main.section_shorttitle_notend_status = False
-        #     self.inner_group_assign(rest_text = rest_text, sectionState = sectionState, group_re = group_re, findtype = findtype)
-        #     return 
-
     
     #original
     #--- func to find section, subsection, para, subpara ---
     def get_section_para(self,sectionState, main):  #,startPage,endPage):
         hierarchy_type = ("section","subsection","para","subpara","subsubpara")
-        #original
-        # section_re = re.compile(r'^(\s*\d+[A-Z]*(?:-[A-Z]+)?\s*\.)(.*)', re.IGNORECASE)
         section_re = re.compile(r'^(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\s*\.)(.*)', re.IGNORECASE)
-        #original
-        # group_re = re.compile(r'^\(\s*([^\s\)]+)\s*\)(.*)', re.IGNORECASE)
         group_re = re.compile(
             r'^\(\s*((?:[1-9]\d{0,2})|(?:[A-Z]{1,3})|(?:(?:CM|CD|D?C{0,3})?(?:XC|XL|L?X{0,3})?(?:IX|IV|V?I{0,3})))\s*\)(.*)',
             re.IGNORECASE
@@ -821,7 +770,7 @@ class Page:
                 match1 = section_re.match(texts)
                 if match1:
                     section_number = match1.group(1).split('.')[0].strip()
-                    sectionState.compare_obj = CompareLevel(section_number, ARTICLE)
+                    sectionState.compare_obj = CompareLevelSebi(section_number, ARTICLE)
                     sectionState.prev_value = section_number
                     sectionState.prev_type = ARTICLE
                     sectionState.curr_depth = 0
@@ -871,19 +820,6 @@ class Page:
         ordinals_re = r"(?:{})".format("|".join(ordinals))
 
         numbers_re = r"(?:[1-9][0-9]?)"
-
-        # pattern = rf"""(?ix)
-        #     ^
-        #     (?:the\s+)?
-        #     (?:
-        #         schedule[\s\-:]*(?:{ordinals_re}|{numbers_re}|{roman_re})\b
-        #         |
-        #         (?:{ordinals_re}|{numbers_re}|{roman_re})[\s\-:]*schedule\b
-        #         |
-        #         schedule\b
-        #     )
-        #     [\s\(\)\.\-]*$
-        # """
 
         pattern = rf"""(?ix)
                 ^
@@ -999,20 +935,6 @@ class Page:
                 self.logger.warning(f"Page {self.pg_num}: Failed to classify textbox '{texts[:30]}...' due to: {e}")
                 continue
     
-    # def bbox_satisfies(self, tb_box,table_box,x_tolerance = 8, y_tolerance = 5):
-    #     try:
-    #         x_min_table, y_min_table, x_max_table, y_max_table = table_box
-    #         x_min_textbox, y_min_textbox, x_max_textbox, y_max_textbox = tb_box
-
-    #         return (
-    #                 round(x_min_textbox, 2) >= round(x_min_table, 2) - x_tolerance and
-    #                 round(y_min_textbox, 2) >= round(y_min_table, 2) - y_tolerance and
-    #                 round(x_max_textbox, 2) <= round(x_max_table, 2) + x_tolerance and
-    #                 round(y_max_textbox, 2) <= round(y_max_table, 2) + y_tolerance
-    #             )
-    #     except Exception as e:
-    #         self.logger.warning(f"Error comparing bounding boxes: {tb_box} vs {table_box} -- {e}")
-    #         return False
 
     def bbox_satisfies(self, tb_box, table_box,
                    width_threshold=0.4, y_tolerance_pct=0.01,
@@ -1326,101 +1248,6 @@ class Page:
                 return True
         return False
     
-    # def get_footnotes(self):
-    #     for tb, label in self.all_tbs.items():
-    #         if not (label == 'footer' or label is None or \
-    #                  (isinstance(label, tuple) and label[0] == 'table')):
-    #             continue
-    #         text = tb.extract_text_from_tb()
-    #         if re.search(r'^\{\{\^\{\{FOOTNOTE\s*\d+\}\}\}\}\s+', text):
-    #             self.all_tbs[tb] = 'footnote'
-
-    # def get_footnotes(self):
-    #     is_footnote_started = False
-
-    #     for tb, label in self.all_tbs.items():
-    #         if is_footnote_started:
-    #             if label == 'footer':
-    #                 break
-
-    #             self.all_tbs[tb] = 'footnote'
-    #             continue
-
-    #         if not (
-    #             label == 'footer'
-    #             or label is None
-    #             or (isinstance(label, tuple) and label[0] == 'table')
-    #         ):
-    #             continue
-
-    #         text = tb.extract_text_from_tb()
-
-    #         if re.search(r'^\{\{\^\{\{FOOTNOTE\s*\d+\}\}\}\}\s+', text):
-    #             self.all_tbs[tb] = 'footnote'
-    #             is_footnote_started = True
-
-
-    # def get_footnotes(
-    #     self,
-    #     previous_page_footnote_font_size=None
-    # ):
-
-    #     FOOTNOTE_START_RE = re.compile(
-    #         r'^\{\{\^\{\{FOOTNOTE\s*\d+\}\}\}\}\s+'
-    #     )
-
-
-    #     current_footnote_font_size = (
-    #         previous_page_footnote_font_size
-    #     )
-
-    #     for tb in self.all_tbs.keys():
-
-    #         text = tb.extract_text_from_tb()
-
-    #         if not text:
-    #             continue
-
-    #         if FOOTNOTE_START_RE.search(text):
-
-    #             self.all_tbs[tb] = 'footnote'
-
-                
-    #             current_footnote_font_size = (
-    #                 tb.avg_font_size
-    #             )
-
-    #             continue
-
-    #         if current_footnote_font_size is not None:
-
-    #             same_font = (
-
-    #                 abs(
-    #                     tb.avg_font_size -
-    #                     current_footnote_font_size
-    #                 )
-
-    #                 <=
-
-    #                 (
-    #                     current_footnote_font_size * 0.05
-    #                 )
-    #             )
-                
-    #             if same_font:
-
-    #                 self.all_tbs[tb] = 'footnote'
-
-                    
-    #                 current_footnote_font_size = (
-    #                     tb.avg_font_size
-    #                 )
-
-    #                 continue
-
-    #     return current_footnote_font_size
-
     def get_footnotes(
         self,
         seen_footnotes=None,
