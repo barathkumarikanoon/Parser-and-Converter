@@ -1173,7 +1173,7 @@ class Main:
         if not content:
             return content
 
-        pattern = r'(?<!\\)([*_/])'
+        pattern = r'(?<!\\)([*_])'
 
         return re.sub(
             pattern,
