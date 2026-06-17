@@ -7,16 +7,6 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTImage
 from pdfminer.image import ImageWriter
 
-MIN_IMAGE_SIZE_KB = 250
-MIN_IMAGE_SIZE_BYTES = MIN_IMAGE_SIZE_KB * 1024
-
-class StableImageWriter(ImageWriter):
-
-    def _create_unique_image_name(self, image, ext):
-        name = image.name + ext
-        path = os.path.join(self.outdir, name)
-        return name, path
-
 
 class Figure:
     def __init__(self, fig):
@@ -46,6 +36,7 @@ class Pictures:
         base_name_of_file,
         output_dir,
         unique_images,
+        min_img_size,
         image_base_dir="images"
     ):
         self.logger = logging.getLogger(__name__)
@@ -59,6 +50,7 @@ class Pictures:
                 pg_num,
                 base_name_of_file,
                 output_dir,
+                min_img_size,
                 image_base_dir
             )
 
@@ -83,21 +75,6 @@ class Pictures:
             for element in page_layout
             for img in self.walk_layout(element)
         ]
-
-    def valid_image(self, path):
-        try:
-            with Image.open(path) as img:
-                img.load()
-
-                w, h = img.size
-
-                if w < 2 or h < 2:
-                    return False
-
-            return True
-
-        except Exception:
-            return False
 
     def register_global(self, img_name, path):
         reg = self.unique_images.setdefault(
@@ -141,8 +118,11 @@ class Pictures:
         page_num,
         file_basename,
         output_dir,
+        min_img_size,
         image_base_dir="images"
     ):
+        min_image_size_kb = min_img_size
+        min_image_size_bytes = min_image_size_kb * 1024
         saved_images = {}
 
         page_layouts = extract_pages(
@@ -156,7 +136,7 @@ class Pictures:
             file_basename
         )
 
-        os.makedirs(file_dir, exist_ok=True)
+        iw = None
 
         for page_layout in page_layouts:
 
@@ -164,21 +144,22 @@ class Pictures:
                 page_layout
             )
 
-            iw = StableImageWriter(file_dir)
-
             for lt_image in images:
 
                 try:
+
                     if self.should_skip(lt_image):
                         continue
+                
+                    if iw is None:
+                        os.makedirs(file_dir, exist_ok=True)
+                        iw = ImageWriter(file_dir)
 
-                    img_saved = iw.export_image(
-                        lt_image
-                    )
+                    img_saved = iw.export_image(lt_image)
 
                     if not img_saved:
                         continue
-
+                    
                     temp_path = os.path.join(
                         file_dir,
                         img_saved
@@ -187,39 +168,42 @@ class Pictures:
                     if not os.path.exists(temp_path):
                         continue
 
-                    file_size = os.path.getsize(temp_path)
+                    img_name = lt_image.name
 
-                    if file_size < MIN_IMAGE_SIZE_BYTES:
+                    final_path = os.path.join(
+                        file_dir,
+                        f"{img_name}.png"
+                    )
 
-                        os.remove(temp_path)
+                    with Image.open(temp_path) as img:
+
+                        if img.mode in ("RGBA", "LA"):
+                            converted = img
+                        elif img.mode == "P":
+                            converted = img.convert("RGBA")
+                        else:
+                            converted = img.convert("RGB")
+
+                        converted.save(final_path, "PNG")
+                    
+                    final_file_size = os.path.getsize(final_path)
+
+                    if final_file_size < min_image_size_bytes:
+
+                        os.remove(final_path)
+
+                        if os.path.exists(temp_path):
+                            os.remove(temp_path)
 
                         self.logger.info(
                             f"Skipping small image "
-                            f"{temp_path} "
-                            f"({round(file_size / 1024, 2)} KB)"
+                            f"{final_path} "
+                            f"({round(final_file_size / 1024, 2)} KB)"
                         )
 
                         continue
 
-                    if not self.valid_image(temp_path):
-                        os.remove(temp_path)
-                        continue
-
-                    img_name = lt_image.name
-
-                    ext = os.path.splitext(
-                        temp_path
-                    )[1].lower()
-
-                    final_name = img_name + ext
-
-                    final_path = os.path.join(
-                        file_dir,
-                        final_name
-                    )
-
                     if temp_path != final_path:
-
                         if not os.path.exists(final_path):
                             os.replace(
                                 temp_path,
@@ -227,7 +211,8 @@ class Pictures:
                             )
                         else:
                             os.remove(temp_path)
-
+                    
+                    
                     saved_images[img_name] = {
                         "name": img_name,
                         "path": final_path
@@ -245,5 +230,11 @@ class Pictures:
                     )
 
                     continue
+        
+        if iw is not None and not saved_images:
+            try:
+                os.rmdir(file_dir)
+            except OSError:
+                pass
 
         return saved_images

@@ -45,23 +45,44 @@ class CompareLevel:
             return False
 
     def is_roman(self, number):
-        #check if a number is a roman numeral
-        #reg = '^M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$'
-        self.logger.debug(f"Checking if value is Roman: {number}")
+        self.logger.debug(f"Checking Roman: {number}")
 
-        if number in ['iia', 'iib', 'iic', 'iid', 'iiia', 'iiib', 'iva', 'va', 'vb', 'vc', 'vd', 'via', 'viia']:
-            return True
-
-        reg = '^(X|IX|IV|V?I{0,3})$'
         try:
-            tmp = str(number)
-            if re.search(reg, tmp.upper()):
-                return True
-            else:
+            s = str(number).upper().strip()
+
+            roman_pattern = (
+                r"(X{0,3})"
+                r"(IX|IV|V?I{0,3})$"
+            )
+
+            if not re.match(roman_pattern, s):
                 return False
+
+            return self._roman_to_int(s) > 0
+
         except Exception as e:
-            self.logger.warning(f"Failed Roman check on {number}: {e}")
+            self.logger.warning(f"Roman check failed for {number}: {e}")
             return False
+    
+    def _roman_to_int(self, s: str) -> int:
+        roman = {
+            'I': 1, 'V': 5, 'X': 10, 'L': 50,
+            'C': 100, 'D': 500, 'M': 1000
+        }
+
+        total = 0
+        prev = 0
+
+        for ch in reversed(s):
+            val = roman.get(ch, 0)
+
+            if val < prev:
+                total -= val
+            else:
+                total += val
+                prev = val
+
+        return total
 
     def is_decimal(self, value):
         if re.match(r'\d+[a-zA-Z]*$', value) != None:

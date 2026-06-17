@@ -30,7 +30,7 @@ class SectionState:
 class Page:
     def __init__(self,pg,pdfPath, base_name_of_file, output_dir, 
                  pdf_type, has_side_notes, is_amendment_pdf, 
-                 font_mapper, unique_images):
+                 font_mapper, unique_images, min_img_size):
         self.logger = logging.getLogger(__name__)
         self.pdf_path = pdfPath
         self.page_in_xml = pg
@@ -43,7 +43,7 @@ class Page:
         self.pdf_type = pdf_type
         self.is_amendment_pdf = is_amendment_pdf
         self.figures = Pictures(self.pdf_path, self.pg_num, base_name_of_file, 
-                                output_dir, unique_images)
+                                output_dir, unique_images, min_img_size)
         self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type)
         self.side_notes_datas ={}
         self.font_mapper = font_mapper
@@ -771,7 +771,7 @@ class Page:
                 match1 = section_re.match(texts)
                 if match1:
                     section_number = match1.group(1).split('.')[0].strip()
-                    sectionState.compare_obj = CompareLevelSebi(section_number, ARTICLE)
+                    sectionState.compare_obj = CompareLevel(section_number, ARTICLE)
                     sectionState.prev_value = section_number
                     sectionState.prev_type = ARTICLE
                     sectionState.curr_depth = 0

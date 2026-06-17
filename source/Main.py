@@ -18,7 +18,7 @@ from .FontMapper import DynamicFontMapper
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
-                 is_footnote_continuation): #start,end,is_amendment_pdf,output_dir, pdf_type):
+                 is_footnote_continuation, min_img_size): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
         self.pdf_path = pdfPath
         self.output_dir = output_dir
@@ -45,6 +45,7 @@ class Main:
             self.html_builder = self.get_htmlBuilder(pdf_type)
         else:
             self.html_builder = self.get_htmlBuilder(pdf_type)
+        self.min_img_size = min_img_size
         # self.fontmapper.extract_fonts()
 
     def get_all_footnote_text(self):
@@ -206,6 +207,8 @@ class Main:
                             f"Deleted duplicate image: {img_path}"
                         )
 
+                        self.remove_empty_parent_dir(img_path)
+                    
                     except Exception as e:
 
                         self.logger.warning(
@@ -240,6 +243,24 @@ class Main:
             f"Remaining unique images: "
             f"{len(self.unique_images)}"
         )
+    
+    def remove_empty_parent_dir(self, file_path):
+        try:
+            parent_dir = os.path.dirname(file_path)
+            if parent_dir and os.path.isdir(parent_dir):
+                os.rmdir(parent_dir)
+
+                self.logger.debug(
+                    f"Removed empty image directory: {parent_dir}"
+                )
+
+        except OSError:
+            pass
+
+        except Exception:
+            self.logger.exception(
+                f"Failed removing directory for: {file_path}"
+            )
     
     def get_htmlBuilder(self, pdf_type, docend_symbol = False):
         if pdf_type == 'sebi':
@@ -390,7 +411,7 @@ class Main:
 
             page = Page(pg, self.pdf_path, base_name_of_file, output_dir, 
                         self.pdf_type, self.has_side_notes, self.is_amendment_pdf, 
-                        self.fontmapper, self.unique_images)
+                        self.fontmapper, self.unique_images, self.min_img_size)
             self.total_pgs += 1
             self.all_pgs[self.total_pgs] = page
             page.process_textboxes()#pg)
@@ -1299,6 +1320,8 @@ def get_arg_parser():
                         required = False, default = False, help = 'mention if pdf has document end symbol (---)')
     parser.add_argument('-fnc', '--footnote-continuation', dest='is_footnote_continuation', action = 'store_true', \
                         required = False, default = False, help = 'mention if pdf has footnote that continued across the pages')
+    parser.add_argument('-mis', '--min-img-size', dest = 'min_img_size', action = 'store', \
+                      required = False,  default = 50,  help = 'mention the min size of the image to avoid junk images')
     return parser
 
 
@@ -1356,8 +1379,11 @@ if __name__ == "__main__":
     output_dir = args.output_dir
     has_doc_end = args.has_doc_end
     is_footnote_continuation = args.is_footnote_continuation
+    min_img_size = args.min_img_size
+    if min_img_size and isinstance(min_img_size, str):
+        min_img_size = int(min_img_size)
     main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
-                is_footnote_continuation)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+                is_footnote_continuation, min_img_size)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])
