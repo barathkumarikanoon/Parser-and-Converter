@@ -2,41 +2,219 @@ import re
 import string
 import logging
 
+
 class TextBox:
-    
-    def __init__(self, tb, font_mapper):
+
+    def __init__(self, tb, pdf_type, font_mapper):
         self.logger = logging.getLogger(__name__)
+
         self.tbox = tb
+
         self.coords = tuple(map(float, tb.attrib["bbox"].split(",")))
         self.height = self.coords[3] - self.coords[1]
         self.width = self.coords[2] - self.coords[0]
+
         self.font_mapper = font_mapper
 
-    # --- get texts from the textbox ---
-    def extract_text_from_tb(self):
-        all_text = []
+        self.avg_font_size = self.get_avg_font_size()
+
+        # {(x0,y0,x1,y1): "3"}
+        self.footnotes_superscript = {}
+
+        if pdf_type in set(['sebi_circulars']):
+            self.get_footnotes_superscript()
+
+
+    def get_avg_font_size(self):
+
+        total_size = 0.0
+
+        count = 0
+
+        for txt in self.tbox.findall(".//text"):
+
+            try:
+
+                size = float(
+                    txt.attrib.get("size")
+                )
+
+                total_size += size
+
+                count += 1
+
+            except:
+                continue
+
+        if count == 0:
+            return 0
+
+        return total_size / count
+    
+    def get_footnotes_superscript(self):
+
         try:
-            for textline in self.tbox.findall('.//textline'):
-                line_texts = []
-                for text in textline.findall('.//text'):
-                    # font = text.attrib.get("font", "")
-                    # raw_text = text.text or ""
-                    # if font and text.text:
-                    #     resolved_text = self.font_mapper.resolve_char(font, raw_text)
-                    #     line_texts.append(resolved_text)
+            for textline in self.tbox.findall(".//textline"):
+
+                chars = textline.findall(".//text")
+
+                if not chars:
+                    continue
+
+                # collect sizes
+                sizes = []
+                bottoms = []
+
+                for ch in chars:
+                    try:
+                        if "size" in ch.attrib:
+                            sizes.append(float(ch.attrib["size"]))
+
+                        if "bbox" in ch.attrib:
+                            x0, y0, x1, y1 = map(
+                                float,
+                                ch.attrib["bbox"].split(",")
+                            )
+                            bottoms.append(y0)
+
+                    except Exception:
+                        continue
+
+                if not sizes:
+                    continue
+
+                # normal text assumptions
+                base_size = max(sizes)
+                base_bottom = min(bottoms) if bottoms else 0
+
+                for ch in chars:
+
+                    txt = ch.text or ""
+
+                    if not txt.strip():
+                        continue
+
+                    try:
+                        size = float(ch.attrib.get("size", base_size))
+
+                        x0, y0, x1, y1 = map(
+                            float,
+                            ch.attrib["bbox"].split(",")
+                        )
+
+
+                        smaller_font = size < (base_size * 0.85)
+
+                        raised = y0 > (base_bottom + (base_size * 0.15))
+
+                        # mostly digits/symbol markers
+                        valid_mark = bool(
+                            re.fullmatch(r"[0-9*†‡]+", txt.strip())
+                        )
+
+                        if smaller_font and raised and valid_mark:
+                            self.footnotes_superscript[
+                                (x0, y0, x1, y1)
+                            ] = txt.strip()
+
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            self.logger.error(
+                f"Failed superscript detection: {e}"
+            )
+
+    def extract_plain_text(self):
+        all_text = []
+
+        try:
+            for textline in self.tbox.findall(".//textline"):
+
+                chars = []
+
+                for text in textline.findall(".//text"):
                     if text.text:
-                        line_texts.append(text.text)
-                
-                line = ''.join(line_texts).replace("\n", " ").strip()
+                        chars.append(text.text)
+
+                line = "".join(chars).replace("\n", " ").strip()
+
                 if line:
                     all_text.append(line)
-            
-            # Join all lines with space (or newline if you want separation)
-            return ' '.join(all_text)
-        except Exception as e:
-            self.logger.error(f"Failed to extract text from textbox on page {getattr(self, 'pg_num', 'unknown')}: {e}")
-            return ""
 
+            return " ".join(all_text)
+
+        except Exception as e:
+            self.logger.error(f"Plain text extraction failed: {e}")
+            return ""
+    
+    def extract_text_from_tb(self):
+        if not self.footnotes_superscript:
+            return self.extract_plain_text()
+
+        all_text = []
+
+        try:
+            for textline in self.tbox.findall(".//textline"):
+
+                line_texts = []
+                pending_superscript = []
+
+                for text in textline.findall(".//text"):
+
+                    raw = text.text or ""
+
+                    if not raw:
+                        continue
+
+                    is_super = False
+
+                    if "bbox" in text.attrib:
+                        try:
+                            bbox = tuple(
+                                map(float,
+                                    text.attrib["bbox"].split(","))
+                            )
+
+                            if bbox in self.footnotes_superscript:
+                                pending_superscript.append(
+                                    self.footnotes_superscript[bbox]
+                                )
+                                is_super = True
+
+                        except Exception:
+                            pass
+
+                    if not is_super:
+
+                        if pending_superscript:
+                            marker = "".join(pending_superscript)
+
+                            line_texts.append(
+                                "{{^{{FOOTNOTE " + marker + "}}}}"
+                            )
+
+                            pending_superscript = []
+
+                        line_texts.append(raw)
+
+                if pending_superscript:
+                    marker = "".join(pending_superscript)
+
+                    line_texts.append(
+                        "{{^{{FOOTNOTE " + marker + "}}}}"
+                    )
+
+                line = "".join(line_texts).replace("\n", " ").strip()
+
+                if line:
+                    all_text.append(line)
+
+            return " ".join(all_text)
+
+        except Exception as e:
+            self.logger.error(f"Failed to extract text: {e}")
+            return ""
     
     # --- func to detect the textbox having texts font in bold for heading/title detection ---
     def textFont_is_bold(self, pdf_type = None):
@@ -58,6 +236,8 @@ class TextBox:
             
             if pdf_type == 'sebi':
                 return (no_of_bold_chars / no_of_chars) > 0.50
+            elif pdf_type == 'sebi_circulars':
+                return (no_of_bold_chars / no_of_chars) > 0.80
             elif pdf_type == 'acts':
                 return (no_of_bold_chars / no_of_chars) > 0.50#0.1
             else:
@@ -87,6 +267,8 @@ class TextBox:
 
             if pdf_type == 'sebi':
                 return (no_of_italic_chars / no_of_chars) > 0.7
+            if pdf_type == 'sebi_circulars':
+                return False
             elif pdf_type == 'acts':
                 return (no_of_italic_chars / no_of_chars) > 0.50 #0.1
             else:
@@ -101,7 +283,7 @@ class TextBox:
         total_letters = 0
         total_uppercase = 0
 
-        if pdf_type == 'sebi':
+        if pdf_type == 'sebi' or pdf_type == 'sebi_circulars':
             return False
         try:
             for textline in self.tbox.findall(".//textline"):
@@ -120,6 +302,8 @@ class TextBox:
             #     return (total_uppercase / total_letters) >= 0.70
             if pdf_type == 'acts':
                 return (total_uppercase / total_letters) >= 0.40  #0.25
+            elif pdf_type == 'sebi_circulars':
+                return False
             else:
                 return (total_uppercase / total_letters) >= 0.75 
 
@@ -131,7 +315,7 @@ class TextBox:
     # --- func to detect the textbox having texts font in Title Case for heading/title detection ---
     def is_titlecase(self, pdf_type = None):
         words = []
-        if pdf_type == 'sebi':
+        if pdf_type == 'sebi' or pdf_type == 'sebi_circulars':
             return False
         try:
             for textline in self.tbox.findall(".//textline"):
@@ -172,11 +356,10 @@ class TextBox:
             if valid_word_count == 0:
                 return False
 
-            # Return True if at least 25% of words are titlecase
-            # if pdf_type == 'sebi':
-            #     return (titlecase_count / valid_word_count) >= 0.70
             if pdf_type == 'acts':
                 return (titlecase_count / valid_word_count) >= 0.40#0.25
+            elif pdf_type == 'sebi_circulars':
+                return False
             else:
                 return (titlecase_count / valid_word_count) >= 0.75
         

@@ -11,6 +11,7 @@ from .TableExtraction import TableExtraction
 from .CompareLevel import CompareLevel, CompareLevelSebi
 from .NormalizeText import NormalizeText
 from .Figure import Figure,Pictures
+from .Utils import *
 
 ARTICLE      = 4
 DECIMAL      = 3
@@ -27,7 +28,9 @@ class SectionState:
 
 
 class Page:
-    def __init__(self,pg,pdfPath, base_name_of_file, output_dir, pdf_type, has_side_notes, is_amendment_pdf, font_mapper):
+    def __init__(self,pg,pdfPath, base_name_of_file, output_dir, 
+                 pdf_type, has_side_notes, is_amendment_pdf, 
+                 font_mapper, unique_images, min_img_size):
         self.logger = logging.getLogger(__name__)
         self.pdf_path = pdfPath
         self.page_in_xml = pg
@@ -39,11 +42,18 @@ class Page:
         self.has_side_notes = has_side_notes
         self.pdf_type = pdf_type
         self.is_amendment_pdf = is_amendment_pdf
-        self.figures = Pictures(self.pdf_path, self.pg_num, base_name_of_file, output_dir)
+        self.figures = Pictures(self.pdf_path, self.pg_num, base_name_of_file, 
+                                output_dir, unique_images, min_img_size)
         self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type)
         self.side_notes_datas ={}
         self.font_mapper = font_mapper
-    
+        self.title_type_map = {
+            'schedule' :is_schedule,
+            'annexure': is_annexure,
+            'appendix': is_appendix,
+            'form': is_form,
+        }
+         
 
     # --- func for getting page coordinates, height, width ---
     def get_pg_coords(self,pg):
@@ -90,7 +100,7 @@ class Page:
             textBoxes = get_sorted_textboxes(tbs)
             for tb in textBoxes:
                 try:
-                    tb_obj = TextBox(tb, self.font_mapper)
+                    tb_obj = TextBox(tb, self.pdf_type, self.font_mapper)
                     text = tb_obj.extract_text_from_tb()
                     if text and text.strip():
                         self.all_tbs[tb_obj] = None
@@ -139,41 +149,6 @@ class Page:
 
             # Sort while preserving mapping
             self.all_tbs = dict(sorted(self.all_tbs.items(), key=sort_key))
-
-    #original     
-    # --- func for gathering the sidenotes textboxes ---
-    # def get_side_notes(self): #,startPage,endPage):
-    #     try:
-    #         # if startPage is not None and endPage is not None and int(self.pg_num) >=startPage and int(self.pg_num)<=endPage:
-    #         if self.has_side_notes:
-    #             if not hasattr(self, 'body_startX') and not hasattr(self, 'body_endX'):
-    #                 self.logger.warning("Body boundaries (body_startX, body_endX) are not defined for page %s", self.pg_num)
-    #                 return  # Skip if body region not defined
-                
-    #             pattern = re.compile(r'^(\d+\s+of\s+\d+\.|Ord\.\s*\d+\s+of\s+\d+\.)$')
-    #             for tb in list(self.all_tbs.keys()):
-    #                 try:
-    #                     if (tb.coords[2]< (self.body_startX ) or tb.coords[0] > (self.body_endX) ) \
-    #                         and (self.all_tbs[tb] is None ) \
-    #                         and tb.height < 0.25 * self.pg_height \
-    #                         and tb.width < 0.25 * self.pg_width \
-    #                         and tb.width > 0.04 * self.pg_width:
-    #                         texts = tb.extract_text_from_tb()
-    #                         if  texts.strip() and not pattern.match(texts.strip()):
-    #                             # if not texts.strip().endswith("."):
-    #                             #     continue 
-    #                             self.all_tbs[tb]="side notes"
-    #                             try:
-    #                                 tb.get_side_note_datas(self.side_notes_datas)
-    #                             except Exception as e:
-    #                                 self.logger.warning("Failed to preprocess side note data from textbox on page %s: %s", self.pg_num, e)
-    #                         else:
-    #                             del self.all_tbs[tb]
-    #                 except Exception as e:
-    #                     self.logger.warning("Error processing textbox in page %s: %s", self.pg_num, e)
-    #                     continue
-    #     except Exception as e:
-    #         self.logger.exception("Failed in get_side_notes for page %s: %s", self.pg_num, e)
 
     def get_side_notes(self): #,startPage,endPage):
         try:
@@ -683,10 +658,6 @@ class Page:
         
 
     def check_preamble_start(self, text):
-        # pattern = re.compile(
-        #     r'^\s*(?:(?:A\s+)?An\s+Act\b\s*(?:\|\s*BE\s+it\s+enacted\s+by\b)?|BE\s+it\s+enacted\s+by\b)',
-        #     re.IGNORECASE
-        # )
         pattern = re.compile(
                 r'''
                 ^\s*(
@@ -724,7 +695,6 @@ class Page:
             self.logger.debug(f"Page {self.pg_num}: Nested under section: {group} as {valueType2}")
     
     def inner_sidenote_check(self, text, sectionState, main, group_re, findtype):
-        # match = re.match(r"^(.*?[.:]\s*(?:-|—)?)(?:\s*)(.*)$", text)
         
         check_re = re.compile(
                 r"""
@@ -765,23 +735,12 @@ class Page:
             )
             return
 
-
-        # if match:
-        #     rest_text = match.group(2).strip()
-        #     main.section_shorttitle_notend_status = False
-        #     self.inner_group_assign(rest_text = rest_text, sectionState = sectionState, group_re = group_re, findtype = findtype)
-        #     return 
-
     
     #original
     #--- func to find section, subsection, para, subpara ---
     def get_section_para(self,sectionState, main):  #,startPage,endPage):
         hierarchy_type = ("section","subsection","para","subpara","subsubpara")
-        #original
-        # section_re = re.compile(r'^(\s*\d+[A-Z]*(?:-[A-Z]+)?\s*\.)(.*)', re.IGNORECASE)
         section_re = re.compile(r'^(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\s*\.)(.*)', re.IGNORECASE)
-        #original
-        # group_re = re.compile(r'^\(\s*([^\s\)]+)\s*\)(.*)', re.IGNORECASE)
         group_re = re.compile(
             r'^\(\s*((?:[1-9]\d{0,2})|(?:[A-Z]{1,3})|(?:(?:CM|CD|D?C{0,3})?(?:XC|XL|L?X{0,3})?(?:IX|IV|V?I{0,3})))\s*\)(.*)',
             re.IGNORECASE
@@ -862,19 +821,6 @@ class Page:
         ordinals_re = r"(?:{})".format("|".join(ordinals))
 
         numbers_re = r"(?:[1-9][0-9]?)"
-
-        # pattern = rf"""(?ix)
-        #     ^
-        #     (?:the\s+)?
-        #     (?:
-        #         schedule[\s\-:]*(?:{ordinals_re}|{numbers_re}|{roman_re})\b
-        #         |
-        #         (?:{ordinals_re}|{numbers_re}|{roman_re})[\s\-:]*schedule\b
-        #         |
-        #         schedule\b
-        #     )
-        #     [\s\(\)\.\-]*$
-        # """
 
         pattern = rf"""(?ix)
                 ^
@@ -990,20 +936,6 @@ class Page:
                 self.logger.warning(f"Page {self.pg_num}: Failed to classify textbox '{texts[:30]}...' due to: {e}")
                 continue
     
-    # def bbox_satisfies(self, tb_box,table_box,x_tolerance = 8, y_tolerance = 5):
-    #     try:
-    #         x_min_table, y_min_table, x_max_table, y_max_table = table_box
-    #         x_min_textbox, y_min_textbox, x_max_textbox, y_max_textbox = tb_box
-
-    #         return (
-    #                 round(x_min_textbox, 2) >= round(x_min_table, 2) - x_tolerance and
-    #                 round(y_min_textbox, 2) >= round(y_min_table, 2) - y_tolerance and
-    #                 round(x_max_textbox, 2) <= round(x_max_table, 2) + x_tolerance and
-    #                 round(y_max_textbox, 2) <= round(y_max_table, 2) + y_tolerance
-    #             )
-    #     except Exception as e:
-    #         self.logger.warning(f"Error comparing bounding boxes: {tb_box} vs {table_box} -- {e}")
-    #         return False
 
     def bbox_satisfies(self, tb_box, table_box,
                    width_threshold=0.4, y_tolerance_pct=0.01,
@@ -1066,6 +998,83 @@ class Page:
         for tb,label in self.all_tbs.items():
             if label is not None:
                     continue
+            # if label is not None and (isinstance(label,tuple) and label  not in (('italic', 'blockquote'),)):
+            #     continue
+            texts = tb.extract_text_from_tb().strip()
+            texts = texts.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
+            try:
+                if not isinstance(label,list) and section_re.match(texts): 
+                    section_number = section_re.match(texts).group().split('.')[0].strip()
+                    sectionState.compare_obj = CompareLevelSebi(section_number, ARTICLE)
+                    sectionState.prev_value = section_number
+                    sectionState.prev_type = ARTICLE
+                    sectionState.curr_depth = 0
+                    self.all_tbs[tb] = hierarchy_type[0]
+                    self.logger.debug(f"Page {self.pg_num}: Detected section: {section_number}")
+                    check_inside = re.match(r'^(\s*\d+[A-Z]*(?:-[A-Z]+)?\.\s*)(.*)', texts)
+                    
+                    if check_inside:
+                        rest_text = check_inside.group(2).strip()
+                        match = group_re.match(rest_text)
+                        if match:
+                            group =match.group(1).strip()
+                            valueType2, compValue = sectionState.compare_obj.comp_nums(sectionState.curr_depth, sectionState.prev_value, group, sectionState.prev_type)
+                            if valueType2 is not None and compValue is not None:
+                                sectionState.curr_depth = sectionState.curr_depth - compValue
+                                sectionState.prev_value = group
+                                sectionState.prev_type = valueType2
+                                self.logger.debug(f"Page {self.pg_num}: Nested under section: {group} as {valueType2}")
+                    continue
+
+                match = group_re.match(texts)
+
+                if not isinstance(label,list) and sectionState.compare_obj != None and  match : # does not consider amendments label
+                    group =match.group(1).strip()
+                    valueType2, compValue = sectionState.compare_obj.comp_nums(sectionState.curr_depth,sectionState.prev_value,group,sectionState.prev_type)
+                    if valueType2 is not None and compValue is not None:
+                        sectionState.curr_depth = sectionState.curr_depth - compValue
+                        if sectionState.curr_depth >= len(hierarchy_type)-1:
+                                    continue
+                        else:
+                            classification = hierarchy_type[sectionState.curr_depth]
+                            if classification == hierarchy_type[0]:
+                                continue
+                            self.all_tbs[tb] = classification
+                            sectionState.prev_value = group
+                            sectionState.prev_type = valueType2
+                            self.logger.debug(f"Page {self.pg_num}: Classified '{group}' as {classification}")
+            
+            except Exception as e:
+                self.logger.warning(f"Page {self.pg_num}: Failed to classify textbox '{texts[:30]}...' due to: {e}")
+                continue
+    
+    def get_bulletins_sebi_circulars(self, sectionState):
+        normalize_text = NormalizeText().normalize_text
+        hierarchy_type = ("level1","level2","level3","level4","level5")
+        
+        # original
+        section_re = re.compile(
+            r'^(?!\s*\d{1,4}\.\d{1,4}\.\d{2,4})\s*[1-9]\d{0,2}[A-Z]?\.(?!\))(?:\s+.*)?$',
+            re.IGNORECASE
+        )
+
+        group_re = re.compile(
+            r'\s*('
+                r'(?:[A-z]{1,2}[.\)]|\([A-z]{1,2}\))|'                     # a., a), (a)
+                r'(?:[IVXLCDMivxlcdm]{1,4}[.\)]|\([IVXLCDMivxlcdm]{1,4}\))|'  # i., i), IX., (IX)
+                r'(?:\(?[1-9]\d{0,2}(?:\.[1-9]\d{0,2}){0,3}\)?(?:[.\)])?)'    # allow trailing . or ) optional
+            r')(?!\w)',  # ensure not followed by alphanumeric (safety)
+        )
+
+        
+        for tb,label in self.all_tbs.items():
+            
+            if label == 'footnote':
+                break
+
+            if label is not None:
+                    continue
+            
             # if label is not None and (isinstance(label,tuple) and label  not in (('italic', 'blockquote'),)):
             #     continue
             texts = tb.extract_text_from_tb().strip()
@@ -1239,3 +1248,161 @@ class Page:
             if self.bbox_satisfies(coords,tab_bbox):
                 return True
         return False
+    
+    def get_footnotes(
+        self,
+        seen_footnotes=None,
+        previous_page_footnote_font_size=None
+    ):
+
+        if seen_footnotes is None:
+            seen_footnotes = set()
+
+        FOOTNOTE_RE = re.compile(
+            r'\{\{\^\{\{FOOTNOTE\s*(\d+)\}\}\}\}'
+        )
+
+        current_footnote_font_size = (
+            previous_page_footnote_font_size
+        )
+
+        footnote_started = (
+            previous_page_footnote_font_size is not None
+        )
+
+        for tb in self.all_tbs.keys():
+
+            text = tb.extract_text_from_tb()
+
+            if not text:
+                continue
+
+            # -----------------------------------------
+            # detect second occurrence of footnote ref
+            # -----------------------------------------
+
+            if not footnote_started:
+
+                matches = FOOTNOTE_RE.findall(text)
+
+                if matches:
+
+                    for footnote_num in matches:
+
+                        if footnote_num in seen_footnotes:
+
+                            self.all_tbs[tb] = 'footnote'
+
+                            current_footnote_font_size = (
+                                tb.avg_font_size
+                            )
+
+                            footnote_started = True
+
+                            break
+
+                        seen_footnotes.add(footnote_num)
+
+                    if footnote_started:
+                        continue
+
+            # -----------------------------------------
+            # continuation based on font size
+            # -----------------------------------------
+
+            if current_footnote_font_size is not None:
+
+                same_font = (
+
+                    abs(
+                        tb.avg_font_size -
+                        current_footnote_font_size
+                    )
+
+                    <=
+
+                    (
+                        current_footnote_font_size * 0.05
+                    )
+                )
+
+                if same_font:
+
+                    self.all_tbs[tb] = 'footnote'
+
+                    current_footnote_font_size = (
+                        tb.avg_font_size
+                    )
+
+                    continue
+
+        return current_footnote_font_size, seen_footnotes
+    
+    def get_title_hierarchy(self, section_state, sentence_status,
+                      sentence_completion_punctutation):
+        
+        hierarchy_type = ("level0","level1","level2","level3","level4")
+        group_re = re.compile(
+            r'\s*('
+                r'(?:[A-z]{1,2}[.\)]|\([A-z]{1,2}\))|'                     # a., a), (a)
+                r'(?:[IVXLCDMivxlcdm]{1,4}[.\)]|\([IVXLCDMivxlcdm]{1,4}\))|'  # i., i), IX., (IX)
+                r'(?:\(?[1-9]\d{0,2}(?:\.[1-9]\d{0,2}){0,3}\)?(?:[.\)])?)'    # allow trailing . or ) optional
+            r')(?!\w)',  # ensure not followed by alphanumeric (safety)
+        )
+        try:
+
+            for tb, label in self.all_tbs.items():
+                text = tb.extract_text_from_tb().strip()
+                text = text.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
+                if label in ['footnote', 'header', 'footer', 'title']:
+                    is_sentence_completed = True
+                elif isinstance(label, tuple) and label[0] == 'table':
+                    is_sentence_completed = True
+                else:
+                    is_sentence_completed = text.endswith(sentence_completion_punctutation)
+                if not (label in set(['title', 'level1', 'level2', 'level3', 'level4',
+                            'sec', 'subsec', 'para', 'subpara'])\
+                   or label is None):
+                    continue
+                
+                is_match = False
+
+                for func in self.title_type_map.values():
+                    is_match = (is_match or func(text))
+                try:
+                    if label == 'title' and is_match and sentence_status:
+                        section_number = 0
+                        section_state.compare_obj = CompareLevelSebi(section_number, ARTICLE)
+                        section_state.prev_value = section_number
+                        section_state.prev_type = ARTICLE
+                        section_state.curr_depth = 0
+                        self.logger.debug(f"Page {self.pg_num}: Detected section: {section_number}")
+
+
+                    match = group_re.match(text)
+                  
+                    if section_state.compare_obj != None and  match : # does not consider amendments label
+                        group =match.group(1).strip()
+                        valueType2, compValue = section_state.compare_obj.comp_nums(section_state.curr_depth,section_state.prev_value,group,section_state.prev_type)
+                        if valueType2 is not None and compValue is not None:
+                            section_state.curr_depth = section_state.curr_depth - compValue
+                            if section_state.curr_depth >= len(hierarchy_type):
+                                        continue
+                            else:
+                                classification = hierarchy_type[section_state.curr_depth]
+                                if label != 'title':
+                                    self.all_tbs[tb] = ('title', classification)
+                            
+                                section_state.prev_value = group
+                                section_state.prev_type = valueType2
+                                self.logger.debug(f"Page {self.pg_num}: Classified '{group}' as {classification}")
+                
+                except Exception as e:
+                    self.logger.warning(f"Page {self.pg_num}: Failed to classify textbox '{text[:30]}...' due to: {e}")
+                    continue
+
+                sentence_status = is_sentence_completed
+            return sentence_status
+        except Exception as e:
+            self.logger.error(f"Error in get_hierarchy: {e}")
+            return False

@@ -11,12 +11,14 @@ from .ParserTool import ParserTool
 from .Page import Page, SectionState
 from .HTMLBuilder import HTMLBuilder
 from .Acts import Acts
+from .SebiCirculars import SebiCirculars
 from .Amendment import Amendment
 from .Utils import *
 from .FontMapper import DynamicFontMapper
 
 class Main:
-    def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end): #start,end,is_amendment_pdf,output_dir, pdf_type):
+    def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
+                 is_footnote_continuation, min_img_size): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
         self.pdf_path = pdfPath
         self.output_dir = output_dir
@@ -25,30 +27,259 @@ class Main:
         self.all_pgs = {}
         self.pdf_type = pdf_type  # Store pdf_type for later use
         self.has_doc_end = has_doc_end
-        if self.pdf_type == 'acts':
-            self.html_builder = self.get_htmlBuilder(pdf_type, self.has_doc_end)
-        else:
-            self.html_builder = self.get_htmlBuilder(pdf_type)
         self.is_amendment_pdf = is_amendment_pdf
         self.has_side_notes = has_side_notes
         self.amendment = Amendment()
         self.section_state = SectionState()
         self.article_state = SectionState()
+        self.title_state = SectionState()
         self.is_preamble_reached = False
         self.section_shorttitle_notend_status = False
+        self.is_footnote_continuation = is_footnote_continuation
         self.fontmapper = DynamicFontMapper(self.pdf_path, out_dir=self.output_dir)
+        self.unique_images = {}
+        self.all_footnote_text = {}
+        if self.pdf_type in set(['acts']):
+            self.html_builder = self.get_htmlBuilder(pdf_type, self.has_doc_end)
+        elif self.pdf_type in set(['sebi_circulars']):
+            self.html_builder = self.get_htmlBuilder(pdf_type)
+        else:
+            self.html_builder = self.get_htmlBuilder(pdf_type)
+        self.min_img_size = min_img_size
         # self.fontmapper.extract_fonts()
-        
+
+    def get_all_footnote_text(self):
+
+        FOOTNOTE_START_RE = re.compile(
+            r'^\{\{\^\{\{FOOTNOTE\s*(.+?)\}\}\}\}'
+        )
+
+        active_footnote_num = None
+
+        for pg_num in sorted(self.all_pgs.keys()):
+
+            page = self.all_pgs[pg_num]
+
+            for tb in page.all_tbs.keys():
+
+                if page.all_tbs[tb] != 'footnote':
+                    continue
+
+                for textline in tb.tbox.findall(".//textline"):
+
+                    line_parts = []
+
+                    pending_superscript = []
+
+                    for text in textline.findall(".//text"):
+
+                        raw = text.text or ""
+
+                        if not raw:
+                            continue
+
+                        is_super = False
+
+                        if "bbox" in text.attrib:
+
+                            try:
+
+                                bbox = tuple(
+                                    map(
+                                        float,
+                                        text.attrib["bbox"].split(",")
+                                    )
+                                )
+
+                                if bbox in tb.footnotes_superscript:
+
+                                    pending_superscript.append(
+                                        tb.footnotes_superscript[bbox]
+                                    )
+
+                                    is_super = True
+
+                            except Exception:
+                                pass
+
+                        if not is_super:
+
+                            if pending_superscript:
+
+                                marker = "".join(
+                                    pending_superscript
+                                )
+
+                                line_parts.append(
+                                    "{{^{{FOOTNOTE "
+                                    + marker +
+                                    "}}}}"
+                                )
+
+                                pending_superscript = []
+
+                            line_parts.append(raw)
+
+                    if pending_superscript:
+
+                        marker = "".join(
+                            pending_superscript
+                        )
+
+                        line_parts.append(
+                            "{{^{{FOOTNOTE "
+                            + marker +
+                            "}}}}"
+                        )
+
+                    text = "".join(line_parts)
+
+                    text = re.sub(
+                        r'\s+',
+                        ' ',
+                        text
+                    ).strip()
+
+                    if not text:
+                        continue
+
+                    start_match = FOOTNOTE_START_RE.match(text)
+
+                    if start_match:
+
+                        footnote_num = (
+                            start_match.group(1).strip()
+                        )
+
+                        active_footnote_num = footnote_num
+
+                        cleaned_text = FOOTNOTE_START_RE.sub(
+                            '',
+                            text,
+                            count=1
+                        ).strip()
+
+                        if (
+                            footnote_num
+                            not in self.all_footnote_text
+                        ):
+
+                            self.all_footnote_text[
+                                footnote_num
+                            ] = cleaned_text
+
+                        else:
+
+                            self.all_footnote_text[
+                                footnote_num
+                            ] += "\n" + cleaned_text
+
+                    else:
+
+                        if not active_footnote_num:
+                            continue
+
+                        self.all_footnote_text[
+                            active_footnote_num
+                        ] += "\n" + text
+
+            if not self.is_footnote_continuation:
+
+                active_footnote_num = None
+
+    def finalize_unique_images(self):
+
+        remove_hashes = []
+
+        for img_hash, meta in self.unique_images.items():
+
+            if meta.get("count", 0) > 1:
+
+                img_path = meta.get("path")
+
+
+                if img_path and os.path.exists(img_path):
+
+                    try:
+                        os.remove(img_path)
+
+                        self.logger.info(
+                            f"Deleted duplicate image: {img_path}"
+                        )
+
+                        self.remove_empty_parent_dir(img_path)
+                    
+                    except Exception as e:
+
+                        self.logger.warning(
+                            f"Failed deleting image "
+                            f"{img_path}: {e}"
+                        )
+
+
+                for pg_num in meta.get("pages", set()):
+                    pg_num = int(pg_num)
+                    page_obj = self.all_pgs.get(pg_num)
+                    if page_obj and hasattr(page_obj, "figures"):
+                        try:
+                            page_obj.figures.remove_hash(img_hash)
+
+                        except Exception as e:
+
+                            self.logger.warning(
+                                f"Failed removing image hash "
+                                f"{img_hash} from page {pg_num}: {e}"
+                            )
+
+
+                remove_hashes.append(img_hash)
+
+
+        for img_hash in remove_hashes:
+
+            del self.unique_images[img_hash]
+
+        self.logger.info(
+            f"Remaining unique images: "
+            f"{len(self.unique_images)}"
+        )
+    
+    def remove_empty_parent_dir(self, file_path):
+        try:
+            parent_dir = os.path.dirname(file_path)
+            if parent_dir and os.path.isdir(parent_dir):
+                os.rmdir(parent_dir)
+
+                self.logger.debug(
+                    f"Removed empty image directory: {parent_dir}"
+                )
+
+        except OSError:
+            pass
+
+        except Exception:
+            self.logger.exception(
+                f"Failed removing directory for: {file_path}"
+            )
+    
     def get_htmlBuilder(self, pdf_type, docend_symbol = False):
         if pdf_type == 'sebi':
             sentence_completion_punctutation = ("'.",'".',".'", '."', "';", ";'", ';"','";') #( ".", ":", "?",  ".'", '."', ";", ";'", ';"')
             return HTMLBuilder(sentence_completion_punctutation, pdf_type)
-        elif pdf_type == 'acts':
+        elif pdf_type in set(['acts']):
             sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
                                                 ': or', '; and', ': and', ':––', ';––',\
                                                 '––', '."', '.\'', ';"', ';\'' , \
                                                 '.”', '.’', ';”' , ';’', ':-')
             return Acts(sentence_completion_punctutation, pdf_type, docend_symbol)
+        elif pdf_type in set(['sebi_circulars']):
+            sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
+                                                ': or', '; and', ': and', ':––', ';––',\
+                                                '––', '."', '.\'', ';"', ';\'' , \
+                                                '.”', '.’', ';”' , ';’', ':-', '.]',
+                                                ',-', ':-', ';-', '--')
+            return SebiCirculars(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type, docend_symbol)
+
         else:
             sentence_completion_punctutation = ('.', ':')
             return HTMLBuilder(sentence_completion_punctutation, pdf_type)
@@ -60,7 +291,7 @@ class Main:
             self.html_builder.build(page, self.has_side_notes) #, section_page_end)
         
         self.logger.debug("Fetching Full HTML content")
-        if self.pdf_type != "acts":
+        if self.pdf_type not in set(['acts', 'sebi_circulars']):
             html_content = self.html_builder.get_html()
             self.write_html(html_content, start_page, end_page)
         else:
@@ -90,7 +321,32 @@ class Main:
             # page.print_headers()
             # page.print_footers()
 
-    
+    def process_pages_sebi_circulars(self, pdf_type):
+        prev_sent_end_status = True
+        sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
+                                                ': or', '; and', ': and', ':––', ';––',\
+                                                '––', '."', '.\'', ';"', ';\'' , \
+                                                '.”', '.’', ';”' , ';’', ':-', '.]',
+                                                ',-', ':-', ';-', '--')
+
+        for page in self.all_pgs.values():
+            self.logger.info(f"Processing page num-{page.pg_num}")
+            page.get_width_ofTB_moreThan_Half_of_pg()
+            page.get_body_width_by_binning()
+            # page.is_single_column_page = page.is_single_column_page()
+            # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
+            # print(page.is_single_column_page)
+            page.get_bulletins_sebi_circulars(self.section_state)
+            page.get_titles(pdf_type)
+            prev_sent_end_status = page.get_title_hierarchy(self.title_state, prev_sent_end_status, sentence_completion_punctutation)   
+            page.sort_all_boxes()
+            # page.print_blockquote()
+            # page.print_headers()
+            # page.print_footers()
+            # page.print_levels()
+            page.print_all()
+            # page.print_tbs()
+
     def process_pages_sebi(self, pdf_type):
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
@@ -153,17 +409,38 @@ class Main:
                 self.logger.debug(f"Copied input file to cache dir as: {new_pdf_path}")
                 self.pdf_path = new_pdf_path
 
-            page = Page(pg, self.pdf_path, base_name_of_file, output_dir, self.pdf_type, self.has_side_notes, self.is_amendment_pdf, self.fontmapper)
+            page = Page(pg, self.pdf_path, base_name_of_file, output_dir, 
+                        self.pdf_type, self.has_side_notes, self.is_amendment_pdf, 
+                        self.fontmapper, self.unique_images, self.min_img_size)
             self.total_pgs += 1
             self.all_pgs[self.total_pgs] = page
             page.process_textboxes()#pg)
             page.get_figures()#pg)
             page.label_table_tbs()
 
-            page.line_based_header_footer_detection()
+            # page.line_based_header_footer_detection()
         # Run adaptive header/footer detection
         self.logger.info("Starting adaptive header/footer detection...")
         self.adaptive_header_footer_detection(pages, self.pdf_type)
+
+        
+        if self.pdf_type in {'sebi_circulars'} :
+            previous_page_footnote_font_size  = None
+            seen_footnote = set()
+            for page in self.all_pgs.values():
+                if self.is_footnote_continuation:
+                    previous_page_footnote_font_size, seen_footnote = (
+                        page.get_footnotes(
+                            seen_footnote,
+                            previous_page_footnote_font_size
+                        )
+                    )
+                else:
+                    page.get_footnotes()
+
+        self.finalize_unique_images()
+        self.get_all_footnote_text()
+        self.logger.info(self.all_footnote_text)
 
     def adaptive_header_footer_detection(self, pages, pdf_type=None):
         self.adaptive_headers = []
@@ -171,12 +448,20 @@ class Main:
         page_elements = []
         
         # Simple working configuration
-        HEADER_ZONE_THRESHOLD = 0.12#0.15    # Top 15% of page height
-        FOOTER_ZONE_THRESHOLD = 0.12#0.15    # Bottom 15% of page height
-        SIMILARITY_THRESHOLD =  0.8       # 80% similarity
-        MIN_OCCURRENCE_RATE =   0.4     # Must appear on at least 40% of pages
-        LINE_TOLERANCE = 0.02           # 2% of page height tolerance for same line detection
+        if pdf_type not in set(['sebi_circulars']):
+            HEADER_ZONE_THRESHOLD = 0.12#0.15    # Top 15% of page height
+            FOOTER_ZONE_THRESHOLD = 0.12#0.15    # Bottom 15% of page height
+            SIMILARITY_THRESHOLD =  0.8       # 80% similarity
+            MIN_OCCURRENCE_RATE =   0.4     # Must appear on at least 40% of pages
+            LINE_TOLERANCE = 0.02           # 2% of page height tolerance for same line detection
         
+        else:
+            HEADER_ZONE_THRESHOLD = 0.12#0.15    # Top 15% of page height
+            FOOTER_ZONE_THRESHOLD = 0.12#0.15    # Bottom 15% of page height
+            SIMILARITY_THRESHOLD =  0.9       # 80% similarity
+            MIN_OCCURRENCE_RATE =   0.6     # Must appear on at least 40% of pages
+            LINE_TOLERANCE = 0.02 
+
         try:
             total_pages = len(pages)
             self.logger.info("Starting adaptive header/footer detection on %d pages", total_pages)
@@ -871,6 +1156,8 @@ class Main:
             self.logger.debug("Processing content from pages...")
             if pdf_type == 'acts':
                 self.process_pages_acts(pdf_type)
+            elif pdf_type == 'sebi_circulars':
+                self.process_pages_sebi_circulars(pdf_type)
             elif pdf_type == 'sebi':
                 self.process_pages_sebi(pdf_type)
             else:
@@ -882,12 +1169,20 @@ class Main:
             return False
 
 
+    def escape_inline_markup(self, content):
+        if not content:
+            return content
+
+        pattern = r'(?<!\\)([*_/])'
+
+        return re.sub(
+            pattern,
+            r'\\\1',
+            content
+        )
     
     # --- func for writing the html content to the desired output file ---
     def write_html(self, content, start_page, end_page):
-        if not content:
-            self.logger.warning('HTML content not available to save')
-            return
         try:
             if start_page or end_page:
                 if start_page is None:
@@ -919,6 +1214,7 @@ class Main:
             self.logger.exception("Failed to write HTML content: %s", e)
 
     def write_bluebell(self, content, start_page, end_page):
+        content = self.escape_inline_markup(content)
         if not content:
             self.logger.warning('Content not available to save')
             return
@@ -1022,6 +1318,10 @@ def get_arg_parser():
                         required=False, default=None, help = 'if requires, set word margin threshold for pdf miner')
     parser.add_argument('-de', '--doc-end', dest = 'has_doc_end', action = 'store_true', \
                         required = False, default = False, help = 'mention if pdf has document end symbol (---)')
+    parser.add_argument('-fnc', '--footnote-continuation', dest='is_footnote_continuation', action = 'store_true', \
+                        required = False, default = False, help = 'mention if pdf has footnote that continued across the pages')
+    parser.add_argument('-mis', '--min-img-size', dest = 'min_img_size', action = 'store', \
+                      required = False,  default = 50,  help = 'mention the min size of the image to avoid junk images')
     return parser
 
 
@@ -1078,7 +1378,12 @@ if __name__ == "__main__":
     logger.debug(f"Is the pdf contains side notes - {"Yes" if has_sidenotes else "No"}")
     output_dir = args.output_dir
     has_doc_end = args.has_doc_end
-    main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+    is_footnote_continuation = args.is_footnote_continuation
+    min_img_size = args.min_img_size
+    if min_img_size and isinstance(min_img_size, str):
+        min_img_size = int(min_img_size)
+    main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
+                is_footnote_continuation, min_img_size)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])
