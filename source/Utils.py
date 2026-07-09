@@ -1,4 +1,70 @@
 import re
+import fasttext
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MODEL_PATH = PROJECT_ROOT / "model" / "lid.176.bin"
+
+LANG_MODEL = fasttext.load_model(str(MODEL_PATH))
+
+from paddleocr import PaddleOCR
+
+OCR_ENGINES = {}
+from paddleocr import PaddleOCR
+
+
+LANGUAGES = [
+    "en",  # English / Latin
+    "hi",  # Hindi
+    "mr",  # Marathi
+    "ne",  # Nepali
+    "sa",  # Sanskrit
+    "ta",  # Tamil
+    "te",  # Telugu
+]
+
+for lang in LANGUAGES:
+    OCR_ENGINES[lang] = PaddleOCR(
+        lang=lang,
+        device="cpu",
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=False,
+    )
+
+def extract_text(image_path, lang):
+    try:
+        ocr = OCR_ENGINES[lang]
+
+        result = ocr.predict(image_path)
+
+        texts = []
+
+        for item in result:
+            texts.extend(item.json["res"]["rec_texts"])
+
+        return "\n".join(texts)
+    
+    except Exception as e:
+        return None
+
+
+def detect_language(text):
+    text = text.strip()
+
+    if not text:
+        return None, 0.0
+
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    labels, scores = LANG_MODEL.predict(text)
+
+    return (
+        labels[0].replace("__label__", ""),
+        float(scores[0]),
+    )
 
 ROMAN_RE  = r"(?:M{0,4}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3}))"
 

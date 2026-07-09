@@ -30,7 +30,7 @@ class SectionState:
 class Page:
     def __init__(self,pg,pdfPath, base_name_of_file, output_dir, 
                  pdf_type, has_side_notes, is_amendment_pdf, 
-                 font_mapper, unique_images, min_img_size):
+                 font_mapper, unique_images, min_img_size, ocr_language):
         self.logger = logging.getLogger(__name__)
         self.pdf_path = pdfPath
         self.page_in_xml = pg
@@ -41,9 +41,11 @@ class Page:
         self.all_figbox = {}
         self.has_side_notes = has_side_notes
         self.pdf_type = pdf_type
+        self.ocr_language = ocr_language
         self.is_amendment_pdf = is_amendment_pdf
         self.figures = Pictures(self.pdf_path, self.pg_num, base_name_of_file, 
-                                output_dir, unique_images, min_img_size)
+                                output_dir, unique_images, min_img_size,
+                                ocr_language)
         self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type)
         self.side_notes_datas ={}
         self.font_mapper = font_mapper

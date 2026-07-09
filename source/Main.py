@@ -9,7 +9,7 @@ import logging
 import shutil
 from .ParserTool import ParserTool
 from .Page import Page, SectionState
-from .HTMLBuilder import HTMLBuilder
+from .HTMLBuilder import HTMLBuilder, HTMLBuilderChromeLens
 from .Acts import Acts
 from .SebiCirculars import SebiCirculars
 from .Amendment import Amendment
@@ -18,7 +18,7 @@ from .FontMapper import DynamicFontMapper
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
-                 is_footnote_continuation, min_img_size): #start,end,is_amendment_pdf,output_dir, pdf_type):
+                 is_footnote_continuation, min_img_pixels, ocr_language): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
         self.pdf_path = pdfPath
         self.output_dir = output_dir
@@ -39,13 +39,9 @@ class Main:
         self.fontmapper = DynamicFontMapper(self.pdf_path, out_dir=self.output_dir)
         self.unique_images = {}
         self.all_footnote_text = {}
-        if self.pdf_type in set(['acts']):
-            self.html_builder = self.get_htmlBuilder(pdf_type, self.has_doc_end)
-        elif self.pdf_type in set(['sebi_circulars']):
-            self.html_builder = self.get_htmlBuilder(pdf_type)
-        else:
-            self.html_builder = self.get_htmlBuilder(pdf_type)
-        self.min_img_size = min_img_size
+        self.html_builder = None
+        self.min_img_pixels = min_img_pixels
+        self.ocr_language = ocr_language
         # self.fontmapper.extract_fonts()
 
     def get_all_footnote_text(self):
@@ -265,7 +261,7 @@ class Main:
     def get_htmlBuilder(self, pdf_type, docend_symbol = False):
         if pdf_type == 'sebi':
             sentence_completion_punctutation = ("'.",'".',".'", '."', "';", ";'", ';"','";') #( ".", ":", "?",  ".'", '."', ";", ";'", ';"')
-            return HTMLBuilder(sentence_completion_punctutation, pdf_type)
+            return HTMLBuilder(self.unique_images, sentence_completion_punctutation, pdf_type)
         elif pdf_type in set(['acts']):
             sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
                                                 ': or', '; and', ': and', ':––', ';––',\
@@ -282,10 +278,18 @@ class Main:
 
         else:
             sentence_completion_punctutation = ('.', ':')
-            return HTMLBuilder(sentence_completion_punctutation, pdf_type)
+            return HTMLBuilder(self.unique_images, sentence_completion_punctutation, pdf_type)
         
     # --- func to build HTML after text classification ---
     def buildHTML(self, start_page, end_page): #, section_page_end):
+        if not self.html_builder:
+            return
+        if not self.all_pgs:
+            self.html_builder.build(start_page, end_page)
+            html_content = self.html_builder.get_html()
+            self.write_html(html_content, start_page, end_page)
+            return
+        
         for page in self.all_pgs.values():
             self.logger.info(f"HTML build starts for page num-{page.pg_num}")
             self.html_builder.build(page, self.has_side_notes) #, section_page_end)
@@ -377,7 +381,7 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
             page.get_titles(pdf_type)
-            page.get_bulletins(self.section_state)
+            # page.get_bulletins(self.section_state)
             page.sort_all_boxes()
             # page.print_headers()
             # page.print_footers()
@@ -411,7 +415,8 @@ class Main:
 
             page = Page(pg, self.pdf_path, base_name_of_file, output_dir, 
                         self.pdf_type, self.has_side_notes, self.is_amendment_pdf, 
-                        self.fontmapper, self.unique_images, self.min_img_size)
+                        self.fontmapper, self.unique_images, self.min_img_pixels, 
+                        self.ocr_language)
             self.total_pgs += 1
             self.all_pgs[self.total_pgs] = page
             page.process_textboxes()#pg)
@@ -1123,6 +1128,14 @@ class Main:
                 return b"%PDF-" in header
         except Exception:
             return False
+    
+    def set_htmlbuilder(self):
+        if self.pdf_type in set(['acts']):
+            self.html_builder = self.get_htmlBuilder(self.pdf_type, self.has_doc_end)
+        elif self.pdf_type in set(['sebi_circulars']):
+            self.html_builder = self.get_htmlBuilder(self.pdf_type)
+        else:
+            self.html_builder = self.get_htmlBuilder(self.pdf_type)
 
     # --- parse pdf using pdfminer to convert to XML ---       
     def parsePDF(self, pdf_type, char_margin, word_margin, line_margin, \
@@ -1151,18 +1164,25 @@ class Main:
 
             self.logger.debug("Parsing pages from XML: %s", self.xml_path)
             pages = self.parserTool.get_pages_from_xml(self.xml_path, start_page, end_page)
-            self.logger.debug("Extracting header and footer info...")
-            self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
-            self.logger.debug("Processing content from pages...")
-            if pdf_type == 'acts':
-                self.process_pages_acts(pdf_type)
-            elif pdf_type == 'sebi_circulars':
-                self.process_pages_sebi_circulars(pdf_type)
-            elif pdf_type == 'sebi':
-                self.process_pages_sebi(pdf_type)
+            if pages:
+                self.set_htmlbuilder()
+                self.logger.debug("Extracting header and footer info...")
+                self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
+                self.logger.debug("Processing content from pages...")
+                if pdf_type == 'acts':
+                    self.process_pages_acts(pdf_type)
+                elif pdf_type == 'sebi_circulars':
+                    self.process_pages_sebi_circulars(pdf_type)
+                elif pdf_type == 'sebi':
+                    self.process_pages_sebi(pdf_type)
+                else:
+                    self.process_pages(pdf_type)
+                self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
             else:
-                self.process_pages(pdf_type)
-            self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
+                if pdf_type in {'egazette'}:
+                    self.logger.info('using chrome lens for the scanned copy')
+                    self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
+
             return True
         except Exception as e:
             self.logger.exception("Exception occurred while parsing PDF: %s", e)
@@ -1183,6 +1203,9 @@ class Main:
     
     # --- func for writing the html content to the desired output file ---
     def write_html(self, content, start_page, end_page):
+        if not content:
+            self.logger.warning(f'HTML content not generate for pdf pdth: {self.pdf_path}')
+            return
         try:
             if start_page or end_page:
                 if start_page is None:
@@ -1320,8 +1343,10 @@ def get_arg_parser():
                         required = False, default = False, help = 'mention if pdf has document end symbol (---)')
     parser.add_argument('-fnc', '--footnote-continuation', dest='is_footnote_continuation', action = 'store_true', \
                         required = False, default = False, help = 'mention if pdf has footnote that continued across the pages')
-    parser.add_argument('-mis', '--min-img-size', dest = 'min_img_size', action = 'store', \
-                      required = False,  default = 50,  help = 'mention the min size of the image to avoid junk images')
+    parser.add_argument('-mip', '--min-img-pixels', dest = 'min_img_pixels', action = 'store', \
+                      required = False,  default = 0,  help = 'minimum pixel area threshold for initial filtering (area = dimension^2). Images are further filtered based on text content detection.')
+    parser.add_argument('-ol', '--ocr-language', dest='ocr_language', action='store', \
+                      required=False, default='en', help='language code for OCR (default: en, two letter code)')
     return parser
 
 
@@ -1379,11 +1404,12 @@ if __name__ == "__main__":
     output_dir = args.output_dir
     has_doc_end = args.has_doc_end
     is_footnote_continuation = args.is_footnote_continuation
-    min_img_size = args.min_img_size
-    if min_img_size and isinstance(min_img_size, str):
-        min_img_size = int(min_img_size)
+    min_img_pixels = args.min_img_pixels
+    if min_img_pixels and isinstance(min_img_pixels, str):
+        min_img_pixels = int(min_img_pixels)
+    ocr_language = args.ocr_language
     main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
-                is_footnote_continuation, min_img_size)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+                is_footnote_continuation, min_img_pixels, ocr_language)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])

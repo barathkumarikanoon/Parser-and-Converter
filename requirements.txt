@@ -7,3 +7,9 @@ numpy
 beautifulsoup4
 lxml
 fonttools
+pytesseract
+chrome-lens-py
+pymupdf
+fasttext
+paddlepaddle==3.1.1
+paddleocr==3.7.0

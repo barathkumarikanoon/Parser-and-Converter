@@ -6,7 +6,7 @@ import logging
 import pandas as pd
 from difflib import SequenceMatcher
 import copy
-
+from pathlib import Path
 from .Table import TableBuilder
 from .SentenceEndDetector import LegalSentenceDetector
 from .NormalizeText import NormalizeText
@@ -18,7 +18,7 @@ VOID_TAGS = {"br"}
 
 class HTMLBuilder(TableBuilder):
     
-    def __init__(self, sentence_completion_punctuation = tuple(), pdf_type = None):
+    def __init__(self, unique_images, sentence_completion_punctuation = tuple(), pdf_type = None):
         TableBuilder.__init__(self)
         self.logger = logging.getLogger(__name__)
         self.pdf_type = pdf_type
@@ -34,13 +34,15 @@ class HTMLBuilder(TableBuilder):
         self.is_pre_added = False
         self.normalize_text = NormalizeText().normalize_text
         self.builder = ""
+        self.unique_images = unique_images
+        self.pending_header_footer = []
         self.main_builder = '''<!DOCTYPE HTML>
 <html>
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body {
-    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
     line-height: 1.6;
     white-space: normal;
   }
@@ -71,6 +73,22 @@ class HTMLBuilder(TableBuilder):
   }
   p {
     white-space: pre-wrap;
+  }
+
+  p.figure-text {
+    display: none;
+  }
+
+  span.header-text{
+    display:None;
+  }
+  
+  span.footer-text{
+    display:None;
+  }
+  
+  h4 {
+    text-align: center;
   }
 
   table {
@@ -239,7 +257,7 @@ class HTMLBuilder(TableBuilder):
                           line_texts.append(text.text)
                   line = ''.join(line_texts).replace("\n", " ").strip()
                   if line:
-                      doc += f"<center><h4>{self.normalize_text(line)}</h4></center>\n"
+                      doc += f"<h4>{self.normalize_text(line)}</h4>\n"
               self.builder += doc
         except Exception as e:
           self.logger.exception("Error while adding title - [%s] in html: %s",tb.extract_text_from_tb(),e)
@@ -746,17 +764,42 @@ class HTMLBuilder(TableBuilder):
              return True
         return False
     
-    def addFigure(self, tb, page):
-      if tb.figname in page.figures.pics:
-          if self.pending_tag and self.pending_text:
-            self.flushPrevious()
-          if self.pending_table:
-            self.flushTables()
-          # if self.stack_for_level:
-          #   self.close_levels()
-          img_path = page.figures.pics[tb.figname]
-          self.builder += f'<a href="{img_path}" target="_blank">[View Image]</a>\n'
+    from pathlib import Path
 
+    def extract_img_path(self, full_path):
+      try:
+        p = Path(full_path)
+        parts = p.parts
+
+        if 'images' in parts:
+            idx = parts.index('images')
+            return str(Path(*parts[idx:]))
+        else:
+            return None  # or raise error
+      except Exception as e:
+         self.logger.warning(f'Extracting img path while building html {e}')
+         return None
+    
+    def addFigure(self, tb, page):
+      try:
+        if tb.figname in self.unique_images:
+            if self.pending_tag and self.pending_text:
+              self.flushPrevious()
+            if self.pending_table:
+              self.flushTables()
+            # if self.stack_for_level:
+            #   self.close_levels()
+             
+            img_path = self.extract_img_path(self.unique_images[tb.figname] \
+            .get("path",""))
+
+            self.builder += f'<a href="{img_path}" target="_blank">[View Image]</a>\n'
+
+            text_content = self.unique_images[tb.figname].get("text", "")
+            if text_content:
+                self.builder += f'<p class="figure-text">{text_content}</p>\n'
+      except Exception as e:
+         self.logger.warning(f'While adding figure to html, {e}')
    
     def add_pre(self):
         html = copy.deepcopy(self.builder)
@@ -797,8 +840,34 @@ class HTMLBuilder(TableBuilder):
         elif facts_case_pattern.search(text):
             self.add_pre()
         
+    def add_header(self, text):
+        if not self.pending_table:
+            if self.pending_tag and self.pending_text:
+                self.pending_text += f'<span class="header-text">{text}</span>\n'
+            else:
+                self.builder += f'<span class="header-text">{text}</span>\n'
         
+        else:
+           header = f'<span class="header-text">{text}</span>\n'
+           self.pending_header_footer.append(header)
 
+    def add_footer(self, text):
+        if not self.pending_table:
+            if self.pending_tag and self.pending_text:
+                self.pending_text += f'<span class="footer-text">{text}</span>\n'
+            else:
+                self.builder += f'<span class="footer-text">{text}</span>\n' 
+
+        else:
+           footer = f'<span class="footer-text">{text}</span>\n'
+           self.pending_header_footer.append(footer) 
+
+    def flush_pending_header_footer(self):
+        if self.pending_header_footer:
+            self.builder += '\n'
+            for item in self.pending_header_footer:
+                self.builder += item
+            self.pending_header_footer = []
         
     def build(self, page, has_side_notes):#, section_end_page):
         visited_for_table = set()
@@ -834,12 +903,23 @@ class HTMLBuilder(TableBuilder):
                     next_text_tb = next_tb
 
             at_page_end = (idx == len(all_items) - 1)
-            if label == "header" or label == "footer" :#or self.is_pg_num(tb,page.pg_width):
-               continue
+            if label == "header":
+                self.add_header(
+                  self.normalize_text(tb.extract_text_from_tb())
+               )
+                continue
+
+            elif label == "footer":#or self.is_pg_num(tb,page.pg_width):
+                self.add_footer(
+                  self.normalize_text(tb.extract_text_from_tb())
+               )
+                continue
+            
             if not ((isinstance(label, tuple) and label[0] == "table")):
                 if self.pending_table is not None and len(self.pending_table) <= 2:
                     self.addTable(self.pending_table[0])
                     self.pending_table = None
+                    self.flush_pending_header_footer()
             
             if self.pdf_type == 'sebi' and not self.is_pre_added and label in ('title', 'level1'):
                 self.check_for_pre_ended(self.normalize_text(tb.extract_text_from_tb()), label)
@@ -945,8 +1025,10 @@ class HTMLBuilder(TableBuilder):
       return OrderedDict(flat)           
     
     def close_html(self):
-       html = self.main_builder + self.builder + "\n</body>\n</html>"
-       return html
+        if not self.builder:
+           return None
+        html = self.main_builder + self.builder + "\n</body>\n</html>"
+        return html
     
     def get_html(self):
         self.flushPrevious()
@@ -1035,3 +1117,333 @@ class HTMLBuilder(TableBuilder):
 
           except Exception as e:
               self.logger.exception("Error while adding section [%s]: %s", text, e)
+
+
+import asyncio
+import io
+from html import escape
+
+import pymupdf
+from PIL import Image
+from chrome_lens_py import LensAPI
+from statistics import median
+
+
+class HTMLBuilderChromeLens:
+
+    def __init__(self, pdf_path):
+        self.pdf_path = pdf_path
+        self.lens = LensAPI()
+        self.builder = ""
+        self.total_pages = 0
+        self.logger = logging.getLogger(__name__)
+
+    async def process_page(self, page):
+
+        pix = page.get_pixmap(
+            dpi=300,
+            alpha=False
+        )
+
+        image = Image.open(
+            io.BytesIO(
+                pix.tobytes("png")
+            )
+        )
+
+        result = await self.lens.process_image(
+            image_path=image,
+            output_format="detailed"
+        )
+
+        return result.get(
+            "detailed_blocks",
+            []
+        )
+
+    async def _build_async(
+        self,
+        start_page,
+        end_page
+    ):
+
+        doc = pymupdf.open(
+            self.pdf_path
+        )
+
+        try:
+
+            for page_num in range(
+                start_page,
+                end_page + 1
+            ):
+
+                print(
+                    f"Processing page {page_num}/{self.total_pages}"
+                )
+
+                page = doc[
+                    page_num - 1
+                ]
+
+                detailed_blocks = await self.process_page(
+                    page
+                )
+
+                self.builder += (
+                    self.build_page_html(
+                        detailed_blocks,
+                        page_num
+                    )
+                    + "\n\n"
+                )
+
+        finally:
+
+            doc.close()
+
+    def build(
+        self,
+        start_page=None,
+        end_page=None
+    ):
+
+        doc = pymupdf.open(
+            self.pdf_path
+        )
+
+        self.total_pages = len(
+            doc
+        )
+
+        doc.close()
+
+        if start_page is None:
+            start_page = 1
+
+        if end_page is None:
+            end_page = self.total_pages
+
+        start_page = max(
+            1,
+            start_page
+        )
+
+        end_page = min(
+            self.total_pages,
+            end_page
+        )
+
+        i = 1
+
+        while i <= 3:
+            try:
+                asyncio.run(
+                    self._build_async(
+                        start_page,
+                        end_page
+                    )
+                )
+            
+            except Exception as e:
+               self.logger.warning(f'While using chrome lens to build html: {e}')
+            
+            i += 1
+               
+
+
+    def build_page_html(self, detailed_blocks, page_number):
+
+        words = []
+
+        for block in detailed_blocks:
+
+            for line in block.get("lines", []):
+
+                for word in line.get("words", []):
+
+                    txt = word.get("text", "").strip()
+
+                    if not txt:
+                        continue
+
+                    g = word["geometry"]
+
+                    left = g["center_x"] - g["width"] / 2
+                    right = g["center_x"] + g["width"] / 2
+                    top = g["center_y"] - g["height"] / 2
+                    bottom = g["center_y"] + g["height"] / 2
+
+                    words.append({
+
+                        "text": txt,
+
+                        "left": left,
+                        "right": right,
+
+                        "top": top,
+                        "bottom": bottom,
+
+                        "cx": g["center_x"],
+                        "cy": g["center_y"],
+
+                        "width": g["width"],
+                        "height": g["height"]
+
+                    })
+
+        if not words:
+            return ""
+
+        median_height = median(
+            w["height"]
+            for w in words
+        )
+
+        row_threshold = median_height * 0.60
+
+        words.sort(
+            key=lambda w: (
+                w["cy"],
+                w["left"]
+            )
+        )
+
+
+        rows = []
+
+        for word in words:
+
+            found = False
+
+            for row in rows:
+
+                if abs(row["cy"] - word["cy"]) <= row_threshold:
+
+                    row["words"].append(word)
+
+                    n = len(row["words"])
+
+                    row["cy"] = (
+                        row["cy"] * (n - 1)
+                        + word["cy"]
+                    ) / n
+
+                    found = True
+                    break
+
+            if not found:
+
+                rows.append({
+
+                    "cy": word["cy"],
+
+                    "words": [word]
+
+                })
+
+        rows.sort(
+            key=lambda r: r["cy"]
+        )
+
+        html = []
+
+        PAGE_WIDTH = 1.0
+
+        AVG_CHAR_WIDTH = 0.010
+
+        for row in rows:
+
+            row["words"].sort(
+                key=lambda w: w["left"]
+            )
+
+            spans = []
+
+            current = []
+
+            prev = None
+
+            for word in row["words"]:
+
+                if prev is None:
+
+                    current.append(word)
+
+                    prev = word
+
+                    continue
+
+                gap = word["left"] - prev["right"]
+
+                # if close -> same span
+                if gap < AVG_CHAR_WIDTH * 2:
+
+                    current.append(word)
+
+                else:
+
+                    spans.append(current)
+
+                    current = [word]
+
+                prev = word
+
+            if current:
+                spans.append(current)
+
+            row_html = []
+
+            previous_span_right = 0
+
+            for span in spans:
+
+                span_left = span[0]["left"]
+
+                gap = span_left - previous_span_right
+
+                spaces = max(
+                    1,
+                    round(gap / AVG_CHAR_WIDTH)
+                )
+
+                text = " ".join(
+                    w["text"]
+                    for w in span
+                )
+
+                row_html.append(
+                    "&nbsp;" * spaces +
+                    f"<span>{escape(text)}</span>"
+                )
+
+                previous_span_right = span[-1]["right"]
+
+
+
+            html.append(
+                "<p>{}</p>".format(
+                    "".join(row_html)
+                )
+            )
+
+        return "\n".join(html)
+
+    def get_html(self):
+        if not self.builder:
+           self.logger.warning(f'OOPS! chrome lens couldn\'t generate html for pdf path:{self.pdf_path}')
+           return None
+
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Document</title>
+</head>
+<body>
+
+{self.builder}
+
+</body>
+</html>
+"""
