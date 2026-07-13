@@ -771,7 +771,7 @@ class HTMLBuilder(TableBuilder):
         p = Path(full_path)
         parts = p.parts
 
-        if 'images' in parts:
+        if 'manifest' in parts:
             idx = parts.index('images')
             return str(Path(*parts[idx:]))
         else:
@@ -1178,10 +1178,6 @@ class HTMLBuilderChromeLens:
                 end_page + 1
             ):
 
-                print(
-                    f"Processing page {page_num}/{self.total_pages}"
-                )
-
                 page = doc[
                     page_num - 1
                 ]
@@ -1250,7 +1246,125 @@ class HTMLBuilderChromeLens:
             
             i += 1
                
+    # def build_page_html(self, detailed_blocks, page_number):
+    #     words = []
+    #     for block in detailed_blocks:
+    #         for line in block.get("lines", []):
+    #             for word in line.get("words", []):
+    #                 txt = word.get("text", "").strip()
+    #                 if not txt:
+    #                     continue
+    #                 g = word["geometry"]
+    #                 left = g["center_x"] - g["width"] / 2
+    #                 right = g["center_x"] + g["width"] / 2
+    #                 top = g["center_y"] - g["height"] / 2
+    #                 bottom = g["center_y"] + g["height"] / 2
+    #                 words.append({
+    #                     "text": txt,
+    #                     "left": left,
+    #                     "right": right,
+    #                     "top": top,
+    #                     "bottom": bottom,
+    #                     "cx": g["center_x"],
+    #                     "cy": g["center_y"],
+    #                     "width": g["width"],
+    #                     "height": g["height"]
+    #                 })
+    #     if not words:
+    #         return ""
+    #     median_height = median(
+    #         w["height"]
+    #         for w in words
+    #     )
+    #     row_threshold = median_height * 0.60
+    #     words.sort(
+    #         key=lambda w: (
+    #             w["cy"],
+    #             w["left"]
+    #         )
+    #     )
+    #     rows = []
+    #     for word in words:
+    #         found = False
+    #         for row in rows:
+    #             if abs(row["cy"] - word["cy"]) <= row_threshold:
+    #                 row["words"].append(word)
+    #                 n = len(row["words"])
+    #                 row["cy"] = (
+    #                     row["cy"] * (n - 1)
+    #                     + word["cy"]
+    #                 ) / n
+    #                 found = True
+    #                 break
+    #         if not found:
+    #             rows.append({
+    #                 "cy": word["cy"],
+    #                 "words": [word]
+    #             })
+    #     rows.sort(
+    #         key=lambda r: r["cy"]
+    #     )
 
+    #     html = []
+    #     PAGE_WIDTH = 1.0
+    #     AVG_CHAR_WIDTH = 0.010
+    #     SENTENCE_ENDINGS = (".", "!", "?")
+    #     paragraph_buffer = []
+
+    #     def flush_paragraph():
+    #         if paragraph_buffer:
+    #             html.append("<p>{}</p>".format(" ".join(paragraph_buffer)))
+    #             paragraph_buffer.clear()
+
+    #     for row in rows:
+    #         row["words"].sort(
+    #             key=lambda w: w["left"]
+    #         )
+    #         spans = []
+    #         current = []
+    #         prev = None
+    #         for word in row["words"]:
+    #             if prev is None:
+    #                 current.append(word)
+    #                 prev = word
+    #                 continue
+    #             gap = word["left"] - prev["right"]
+    #             if gap < AVG_CHAR_WIDTH * 2:
+    #                 current.append(word)
+    #             else:
+    #                 spans.append(current)
+    #                 current = [word]
+    #             prev = word
+    #         if current:
+    #             spans.append(current)
+
+    #         row_text_parts = []
+    #         previous_span_right = 0
+    #         for span in spans:
+    #             span_left = span[0]["left"]
+    #             gap = span_left - previous_span_right
+    #             spaces = max(
+    #                 1,
+    #                 round(gap / AVG_CHAR_WIDTH)
+    #             )
+    #             text = " ".join(
+    #                 w["text"]
+    #                 for w in span
+    #             )
+    #             row_text_parts.append(
+    #                 "&nbsp;" * spaces + escape(text)
+    #             )
+    #             previous_span_right = span[-1]["right"]
+
+    #         paragraph_buffer.append("".join(row_text_parts))
+
+    #         last_word_text = row["words"][-1]["text"].strip()
+    #         if last_word_text.endswith(SENTENCE_ENDINGS):
+    #             flush_paragraph()
+
+    #     flush_paragraph()  # trailing text with no terminal punctuation
+
+    #     return "\n".join(html)
 
     def build_page_html(self, detailed_blocks, page_number):
 
@@ -1269,20 +1383,15 @@ class HTMLBuilderChromeLens:
 
                     g = word["geometry"]
 
-                    left = g["center_x"] - g["width"] / 2
-                    right = g["center_x"] + g["width"] / 2
-                    top = g["center_y"] - g["height"] / 2
-                    bottom = g["center_y"] + g["height"] / 2
-
                     words.append({
 
                         "text": txt,
 
-                        "left": left,
-                        "right": right,
+                        "left": g["center_x"] - g["width"] / 2,
+                        "right": g["center_x"] + g["width"] / 2,
 
-                        "top": top,
-                        "bottom": bottom,
+                        "top": g["center_y"] - g["height"] / 2,
+                        "bottom": g["center_y"] + g["height"] / 2,
 
                         "cx": g["center_x"],
                         "cy": g["center_y"],
@@ -1308,7 +1417,6 @@ class HTMLBuilderChromeLens:
                 w["left"]
             )
         )
-
 
         rows = []
 
@@ -1348,8 +1456,6 @@ class HTMLBuilderChromeLens:
 
         html = []
 
-        PAGE_WIDTH = 1.0
-
         AVG_CHAR_WIDTH = 0.010
 
         for row in rows:
@@ -1358,76 +1464,216 @@ class HTMLBuilderChromeLens:
                 key=lambda w: w["left"]
             )
 
-            spans = []
+            line = ""
 
-            current = []
-
-            prev = None
+            previous_right = None
 
             for word in row["words"]:
 
-                if prev is None:
+                if previous_right is None:
 
-                    current.append(word)
+                    indent = max(
+                        0,
+                        round(word["left"] / AVG_CHAR_WIDTH)
+                    )
 
-                    prev = word
-
-                    continue
-
-                gap = word["left"] - prev["right"]
-
-                # if close -> same span
-                if gap < AVG_CHAR_WIDTH * 2:
-
-                    current.append(word)
+                    line += " " * indent + word["text"]
 
                 else:
 
-                    spans.append(current)
+                    gap = word["left"] - previous_right
 
-                    current = [word]
+                    spaces = max(
+                        1,
+                        round(gap / AVG_CHAR_WIDTH)
+                    )
 
-                prev = word
+                    line += " " * spaces + word["text"]
 
-            if current:
-                spans.append(current)
-
-            row_html = []
-
-            previous_span_right = 0
-
-            for span in spans:
-
-                span_left = span[0]["left"]
-
-                gap = span_left - previous_span_right
-
-                spaces = max(
-                    1,
-                    round(gap / AVG_CHAR_WIDTH)
-                )
-
-                text = " ".join(
-                    w["text"]
-                    for w in span
-                )
-
-                row_html.append(
-                    "&nbsp;" * spaces +
-                    f"<span>{escape(text)}</span>"
-                )
-
-                previous_span_right = span[-1]["right"]
-
-
+                previous_right = word["right"]
 
             html.append(
-                "<p>{}</p>".format(
-                    "".join(row_html)
-                )
+                f'<p style="white-space: pre-wrap;">{escape(line)}</p>'
             )
 
         return "\n".join(html)
+
+    # def build_page_html(self, detailed_blocks, page_number):
+
+    #     words = []
+
+    #     for block in detailed_blocks:
+
+    #         for line in block.get("lines", []):
+
+    #             for word in line.get("words", []):
+
+    #                 txt = word.get("text", "").strip()
+
+    #                 if not txt:
+    #                     continue
+
+    #                 g = word["geometry"]
+
+    #                 left = g["center_x"] - g["width"] / 2
+    #                 right = g["center_x"] + g["width"] / 2
+    #                 top = g["center_y"] - g["height"] / 2
+    #                 bottom = g["center_y"] + g["height"] / 2
+
+    #                 words.append({
+
+    #                     "text": txt,
+
+    #                     "left": left,
+    #                     "right": right,
+
+    #                     "top": top,
+    #                     "bottom": bottom,
+
+    #                     "cx": g["center_x"],
+    #                     "cy": g["center_y"],
+
+    #                     "width": g["width"],
+    #                     "height": g["height"]
+
+    #                 })
+
+    #     if not words:
+    #         return ""
+
+    #     median_height = median(
+    #         w["height"]
+    #         for w in words
+    #     )
+
+    #     row_threshold = median_height * 0.60
+
+    #     words.sort(
+    #         key=lambda w: (
+    #             w["cy"],
+    #             w["left"]
+    #         )
+    #     )
+
+
+    #     rows = []
+
+    #     for word in words:
+
+    #         found = False
+
+    #         for row in rows:
+
+    #             if abs(row["cy"] - word["cy"]) <= row_threshold:
+
+    #                 row["words"].append(word)
+
+    #                 n = len(row["words"])
+
+    #                 row["cy"] = (
+    #                     row["cy"] * (n - 1)
+    #                     + word["cy"]
+    #                 ) / n
+
+    #                 found = True
+    #                 break
+
+    #         if not found:
+
+    #             rows.append({
+
+    #                 "cy": word["cy"],
+
+    #                 "words": [word]
+
+    #             })
+
+    #     rows.sort(
+    #         key=lambda r: r["cy"]
+    #     )
+
+    #     html = []
+
+    #     PAGE_WIDTH = 1.0
+
+    #     AVG_CHAR_WIDTH = 0.010
+
+    #     for row in rows:
+
+    #         row["words"].sort(
+    #             key=lambda w: w["left"]
+    #         )
+
+    #         spans = []
+
+    #         current = []
+
+    #         prev = None
+
+    #         for word in row["words"]:
+
+    #             if prev is None:
+
+    #                 current.append(word)
+
+    #                 prev = word
+
+    #                 continue
+
+    #             gap = word["left"] - prev["right"]
+
+    #             # if close -> same span
+    #             if gap < AVG_CHAR_WIDTH * 2:
+
+    #                 current.append(word)
+
+    #             else:
+
+    #                 spans.append(current)
+
+    #                 current = [word]
+
+    #             prev = word
+
+    #         if current:
+    #             spans.append(current)
+
+    #         row_html = []
+
+    #         previous_span_right = 0
+
+    #         for span in spans:
+
+    #             span_left = span[0]["left"]
+
+    #             gap = span_left - previous_span_right
+
+    #             spaces = max(
+    #                 1,
+    #                 round(gap / AVG_CHAR_WIDTH)
+    #             )
+
+    #             text = " ".join(
+    #                 w["text"]
+    #                 for w in span
+    #             )
+
+    #             row_html.append(
+    #                 "&nbsp;" * spaces +
+    #                 f"<span>{escape(text)}</span>"
+    #             )
+
+    #             previous_span_right = span[-1]["right"]
+
+
+
+    #         html.append(
+    #             "<p>{}</p>".format(
+    #                 "".join(row_html)
+    #             )
+    #         )
+
+    #     return "\n".join(html)
 
     def get_html(self):
         if not self.builder:

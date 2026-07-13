@@ -2,15 +2,17 @@ import camelot
 import logging 
 
 class TableExtraction:
-    def __init__(self,pdf_path,pg_num, pdf_type):
+    def __init__(self,pdf_path,pg_num, pdf_type, scanned_copy):
         self.logger = logging.getLogger(__name__)
         self.pdf_type = pdf_type
-        self.tables, self.table_bbox = self.get_table_and_bbox(pdf_path,pg_num)
+        self.tables, self.table_bbox = self.get_table_and_bbox(pdf_path,pg_num, scanned_copy)
     
     # --- func to find the table contents and their coordinates ---
-    def get_table_and_bbox(self,pdf_path,page_num):
+    def get_table_and_bbox(self,pdf_path,page_num, scanned_copy):
         table = {}
         bbox = {}
+        if scanned_copy:
+            return table, bbox
         try:
             tables_and_bbox = camelot.read_pdf(pdf_path, pages=page_num, flavor='lattice')
             for idx,tab in enumerate(tables_and_bbox):

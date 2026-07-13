@@ -16,7 +16,7 @@ from pdfminer.image import ImageWriter
 #     HAS_TESSERACT = False
 
 class StableImageWriter(ImageWriter):
-    def _create_unique_image_name(self, image: LTImage, ext: str) -> Tuple[str, str]:
+    def _create_unique_image_name(self, image, ext):
         name = image.name + ext
         path = os.path.join(self.outdir, name)
         return name, path
@@ -52,7 +52,8 @@ class Pictures:
         unique_images,
         min_img_pixels,
         ocr_language,
-        image_base_dir="images"
+        scanned_copy,
+        image_base_dir="manifest"
     ):
         self.logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ class Pictures:
                 base_name_of_file,
                 output_dir,
                 min_img_pixels,
+                scanned_copy,
                 image_base_dir
             )
 
@@ -273,8 +275,11 @@ class Pictures:
         file_basename,
         output_dir,
         min_img_pixels,
-        image_base_dir="images"
+        scanned_copy,
+        image_base_dir="manifest"
     ):
+        if scanned_copy:
+            return
         saved_images = {}
 
         page_layouts = extract_pages(
@@ -285,7 +290,8 @@ class Pictures:
         file_dir = os.path.join(
             output_dir,
             image_base_dir,
-            file_basename
+            file_basename,
+            'images'
         )
 
         iw = None

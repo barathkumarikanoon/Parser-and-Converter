@@ -30,11 +30,14 @@ class SectionState:
 class Page:
     def __init__(self,pg,pdfPath, base_name_of_file, output_dir, 
                  pdf_type, has_side_notes, is_amendment_pdf, 
-                 font_mapper, unique_images, min_img_size, ocr_language):
+                 font_mapper, unique_images, min_img_size, ocr_language,
+                 scanned_copy):
         self.logger = logging.getLogger(__name__)
         self.pdf_path = pdfPath
         self.page_in_xml = pg
         self.pg_width, self.pg_height = self.get_pg_coords(pg)
+        self.body_startX = 0.000
+        self.body_endX   = self.pg_width
         self.pg_num = pg.attrib["id"]
         self.logger.debug(f"page: {self.pg_num} --- page_height: {self.pg_height} , page_width: {self.pg_width}")
         self.all_tbs = {}
@@ -45,8 +48,9 @@ class Page:
         self.is_amendment_pdf = is_amendment_pdf
         self.figures = Pictures(self.pdf_path, self.pg_num, base_name_of_file, 
                                 output_dir, unique_images, min_img_size,
-                                ocr_language)
-        self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type)
+                                ocr_language, scanned_copy)
+        self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type,
+                                            scanned_copy)
         self.side_notes_datas ={}
         self.font_mapper = font_mapper
         self.title_type_map = {
@@ -164,8 +168,7 @@ class Page:
             # if startPage is not None and endPage is not None and int(self.pg_num) >=startPage and int(self.pg_num)<=endPage:
             if self.has_side_notes:
                 if not hasattr(self, 'body_startX') and not hasattr(self, 'body_endX'):
-                    self.logger.warning("Body boundaries (body_startX, body_endX) \
-                                        are not defined for page %s", self.pg_num)
+                    self.logger.warning("Body boundaries (body_startX, body_endX) are not defined for page %s", self.pg_num)
                     return  # Skip if body region not defined
                 
                 pattern = re.compile(r'^(\d+\s+of\s+\d+\.|Ord\.?\s*\d+\s+of\s+\d+\. | Ordinance\.?\s*\d+\s+of\s+\d+\.)$')
@@ -648,11 +651,11 @@ class Page:
             if match:
                 left_sidenote_end_coords.append(tb.coords[0])
         average_left = sum(left_sidenote_end_coords)/len(left_sidenote_end_coords) if left_sidenote_end_coords else 0
-        if average_left > 0:
+        if average_left > 0 and hasattr(self, 'body_startX'):
             self.body_startX = max(round(average_left, 2), self.body_startX)
         
         average_right = sum(right_sidenote_start_coords) / len(right_sidenote_start_coords) if right_sidenote_start_coords else 0
-        if average_right > 0:
+        if average_right > 0 and hasattr(self, 'body_endX'):
             if self.body_endX < 0:
                 self.body_endX = round(average_right, 2)
             else:

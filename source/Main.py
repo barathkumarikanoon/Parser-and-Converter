@@ -7,7 +7,7 @@ import re
 import codecs
 import logging
 import shutil
-from .ParserTool import ParserTool
+from .ParserTool import ParserTool, ChromeLensParserTool
 from .Page import Page, SectionState
 from .HTMLBuilder import HTMLBuilder, HTMLBuilderChromeLens
 from .Acts import Acts
@@ -15,6 +15,7 @@ from .SebiCirculars import SebiCirculars
 from .Amendment import Amendment
 from .Utils import *
 from .FontMapper import DynamicFontMapper
+from .Manifest import IIIFManifest
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
@@ -402,7 +403,8 @@ class Main:
         pass
 
     # --- NEW ADAPTIVE HEADER/FOOTER DETECTION ---
-    def get_page_header_footer(self, pages, base_name_of_file, output_dir):
+    def get_page_header_footer(self, pages, base_name_of_file, output_dir,
+                               scanned_copy = False):
         # Initialize page objects first
         for pg in pages:
             pdf_dir = self.get_path_cache_pdf()
@@ -416,7 +418,8 @@ class Main:
             page = Page(pg, self.pdf_path, base_name_of_file, output_dir, 
                         self.pdf_type, self.has_side_notes, self.is_amendment_pdf, 
                         self.fontmapper, self.unique_images, self.min_img_pixels, 
-                        self.ocr_language)
+                        self.ocr_language,
+                        scanned_copy)
             self.total_pgs += 1
             self.all_pgs[self.total_pgs] = page
             page.process_textboxes()#pg)
@@ -426,7 +429,8 @@ class Main:
             # page.line_based_header_footer_detection()
         # Run adaptive header/footer detection
         self.logger.info("Starting adaptive header/footer detection...")
-        self.adaptive_header_footer_detection(pages, self.pdf_type)
+        if not scanned_copy:
+            self.adaptive_header_footer_detection(pages, self.pdf_type)
 
         
         if self.pdf_type in {'sebi_circulars'} :
@@ -1182,13 +1186,32 @@ class Main:
                 if pdf_type in {'egazette'}:
                     self.logger.info('using chrome lens for the scanned copy')
                     self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
+                else:
+                    pages = ChromeLensParserTool(self.pdf_path)\
+                            .build_xml(start_page, end_page)
+                    self.set_htmlbuilder()
+                    self.logger.debug("Extracting header and footer info...")
+                    self.get_page_header_footer(pages, base_name_of_file, self.output_dir,
+                                        scanned_copy = True)
+                    self.logger.debug("Processing content from pages...")
+                    if pdf_type == 'acts':
+                        self.process_pages_acts(pdf_type)
+                    elif pdf_type == 'sebi_circulars':
+                        self.process_pages_sebi_circulars(pdf_type)
+                    elif pdf_type == 'sebi':
+                        self.process_pages_sebi(pdf_type)
+                    else:
+                        self.process_pages(pdf_type)
+                    self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
+
+            if pdf_type in {'egazette'}:
+                self.write_manifest()
 
             return True
         except Exception as e:
             self.logger.exception("Exception occurred while parsing PDF: %s", e)
             return False
-
-
+    
     def escape_inline_markup(self, content):
         if not content:
             return content
@@ -1202,6 +1225,36 @@ class Main:
         )
     
     # --- func for writing the html content to the desired output file ---
+    def write_manifest(self):
+        try:
+            output_dir = Path(self.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            # Build manifest from finalized images collected in self.unique_images
+            manifest_builder = IIIFManifest(
+                    Path(output_dir),
+                    label=Path(self.pdf_path).stem
+                )
+
+            images = []
+            for meta in self.unique_images.values():
+                p = meta.get('path', None)
+                if p:
+                    try:
+                        from pathlib import Path as _P
+                        pp = _P(p)
+                        if pp.exists():
+                            images.append(pp)
+                    except Exception:
+                        continue
+
+            manifest_path = manifest_builder.create_from_images(images, metadata={"Generated from": str(self.pdf_path)})
+            if manifest_path:
+                self.logger.info("Created IIIF manifest at %s", manifest_path)
+            return manifest_path
+        except Exception as e:
+            self.logger.exception("Failed to create IIIF manifest: %s", e)
+            return None
+
     def write_html(self, content, start_page, end_page):
         if not content:
             self.logger.warning(f'HTML content not generate for pdf pdth: {self.pdf_path}')
