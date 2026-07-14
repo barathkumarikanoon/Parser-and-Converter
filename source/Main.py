@@ -19,7 +19,7 @@ from .Manifest import IIIFManifest
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
-                 is_footnote_continuation, min_img_pixels, ocr_language): #start,end,is_amendment_pdf,output_dir, pdf_type):
+                 is_footnote_continuation, min_img_pixels, ocr_language, is_scanned_copy): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
         self.pdf_path = pdfPath
         self.output_dir = output_dir
@@ -43,6 +43,7 @@ class Main:
         self.html_builder = None
         self.min_img_pixels = min_img_pixels
         self.ocr_language = ocr_language
+        self.is_scanned_copy = is_scanned_copy
         # self.fontmapper.extract_fonts()
 
     def get_all_footnote_text(self):
@@ -429,8 +430,7 @@ class Main:
             # page.line_based_header_footer_detection()
         # Run adaptive header/footer detection
         self.logger.info("Starting adaptive header/footer detection...")
-        if not scanned_copy:
-            self.adaptive_header_footer_detection(pages, self.pdf_type)
+        self.adaptive_header_footer_detection(pages, self.pdf_type)
 
         
         if self.pdf_type in {'sebi_circulars'} :
@@ -1141,6 +1141,26 @@ class Main:
         else:
             self.html_builder = self.get_htmlBuilder(self.pdf_type)
 
+    def process_scanned_copy(self, pdf_type, base_name_of_file, start_page,
+                             end_page):
+        pages = ChromeLensParserTool(self.pdf_path)\
+                            .build_xml(start_page, end_page)
+        # self.print_page_xml(pages)
+        self.set_htmlbuilder()
+        self.logger.debug("Extracting header and footer info...")
+        self.get_page_header_footer(pages, base_name_of_file, self.output_dir,
+                            scanned_copy = True)
+        self.logger.debug("Processing content from pages...")
+        if pdf_type == 'acts':
+            self.process_pages_acts(pdf_type)
+        elif pdf_type == 'sebi_circulars':
+            self.process_pages_sebi_circulars(pdf_type)
+        elif pdf_type == 'sebi':
+            self.process_pages_sebi(pdf_type)
+        else:
+            self.process_pages(pdf_type)
+        self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
+    
     # --- parse pdf using pdfminer to convert to XML ---       
     def parsePDF(self, pdf_type, char_margin, word_margin, line_margin, \
                 start_page, end_page):
@@ -1155,6 +1175,11 @@ class Main:
             
             base_name_of_file = os.path.splitext(os.path.basename(self.pdf_path))[0]
             self.logger.info("Starting PDF parsing for: %s", self.pdf_path)
+            if self.is_scanned_copy:
+                self.process_scanned_copy(pdf_type, base_name_of_file, start_page, 
+                                          end_page)
+                return True
+            
             cache_xml_path = self.get_path_cache_xml()
             self.xml_path =  cache_xml_path / f"{base_name_of_file}.xml"
             self.logger.debug("Converting PDF to XML...")
@@ -1183,26 +1208,12 @@ class Main:
                     self.process_pages(pdf_type)
                 self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
             else:
-                if pdf_type in {'egazette'}:
-                    self.logger.info('using chrome lens for the scanned copy')
-                    self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
-                else:
-                    pages = ChromeLensParserTool(self.pdf_path)\
-                            .build_xml(start_page, end_page)
-                    self.set_htmlbuilder()
-                    self.logger.debug("Extracting header and footer info...")
-                    self.get_page_header_footer(pages, base_name_of_file, self.output_dir,
-                                        scanned_copy = True)
-                    self.logger.debug("Processing content from pages...")
-                    if pdf_type == 'acts':
-                        self.process_pages_acts(pdf_type)
-                    elif pdf_type == 'sebi_circulars':
-                        self.process_pages_sebi_circulars(pdf_type)
-                    elif pdf_type == 'sebi':
-                        self.process_pages_sebi(pdf_type)
-                    else:
-                        self.process_pages(pdf_type)
-                    self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
+                # if pdf_type in {'egazette'}:
+                #     self.logger.info('using chrome lens for the scanned copy')
+                #     self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
+                # else:
+                    self.process_scanned_copy(pdf_type, base_name_of_file,
+                                              start_page, end_page)
 
             if pdf_type in {'egazette'}:
                 self.write_manifest()
@@ -1211,6 +1222,18 @@ class Main:
         except Exception as e:
             self.logger.exception("Exception occurred while parsing PDF: %s", e)
             return False
+
+    def print_page_xml(self, pages):
+        import xml.etree.ElementTree as ET
+        from xml.dom import minidom
+        for page_el in pages:
+            raw = ET.tostring(page_el, encoding="unicode")
+            pretty = minidom.parseString(raw).toprettyxml(indent="  ")
+            pretty = "\n".join(
+                line for line in pretty.split("\n") if line.strip()
+            )
+            self.logger.info(pretty)
+            
     
     def escape_inline_markup(self, content):
         if not content:
@@ -1400,6 +1423,8 @@ def get_arg_parser():
                       required = False,  default = 0,  help = 'minimum pixel area threshold for initial filtering (area = dimension^2). Images are further filtered based on text content detection.')
     parser.add_argument('-ol', '--ocr-language', dest='ocr_language', action='store', \
                       required=False, default='en', help='language code for OCR (default: en, two letter code)')
+    parser.add_argument('-sc', '--scanned-copy', dest = 'scanned_copy', action = 'store_true',
+                        required = False, default = False, help = 'mention if the pdf copy is scanned')
     return parser
 
 
@@ -1461,8 +1486,10 @@ if __name__ == "__main__":
     if min_img_pixels and isinstance(min_img_pixels, str):
         min_img_pixels = int(min_img_pixels)
     ocr_language = args.ocr_language
+    is_scanned_copy = args.scanned_copy
     main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
-                is_footnote_continuation, min_img_pixels, ocr_language)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+                is_footnote_continuation, min_img_pixels, ocr_language,
+                is_scanned_copy)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])
