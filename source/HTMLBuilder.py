@@ -772,7 +772,7 @@ class HTMLBuilder(TableBuilder):
         parts = p.parts
 
         if 'manifest' in parts:
-            idx = parts.index('images')
+            idx = parts.index('manifest')
             return str(Path(*parts[idx:]))
         else:
             return None  # or raise error
