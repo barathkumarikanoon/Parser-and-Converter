@@ -7,7 +7,7 @@ import logging
 
 
 from .TextBox import TextBox
-from .TableExtraction import TableExtraction
+from .TableExtraction import TableExtraction, BorderlessTableExtraction
 from .CompareLevel import CompareLevel, CompareLevelSebi
 from .NormalizeText import NormalizeText
 from .Figure import Figure,Pictures
@@ -51,6 +51,7 @@ class Page:
                                 ocr_language, scanned_copy)
         self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type,
                                             scanned_copy)
+        self.borderless_tabular_datas = None
         self.side_notes_datas ={}
         self.font_mapper = font_mapper
         self.title_type_map = {
@@ -504,6 +505,13 @@ class Page:
                 print("From table:",label[1])
                 print(tb.extract_text_from_tb())
     
+    def print_borderless_table_content(self):
+        print("i'm from borderless table contents")
+        for tb,label in self.all_tbs.items():
+            if isinstance(label, tuple) and label[0] == "borderless_table":
+                print("From table:",label[1])
+                print(tb.extract_text_from_tb())
+    
     def print_amendment(self):
         print("i'm from amendment")
         for tb,label in self.all_tbs.items():
@@ -762,7 +770,8 @@ class Page:
             if label is not None:
                 if isinstance(label, tuple) and label[0] == 'article' and not side_note_status:
                     continue
-                elif isinstance(label,tuple) and label[0] == 'table':
+                elif isinstance(label,tuple) and (label[0] == 'table' or \
+                                                  label[0] == 'borderless_table'):
                     continue
                 elif isinstance(label,list) and label[0] == 'amendment':
                     continue
@@ -884,7 +893,8 @@ class Page:
 
         # if startPage is not None and endPage is not None and startPage <= page_num <= endPage:
         for tb,label in self.all_tbs.items():
-            if label is not None and isinstance(label,tuple) and label[0] == 'table':
+            if label is not None and isinstance(label,tuple) and (label[0] == 'table' or \
+                                                                  label[0] == 'borderless_table'):
                 continue
             texts = tb.extract_text_from_tb().strip()
             texts = texts.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
@@ -977,6 +987,19 @@ class Page:
                 try:
                     if self.all_tbs[tb] is None and self.bbox_satisfies(tb.coords,tab_bbox):
                         self.all_tbs[tb] = ("table",idx)
+                    self.logger.debug(f"Page {self.pg_num}: Labelled textbox within table {idx}")
+                except Exception as e:
+                    self.logger.warning(f"Page {self.pg_num}: Failed to label textbox '{tb}' for table {idx} -- {e}")
+    
+    def label_borderless_table_tbs(self):
+        if self.borderless_tabular_datas is None:
+            return
+        
+        for idx,tab_bbox in self.borderless_tabular_datas.table_bbox.items():
+            for tb in self.all_tbs.keys():
+                try:
+                    if self.all_tbs[tb] is None and self.bbox_satisfies(tb.coords,tab_bbox):
+                        self.all_tbs[tb] = ("borderless_table",idx)
                     self.logger.debug(f"Page {self.pg_num}: Labelled textbox within table {idx}")
                 except Exception as e:
                     self.logger.warning(f"Page {self.pg_num}: Failed to label textbox '{tb}' for table {idx} -- {e}")
@@ -1361,7 +1384,8 @@ class Page:
                 text = text.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
                 if label in ['footnote', 'header', 'footer', 'title']:
                     is_sentence_completed = True
-                elif isinstance(label, tuple) and label[0] == 'table':
+                elif isinstance(label, tuple) and (label[0] == 'table' or \
+                                                   label[0] == 'borderless_table'):
                     is_sentence_completed = True
                 else:
                     is_sentence_completed = text.endswith(sentence_completion_punctutation)
@@ -1411,3 +1435,8 @@ class Page:
         except Exception as e:
             self.logger.error(f"Error in get_hierarchy: {e}")
             return False
+    
+    def get_borderless_table(self, pdf_type):
+        self.borderless_tabular_datas = BorderlessTableExtraction(
+                self.all_tbs, pdf_type, self.pg_width, self.pg_height
+            )

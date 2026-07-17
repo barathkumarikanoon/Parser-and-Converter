@@ -19,7 +19,8 @@ from .Manifest import IIIFManifest
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
-                 is_footnote_continuation, min_img_pixels, ocr_language, is_scanned_copy): #start,end,is_amendment_pdf,output_dir, pdf_type):
+                 is_footnote_continuation, min_img_pixels, ocr_language, is_scanned_copy,
+                 table_extract): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
         self.pdf_path = pdfPath
         self.output_dir = output_dir
@@ -44,6 +45,7 @@ class Main:
         self.min_img_pixels = min_img_pixels
         self.ocr_language = ocr_language
         self.is_scanned_copy = is_scanned_copy
+        self.table_extract = table_extract
         # self.fontmapper.extract_fonts()
 
     def get_all_footnote_text(self):
@@ -318,7 +320,9 @@ class Main:
             # print(page.is_single_column_page)
             if self.is_amendment_pdf:
                 self.amendment.check_for_amendment_acts(page)#,self.section_start_page,self.section_end_page)
-
+            if self.table_extract:
+                page.get_borderless_table(pdf_type)
+                page.label_borderless_table_tbs()
             page.get_article(self.article_state, self)
             page.get_section_para(self.section_state, self)#, self.section_start_page,self.section_end_page)
             page.get_titles(pdf_type)
@@ -342,6 +346,9 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
+            if self.table_extract:
+                page.get_borderless_table(pdf_type)
+                page.label_borderless_table_tbs()
             page.get_bulletins_sebi_circulars(self.section_state)
             page.get_titles(pdf_type)
             prev_sent_end_status = page.get_title_hierarchy(self.title_state, prev_sent_end_status, sentence_completion_punctutation)   
@@ -363,6 +370,9 @@ class Main:
             # print(page.is_single_column_page)
             page.get_italic_blockquotes(pdf_type)
             self.amendment.check_for_blockquotes(page)
+            # if self.table_extract:
+            #     page.get_borderless_table(pdf_type)
+            #     page.label_borderless_table_tbs()
             # page.get_titles(pdf_type)
             page.get_bulletins(self.section_state)
             page.get_titles(pdf_type)
@@ -382,6 +392,8 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
+            page.get_borderless_table(pdf_type)
+            page.label_borderless_table_tbs()
             page.get_titles(pdf_type)
             # page.get_bulletins(self.section_state)
             page.sort_all_boxes()
@@ -404,8 +416,7 @@ class Main:
         pass
 
     # --- NEW ADAPTIVE HEADER/FOOTER DETECTION ---
-    def get_page_header_footer(self, pages, base_name_of_file, output_dir,
-                               scanned_copy = False):
+    def get_page_header_footer(self, pages, base_name_of_file, output_dir):
         # Initialize page objects first
         for pg in pages:
             pdf_dir = self.get_path_cache_pdf()
@@ -420,7 +431,7 @@ class Main:
                         self.pdf_type, self.has_side_notes, self.is_amendment_pdf, 
                         self.fontmapper, self.unique_images, self.min_img_pixels, 
                         self.ocr_language,
-                        scanned_copy)
+                        self.is_scanned_copy)
             self.total_pgs += 1
             self.all_pgs[self.total_pgs] = page
             page.process_textboxes()#pg)
@@ -430,7 +441,8 @@ class Main:
             # page.line_based_header_footer_detection()
         # Run adaptive header/footer detection
         self.logger.info("Starting adaptive header/footer detection...")
-        self.adaptive_header_footer_detection(pages, self.pdf_type)
+        if not self.is_scanned_copy:
+            self.adaptive_header_footer_detection(pages, self.pdf_type)
 
         
         if self.pdf_type in {'sebi_circulars'} :
@@ -1148,8 +1160,7 @@ class Main:
         # self.print_page_xml(pages)
         self.set_htmlbuilder()
         self.logger.debug("Extracting header and footer info...")
-        self.get_page_header_footer(pages, base_name_of_file, self.output_dir,
-                            scanned_copy = True)
+        self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
         self.logger.debug("Processing content from pages...")
         if pdf_type == 'acts':
             self.process_pages_acts(pdf_type)
@@ -1208,10 +1219,11 @@ class Main:
                     self.process_pages(pdf_type)
                 self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
             else:
-                # if pdf_type in {'egazette'}:
-                #     self.logger.info('using chrome lens for the scanned copy')
-                #     self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
-                # else:
+                if pdf_type in {'egazette'}:
+                    self.logger.info('using chrome lens for the scanned copy')
+                    self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
+                else:
+                    self.is_scanned_copy = True
                     self.process_scanned_copy(pdf_type, base_name_of_file,
                                               start_page, end_page)
 
@@ -1425,6 +1437,8 @@ def get_arg_parser():
                       required=False, default='en', help='language code for OCR (default: en, two letter code)')
     parser.add_argument('-sc', '--scanned-copy', dest = 'scanned_copy', action = 'store_true',
                         required = False, default = False, help = 'mention if the pdf copy is scanned')
+    parser.add_argument('-te', '--table-extract', dest = 'table_extract', action = 'store_true',
+                        required = False, default = False, help = 'mention if the pdf has borderless table or pdf is scanned copy to extract table content')
     return parser
 
 
@@ -1487,9 +1501,10 @@ if __name__ == "__main__":
         min_img_pixels = int(min_img_pixels)
     ocr_language = args.ocr_language
     is_scanned_copy = args.scanned_copy
+    table_extract = args.table_extract
     main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
                 is_footnote_continuation, min_img_pixels, ocr_language,
-                is_scanned_copy)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+                is_scanned_copy, table_extract)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])

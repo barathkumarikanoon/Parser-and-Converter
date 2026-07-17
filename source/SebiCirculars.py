@@ -1540,7 +1540,8 @@ class SebiCirculars(TableBuilder, SentenceMaker):
                 self.logger.warning("The figure may be header or junk image, skipping...")
                 continue
             
-            if not ((isinstance(label, tuple) and label[0] == "table")):
+            if not ((isinstance(label, tuple) and (label[0] == "table" or \
+                                                   label[0] == "borderless_table"))):
                 if self.pending_table is not None and len(self.pending_table) <= 2:
                     self.addTable(self.pending_table[0])
                     self.table_footnote_text = []
@@ -1565,7 +1566,8 @@ class SebiCirculars(TableBuilder, SentenceMaker):
                     self.footnote_to_add = self.is_footnote_detected
                 else:
                     self.footnote_to_add.extend(self.is_footnote_detected)
-                if isinstance(label, tuple) and label[0] == "table":
+                if isinstance(label, tuple) and (label[0] == "table" or\
+                                                 label[0] == "borderless_table"):
                     self.table_footnote_text.append(text)
             
             if isinstance(label, tuple) and label[0] == "table":
@@ -1573,6 +1575,28 @@ class SebiCirculars(TableBuilder, SentenceMaker):
                 if table_id not in visited_for_table:
                     table_obj = page.tabular_datas.tables.get(table_id)
                     table_width = page.tabular_datas.get_table_width(table_id)
+
+                    if table_obj is not None:
+                        if self.pending_table is None:
+                            self.pending_table = [table_obj, table_width]
+                        
+                        else:
+                            if self.is_table_continuation(table_obj, table_width):
+                                self.merge_tables(table_obj, table_width)#, html_builder=self)
+                               
+                            else:
+                                self.addTable(self.pending_table[0])
+                                self.table_footnote_text = []
+                                self.pending_table = [table_obj, table_width]
+                                self.table_footnote_text = [text]
+
+                    visited_for_table.add(table_id)
+            
+            elif isinstance(label, tuple) and label[0] == "borderless_table":
+                table_id = label[1]
+                if table_id not in visited_for_table:
+                    table_obj = page.borderless_tabular_datas.tables.get(table_id)
+                    table_width = page.borderless_tabular_datas.get_table_width(table_id)
 
                     if table_obj is not None:
                         if self.pending_table is None:
