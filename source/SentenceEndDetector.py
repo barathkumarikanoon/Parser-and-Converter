@@ -37,6 +37,7 @@ class LegalSentenceDetector:
     def __init__(self):
         self._abbr_clean = {abbr.lower() for abbr in LEGAL_ABBREVIATIONS}
         self.same_line_tolerance = 0.25
+        self.column_bounds = None
 
     def is_real_sentence_end(self, text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width):
       """
@@ -345,17 +346,35 @@ class LegalSentenceDetector:
             x0a, _, x1a, _ = self._normalize_bbox(box1)
             x0b, _, _, _ = self._normalize_bbox(box2)
 
-            # Condition 1: First box ends ≥ 30% of page width from right margin
-            right_gap_a = pg_width - x1a
-            if right_gap_a >= 0.2 * pg_width:
+            left_a, right_a = self._column_span_for(x0a, x1a, pg_width)
+            left_b, right_b = self._column_span_for(x0b, x0b, pg_width)
+            width_a = max(right_a - left_a, 1.0)
+            width_b = max(right_b - left_b, 1.0)
+
+            # Condition 1: First box ends ≥ 20% of its column width from that column's right edge
+            right_gap_a = right_a - x1a
+            if right_gap_a >= 0.2 * width_a:
                 return True
 
-            # Condition 2: Second box starts ≥ 40% of page width from left margin
-            if x0b >= 0.35 * pg_width:
+            # Condition 2: Second box starts ≥ 35% of its column width from that column's left edge
+            left_gap_b = x0b - left_b
+            if left_gap_b >= 0.35 * width_b:
                 return True
 
             return False
 
+    def _column_span_for(self, x0, x1, pg_width):
+        if not self.column_bounds:
+            return 0.0, pg_width
+        center = (x0 + x1) / 2.0
+        for col_x0, col_x1 in self.column_bounds:
+            if col_x0 <= center <= col_x1:
+                return col_x0, col_x1
+        nearest = min(
+            self.column_bounds,
+            key=lambda col: min(abs(center - col[0]), abs(center - col[1]))
+        )
+        return nearest
 
 class SentenceMaker:
     def clean_text(self, raw_text):

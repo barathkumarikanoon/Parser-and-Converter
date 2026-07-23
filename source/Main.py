@@ -16,14 +16,58 @@ from .Amendment import Amendment
 from .Utils import *
 from .FontMapper import DynamicFontMapper
 from .Manifest import IIIFManifest
+from .TableExtraction import HeaderRowClassifier, RegionMergeClassifier, ContinuationClassifier
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
                  is_footnote_continuation, min_img_pixels, ocr_language, is_scanned_copy,
-                 table_extract): #start,end,is_amendment_pdf,output_dir, pdf_type):
+                 table_extract, public_base_url=None, server_root=None,
+                 rights=None, provider_id=None, provider_name=None, attribution=None): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
+        if self.is_url_like(output_dir):
+            raise ValueError(
+                f"output_dir ('{output_dir}') looks like a URL, not a local filesystem "
+                f"path where output files get written. Did you mean to pass that as "
+                f"public_base_url/-pu instead? The public URL used for IIIF manifest "
+                f"links is always supplied separately and never derived from output_dir."
+            )
+        if server_root:
+            if self.is_url_like(server_root):
+                raise ValueError(
+                    f"server_root ('{server_root}') looks like a URL, not a local "
+                    f"filesystem path. It must be the local directory that corresponds "
+                    f"to the web server's document root; the public URL is supplied "
+                    f"separately via public_base_url/-pu."
+                )
+            try:
+                Path(output_dir).resolve().relative_to(Path(server_root).resolve())
+            except ValueError:
+                raise ValueError(
+                    f"output_dir ('{output_dir}') is not located within "
+                    f"server_root ('{server_root}') - IIIF manifest URLs can't be "
+                    f"expressed relative to a server root that doesn't contain the "
+                    f"output directory."
+                )
+
+        if rights and not self.is_url_like(rights):
+            self.logger.warning(
+                f"[!] rights ('{rights}') doesn't look like a URI (IIIF requires a "
+                f"Creative Commons or RightsStatements.org URI) - ignoring it."
+            )
+            rights = None
+        if provider_id and not self.is_url_like(provider_id):
+            self.logger.warning(
+                f"[!] provider_id ('{provider_id}') doesn't look like a URI - ignoring it."
+            )
+            provider_id = None
+
         self.pdf_path = pdfPath
         self.output_dir = output_dir
+        self.server_root = server_root
+        self.rights = rights
+        self.provider_id = provider_id
+        self.provider_name = provider_name
+        self.attribution = attribution
         self.parserTool = ParserTool()
         self.total_pgs = 0
         self.all_pgs = {}
@@ -46,6 +90,16 @@ class Main:
         self.ocr_language = ocr_language
         self.is_scanned_copy = is_scanned_copy
         self.table_extract = table_extract
+        self.public_base_url = public_base_url
+        # Public URL of the IIIF manifest (egazette only), set by write_manifest() once
+        self.manifest_url = None
+        self.header_classifier = HeaderRowClassifier.default()
+        self.region_merge_classifier = RegionMergeClassifier.default()
+        self.continuation_classifier = ContinuationClassifier.default()
+        # Column template carried between pages so a borderless table that runs off the
+        # bottom of one page can be picked up at the top of the next (set per page in the
+        # processing loops, reset here so it never leaks across documents/runs).
+        self.pending_continuation = None
         # self.fontmapper.extract_fonts()
 
     def get_all_footnote_text(self):
@@ -308,6 +362,7 @@ class Main:
 
     # --- classify the page texboxes sidenotes, section, para, titles(headings) ---
     def process_pages_acts(self, pdf_type):
+        self.pending_continuation = None
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
             # page.print_tbs()
@@ -321,7 +376,12 @@ class Main:
             if self.is_amendment_pdf:
                 self.amendment.check_for_amendment_acts(page)#,self.section_start_page,self.section_end_page)
             if self.table_extract:
-                page.get_borderless_table(pdf_type)
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
                 page.label_borderless_table_tbs()
             page.get_article(self.article_state, self)
             page.get_section_para(self.section_state, self)#, self.section_start_page,self.section_end_page)
@@ -339,6 +399,7 @@ class Main:
                                                 '.”', '.’', ';”' , ';’', ':-', '.]',
                                                 ',-', ':-', ';-', '--')
 
+        self.pending_continuation = None
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
             page.get_width_ofTB_moreThan_Half_of_pg()
@@ -347,7 +408,12 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
             if self.table_extract:
-                page.get_borderless_table(pdf_type)
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
                 page.label_borderless_table_tbs()
             page.get_bulletins_sebi_circulars(self.section_state)
             page.get_titles(pdf_type)
@@ -370,9 +436,14 @@ class Main:
             # print(page.is_single_column_page)
             page.get_italic_blockquotes(pdf_type)
             self.amendment.check_for_blockquotes(page)
-            # if self.table_extract:
-            #     page.get_borderless_table(pdf_type)
-            #     page.label_borderless_table_tbs()
+            if self.table_extract:
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
             # page.get_titles(pdf_type)
             page.get_bulletins(self.section_state)
             page.get_titles(pdf_type)
@@ -392,8 +463,14 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
-            page.get_borderless_table(pdf_type)
-            page.label_borderless_table_tbs()
+            if self.table_extract:
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
             page.get_titles(pdf_type)
             # page.get_bulletins(self.section_state)
             page.sort_all_boxes()
@@ -444,7 +521,11 @@ class Main:
         if not self.is_scanned_copy:
             self.adaptive_header_footer_detection(pages, self.pdf_type)
 
-        
+        self.logger.info("Detecting multicolumn page layouts...")
+        for page in self.all_pgs.values():
+            page.detect_multicolumn_layout()
+            page.apply_column_reading_order()
+
         if self.pdf_type in {'sebi_circulars'} :
             previous_page_footnote_font_size  = None
             seen_footnote = set()
@@ -460,8 +541,21 @@ class Main:
                     page.get_footnotes()
 
         self.finalize_unique_images()
+        if not self.unique_images:
+            self.remove_empty_manifest_dir(base_name_of_file, output_dir)
         self.get_all_footnote_text()
         self.logger.info(self.all_footnote_text)
+
+    def remove_empty_manifest_dir(self, base_name_of_file, output_dir, image_base_dir="manifest"):
+        manifest_pdf_dir = os.path.join(output_dir, image_base_dir, base_name_of_file)
+        images_dir = os.path.join(manifest_pdf_dir, "images")
+        for directory in (images_dir, manifest_pdf_dir):
+            try:
+                if os.path.isdir(directory) and not os.listdir(directory):
+                    os.rmdir(directory)
+                    self.logger.debug(f"Removed empty manifest directory: {directory}")
+            except OSError as e:
+                self.logger.debug(f"Could not remove manifest directory {directory}: {e}")
 
     def adaptive_header_footer_detection(self, pages, pdf_type=None):
         self.adaptive_headers = []
@@ -1144,6 +1238,10 @@ class Main:
                 return b"%PDF-" in header
         except Exception:
             return False
+
+    @staticmethod
+    def is_url_like(value):
+        return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', str(value)))
     
     def set_htmlbuilder(self):
         if self.pdf_type in set(['acts']):
@@ -1183,7 +1281,18 @@ class Main:
             if not self.is_pdf_file(self.pdf_path):
                 self.logger.error(f"[✖] Input is not a valid PDF file: {self.pdf_path}")
                 return False
-            
+
+            if self.is_url_like(self.output_dir):
+                self.logger.error(
+                    f"[✖] -o/--output-directory ('{self.output_dir}') looks like a URL, "
+                    f"not a local filesystem path where output files get written. Did you "
+                    f"mean to pass that as -pu/--public-base-url instead? The public URL "
+                    f"used for IIIF manifest links is always supplied separately via "
+                    f"-pu/--public-base-url (or the PUBLIC_BASE_URL env var) and never "
+                    f"derived from output_dir."
+                )
+                return False
+
             base_name_of_file = os.path.splitext(os.path.basename(self.pdf_path))[0]
             self.logger.info("Starting PDF parsing for: %s", self.pdf_path)
             if self.is_scanned_copy:
@@ -1227,7 +1336,7 @@ class Main:
                     self.process_scanned_copy(pdf_type, base_name_of_file,
                                               start_page, end_page)
 
-            if pdf_type in {'egazette'}:
+            if pdf_type in {'egazette', 'sebi'}:
                 self.write_manifest()
 
             return True
@@ -1261,39 +1370,105 @@ class Main:
     
     # --- func for writing the html content to the desired output file ---
     def write_manifest(self):
+        if not self.unique_images:
+            self.logger.info("No images to build an IIIF manifest from; skipping manifest generation.")
+            return None
+        if self.is_url_like(self.output_dir):
+            self.logger.error(
+                f"[✖] output_dir ('{self.output_dir}') looks like a URL, not a local "
+                f"filesystem path - skipping manifest generation. Use -pu/--public-base-url "
+                f"(or PUBLIC_BASE_URL) to supply the public URL instead."
+            )
+            return None
+        if not self.public_base_url and not os.environ.get("PUBLIC_BASE_URL"):
+            self.logger.warning(
+                "[!] No -pu/--public-base-url (or PUBLIC_BASE_URL env var) supplied - "
+                "IIIF manifest and HTML manifest-link URLs will fall back to "
+                "http://localhost:8000, which is almost certainly wrong outside local "
+                "development."
+            )
         try:
             output_dir = Path(self.output_dir)
             output_dir.mkdir(parents=True, exist_ok=True)
             # Build manifest from finalized images collected in self.unique_images
             manifest_builder = IIIFManifest(
                     Path(output_dir),
-                    label=Path(self.pdf_path).stem
+                    label=Path(self.pdf_path).stem,
+                    base_prez_uri=self.public_base_url,
+                    server_root=self.server_root,
+                    rights=self.rights,
+                    provider_id=self.provider_id,
+                    provider_name=self.provider_name,
+                    attribution=self.attribution
                 )
 
-            images = []
+            # Page ids come from the source XML as strings (e.g. "1", "12"), so a plain
+            # lexicographic sort would order page 12 before page 2 - sort numerically
+            # where possible, falling back to the raw value for anything non-numeric.
+            def page_sort_key(p):
+                return (0, int(p)) if str(p).isdigit() else (1, str(p))
+
+            image_entries = []
             for meta in self.unique_images.values():
                 p = meta.get('path', None)
-                if p:
-                    try:
-                        from pathlib import Path as _P
-                        pp = _P(p)
-                        if pp.exists():
-                            images.append(pp)
-                    except Exception:
+                if not p:
+                    continue
+                try:
+                    pp = Path(p)
+                    if not pp.exists():
                         continue
+                except Exception:
+                    continue
+                image_entries.append({
+                    "path": pp,
+                    # Every page this (deduplicated) image appeared on, in reading order -
+                    # carried through so the manifest can label each image by its actual
+                    # source page(s) instead of a meaningless "Image N" counter.
+                    "pages": sorted(meta.get("pages", set()), key=page_sort_key),
+                    # OCR text already extracted from the image itself (Figure.py runs a
+                    # real OCR pass to decide whether to keep the image at all) - surfaced
+                    # here as a IIIF "supplementing" annotation instead of being discarded
+                    # after that gate check, so it isn't computed and thrown away.
+                    "text": meta.get("text") or None,
+                    "language": meta.get("language"),
+                })
 
-            manifest_path = manifest_builder.create_from_images(images, metadata={"Generated from": str(self.pdf_path)})
+            # Present in the order the images actually appear in the source document
+            # (first page each deduplicated image was seen on), not dict-insertion order.
+            image_entries.sort(key=lambda e: page_sort_key(e["pages"][0]) if e["pages"] else (2, ""))
+
+            # "Generated from" must never leak the local filesystem path (server
+            # username, directory layout, repo/project structure) into what's a
+            # publicly-served manifest.json - only the filename itself carries useful
+            # provenance information, so strip the directory component entirely rather
+            # than embedding self.pdf_path verbatim.
+            manifest_path = manifest_builder.create_from_images(
+                image_entries, metadata={"Generated from": Path(self.pdf_path).name}
+            )
             if manifest_path:
                 self.logger.info("Created IIIF manifest at %s", manifest_path)
+                self.manifest_url = manifest_builder.get_manifest_uri()
             return manifest_path
         except Exception as e:
             self.logger.exception("Failed to create IIIF manifest: %s", e)
             return None
 
+    def add_manifest_link_to_html(self, content):
+        if self.pdf_type not in {'egazette', 'sebi'} or not self.manifest_url:
+            return content
+        link_html = (
+            f'<p><a href="{self.manifest_url}" target="_blank">'
+            f'click here for IIIF manifest</a></p>\n'
+        )
+        if '<body>' in content:
+            return content.replace('<body>', '<body>\n' + link_html, 1)
+        return link_html + content
+
     def write_html(self, content, start_page, end_page):
         if not content:
             self.logger.warning(f'HTML content not generate for pdf pdth: {self.pdf_path}')
             return
+        content = self.add_manifest_link_to_html(content)
         try:
             if start_page or end_page:
                 if start_page is None:
@@ -1439,6 +1614,40 @@ def get_arg_parser():
                         required = False, default = False, help = 'mention if the pdf copy is scanned')
     parser.add_argument('-te', '--table-extract', dest = 'table_extract', action = 'store_true',
                         required = False, default = False, help = 'mention if the pdf has borderless table or pdf is scanned copy to extract table content')
+    parser.add_argument('-pu', '--public-base-url', dest = 'public_base_url', action = 'store',
+                        required = False, default = None,
+                        help = 'public URL that --output-directory will be served from (e.g. '
+                               'https://gazettes.servantsofknowledge.in/gzdl/html/andhra_extraordinary/2025-01-01), '
+                               'used as the base for image/canvas/manifest URIs in the IIIF manifest (egazette/sebi types only). '
+                               'Falls back to the PUBLIC_BASE_URL env var, then http://localhost:8000.')
+    parser.add_argument('-sr', '--server-root', dest = 'server_root', action = 'store',
+                        required = False, default = None,
+                        help = 'local filesystem directory that acts as the web server\'s document root '
+                               '(e.g. /var/www), used only to compute the URL path segment between '
+                               '--public-base-url and "manifest/<pdfname>/..." in the IIIF manifest '
+                               '(egazette/sebi types only) - never affects where output files are written. '
+                               'output_dir must be located within it. If not given, output_dir itself is '
+                               'assumed to be the server root (no extra path segment).')
+    parser.add_argument('-rt', '--rights', dest = 'rights', action = 'store',
+                        required = False, default = None,
+                        help = 'IIIF manifest "rights" URI (a Creative Commons or RightsStatements.org '
+                               'license URI, e.g. https://creativecommons.org/publicdomain/mark/1.0/) '
+                               '(egazette/sebi types only). Omitted entirely if not supplied - never '
+                               'defaulted to a guessed license.')
+    parser.add_argument('-pi', '--provider-id', dest = 'provider_id', action = 'store',
+                        required = False, default = None,
+                        help = 'URI identifying the organization presenting the manifest (e.g. its '
+                               'homepage), used for the IIIF "provider" field (egazette/sebi types only). '
+                               'Requires --provider-name too to be added; ignored alone.')
+    parser.add_argument('-pn', '--provider-name', dest = 'provider_name', action = 'store',
+                        required = False, default = None,
+                        help = 'Display name of the organization presenting the manifest, used for the '
+                               'IIIF "provider" field (egazette/sebi types only). Requires --provider-id '
+                               'too to be added; ignored alone.')
+    parser.add_argument('-at', '--attribution', dest = 'attribution', action = 'store',
+                        required = False, default = None,
+                        help = 'Attribution text for the IIIF manifest\'s "requiredStatement" (egazette/sebi '
+                               'types only). Omitted entirely if not supplied.')
     return parser
 
 
@@ -1502,9 +1711,16 @@ if __name__ == "__main__":
     ocr_language = args.ocr_language
     is_scanned_copy = args.scanned_copy
     table_extract = args.table_extract
+    public_base_url = args.public_base_url
+    server_root = args.server_root
+    rights = args.rights
+    provider_id = args.provider_id
+    provider_name = args.provider_name
+    attribution = args.attribution
     main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
                 is_footnote_continuation, min_img_pixels, ocr_language,
-                is_scanned_copy, table_extract)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+                is_scanned_copy, table_extract, public_base_url, server_root,
+                rights, provider_id, provider_name, attribution)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])

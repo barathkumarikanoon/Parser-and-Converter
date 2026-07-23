@@ -304,6 +304,8 @@ class TextBox:
                 return (total_uppercase / total_letters) >= 0.40  #0.25
             elif pdf_type == 'sebi_circulars':
                 return False
+            elif pdf_type == 'egazette':
+                return False
             else:
                 return (total_uppercase / total_letters) >= 0.75 
 
@@ -313,10 +315,12 @@ class TextBox:
 
     
     # --- func to detect the textbox having texts font in Title Case for heading/title detection ---
-    def is_titlecase(self, pdf_type = None):
+    def is_titlecase(self, pdf_type=None):
         words = []
+
         if pdf_type == 'sebi' or pdf_type == 'sebi_circulars':
             return False
+
         try:
             for textline in self.tbox.findall(".//textline"):
                 for text in textline.findall(".//text"):
@@ -332,41 +336,39 @@ class TextBox:
             valid_word_count = 0
 
             for word in words:
-                # Remove trailing punctuation like commas, periods, etc.
+                # Remove leading/trailing punctuation like commas, periods, etc.
                 word = word.strip(string.punctuation)
 
                 # Skip empty words after cleaning
                 if not word:
                     continue
 
-                # Check if the word contains at least one alphabetic character
-                if any(c.isalpha() for c in word):
-                    valid_word_count += 1
+                # Must contain at least one alphabetic character
+                if not any(c.isalpha() for c in word):
+                    continue
 
-                    # Check if first letter uppercase and the rest lowercase
-                    if len(word) == 1:
+                if len(word) == 1:
+                    continue
 
-                        # For single letter words, just check uppercase
-                        if word[0].isupper():
-                            titlecase_count += 1
-                    else:
-                        if word[0].isupper() and word[1:].islower():
-                            titlecase_count += 1
+                valid_word_count += 1
+
+                # Titlecase = first letter uppercase, remaining letters lowercase
+                if word[0].isupper() and word[1:].islower():
+                    titlecase_count += 1
 
             if valid_word_count == 0:
                 return False
 
             if pdf_type == 'acts':
-                return (titlecase_count / valid_word_count) >= 0.40#0.25
+                return (titlecase_count / valid_word_count) >= 0.40  # 0.25
             elif pdf_type == 'sebi_circulars':
                 return False
             else:
                 return (titlecase_count / valid_word_count) >= 0.75
-        
+
         except Exception as e:
             self.logger.error(f"Error detecting is_titlecase text in textbox [{self.extract_text_from_tb()}]: {e}")
             return False
-
     
     # --- func to get the first char coords of the textbox ---
     def get_first_char_coordX0(self):

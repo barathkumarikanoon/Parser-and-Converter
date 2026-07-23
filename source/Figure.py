@@ -9,12 +9,6 @@ from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTImage
 from pdfminer.image import ImageWriter
 
-# try:
-#     import pytesseract
-#     HAS_TESSERACT = True
-# except ImportError:
-#     HAS_TESSERACT = False
-
 class StableImageWriter(ImageWriter):
     def _create_unique_image_name(self, image, ext):
         name = image.name + ext
@@ -94,13 +88,14 @@ class Pictures:
             for img in self.walk_layout(element)
         ]
 
-    def register_global(self, img_name, path, text_content = None):
+    def register_global(self, img_name, path, text_content = None, text_language = None):
         reg = self.unique_images.setdefault(
             img_name,
             {
                 "count": 0,
                 "path": path,
                 "text": text_content if text_content else "",
+                "language": text_language,
                 "pages": set()
             }
         )
@@ -113,65 +108,6 @@ class Pictures:
     
         if img_name in self.pics:
             del self.pics[img_name]
-
-    # def extract_text_content(self, image_path):
-    #     try:
-    #         with Image.open(image_path) as img:
-    #             img_gray = img.convert("L") if img.mode != "L" else img
-
-    #             img_array = np.array(img_gray)
-
-    #             dark_pixels = np.sum(img_array < 200)
-    #             total_pixels = img_array.size
-    #             dark_ratio = dark_pixels / total_pixels if total_pixels > 0 else 0
-
-    #             variance = np.var(img_array) if img_array.size > 100 else 0
-
-    #             looks_like_text = (
-    #                 0.05 < dark_ratio < 0.95
-    #                 and variance > 100
-    #             )
-
-    #             self.logger.debug(
-    #                 f"{image_path} | dark_ratio={dark_ratio:.2%}, "
-    #                 f"variance={variance:.1f}, looks_like_text={looks_like_text}"
-    #             )
-
-    #             if not looks_like_text:
-    #                 self.logger.info(
-    #                     f"Skipping {image_path}: no meaningful text-like content detected."
-    #                 )
-    #                 return None
-
-    #             if not HAS_TESSERACT:
-    #                 self.logger.warning("Tesseract is not available.")
-    #                 return None
-
-    #             try:
-    #                 config = "--oem 3 --psm 6"
-    #                 ocr_text = pytesseract.image_to_string(
-    #                     img_gray,
-    #                     config=config
-    #                 ).strip()
-    #                 print(ocr_text)
-    #                 if ocr_text:
-    #                     lang, confidence = detect_language(ocr_text)
-    #                     print(ocr_text, lang, confidence)
-    #                     if confidence >= 0.3:
-    #                         return ocr_text
-
-    #                 self.logger.info(
-    #                     f"OCR found no text in {image_path}."
-    #                 )
-    #                 return None
-
-    #             except Exception as e:
-    #                 self.logger.debug(f"OCR failed for {image_path}: {e}")
-    #                 return None
-
-    #     except Exception as e:
-    #         self.logger.warning(f"Failed to analyze image {image_path}: {e}")
-    #         return None
 
     def extract_text_content(self, image_path):
         try:
@@ -205,11 +141,8 @@ class Pictures:
                     self.logger.info(
                         f"Skipping {image_path}: no meaningful text-like content detected."
                     )
-                    return None
+                    return None, None
 
-                # if not HAS_TESSERACT:
-                #     self.logger.warning("Tesseract is not available.")
-                #     return None
 
                 try:
                     # config = "--oem 3 --psm 6"
@@ -223,26 +156,26 @@ class Pictures:
 
                     if not ocr_text:
                         self.logger.info(f"OCR found no text in {image_path}.")
-                        return None
+                        return None, None
 
                     lang, confidence = detect_language(ocr_text)
 
                     if confidence >= 0.3:
-                        return ocr_text
+                        return ocr_text, lang
 
                     self.logger.info(
                         f"Rejected OCR text due to low language confidence "
                         f"({confidence:.3f}) for {image_path}"
                     )
-                    return None
+                    return None, None
 
                 except Exception as e:
                     self.logger.debug(f"OCR failed for {image_path}: {e}")
-                    return None
+                    return None, None
 
         except Exception as e:
             self.logger.warning(f"Failed to analyze image {image_path}: {e}")
-            return None
+            return None, None
     
     def should_skip(self, lt_image, min_img_pixels):
         try:
@@ -356,21 +289,23 @@ class Pictures:
                         else:
                             os.remove(temp_path)
                     
-                    text_content = self.extract_text_content(final_path)
+                    text_content, text_language = self.extract_text_content(final_path)
                     if not text_content:
                         os.remove(final_path)
                         continue
-                    
+
                     saved_images[img_name] = {
                         "name": img_name,
                         "path": final_path,
-                        "text": text_content
+                        "text": text_content,
+                        "language": text_language
                     }
 
                     self.register_global(
                         img_name,
                         final_path,
-                        text_content
+                        text_content,
+                        text_language
                     )
 
                 except Exception:

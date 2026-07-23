@@ -496,7 +496,7 @@ class ChromeLensParserTool:
 
         return result.get("detailed_blocks", [])
 
-    async def _process_page_with_retry(self, page, retries=3):
+    async def _process_page_with_retry(self, page, retries=5):
 
         last_exception = None
 

@@ -1,6 +1,5 @@
 import re
 import math
-from collections import OrderedDict
 import numpy as np
 import logging
 import pandas as pd
@@ -29,7 +28,8 @@ class HTMLBuilder(TableBuilder):
         self.stack_for_level = []
         self.hierarchy = ("section","subsection","para","subpara","subsubpara")
         self.level_hierarchy = ('level1', 'level2', 'level3', 'level4','level5')
-        self.is_real_sentence_end =LegalSentenceDetector().is_real_sentence_end
+        self._sentence_detector = LegalSentenceDetector()
+        self.is_real_sentence_end = self._sentence_detector.is_real_sentence_end
         self.previous_sentence_end_status = True
         self.is_pre_added = False
         self.normalize_text = NormalizeText().normalize_text
@@ -871,8 +871,7 @@ class HTMLBuilder(TableBuilder):
         
     def build(self, page, has_side_notes):#, section_end_page):
         visited_for_table = set()
-        # if not page.is_single_column_page:
-        #    page.all_tbs = self.get_orderBy_textboxes(page)
+        self._sentence_detector.column_bounds = page.column_bounds if page.is_multicolumn else None
         # try:
         #   if section_end_page and int(section_end_page)+1 == int(page.pg_num):
         #       while self.stack_for_section:
@@ -1020,31 +1019,7 @@ class HTMLBuilder(TableBuilder):
           return True
       
       return False
-       
-    def get_orderBy_textboxes(self,page):
-      column_gap = 0.1 * page.pg_width
-      items = list(page.all_tbs.items())
-      items.sort(key=lambda pair:pair[0].coords[0])
 
-      columns = []
-      current = []
-      prev_x0 =None
-
-      for tb, label in items:
-        if prev_x0 is None or (tb.coords[0]-prev_x0) < column_gap:
-           current.append((tb,label))
-        else:
-           columns.append(current)
-           current=[(tb,label)]
-        prev_x0 = tb.coords[0]
-      if current:
-         columns.append(current)
-      for col in columns:
-         col.sort(key=lambda  pair: -pair[0].coords[3])
-
-      flat = [pair for col in columns for pair in col]
-      return OrderedDict(flat)           
-    
     def close_html(self):
         if not self.builder:
            return None
@@ -1266,126 +1241,127 @@ class HTMLBuilderChromeLens:
                self.logger.warning(f'While using chrome lens to build html: {e}')
             
             i += 1
-               
-    # def build_page_html(self, detailed_blocks, page_number):
-    #     words = []
-    #     for block in detailed_blocks:
-    #         for line in block.get("lines", []):
-    #             for word in line.get("words", []):
-    #                 txt = word.get("text", "").strip()
-    #                 if not txt:
-    #                     continue
-    #                 g = word["geometry"]
-    #                 left = g["center_x"] - g["width"] / 2
-    #                 right = g["center_x"] + g["width"] / 2
-    #                 top = g["center_y"] - g["height"] / 2
-    #                 bottom = g["center_y"] + g["height"] / 2
-    #                 words.append({
-    #                     "text": txt,
-    #                     "left": left,
-    #                     "right": right,
-    #                     "top": top,
-    #                     "bottom": bottom,
-    #                     "cx": g["center_x"],
-    #                     "cy": g["center_y"],
-    #                     "width": g["width"],
-    #                     "height": g["height"]
-    #                 })
-    #     if not words:
-    #         return ""
-    #     median_height = median(
-    #         w["height"]
-    #         for w in words
-    #     )
-    #     row_threshold = median_height * 0.60
-    #     words.sort(
-    #         key=lambda w: (
-    #             w["cy"],
-    #             w["left"]
-    #         )
-    #     )
-    #     rows = []
-    #     for word in words:
-    #         found = False
-    #         for row in rows:
-    #             if abs(row["cy"] - word["cy"]) <= row_threshold:
-    #                 row["words"].append(word)
-    #                 n = len(row["words"])
-    #                 row["cy"] = (
-    #                     row["cy"] * (n - 1)
-    #                     + word["cy"]
-    #                 ) / n
-    #                 found = True
-    #                 break
-    #         if not found:
-    #             rows.append({
-    #                 "cy": word["cy"],
-    #                 "words": [word]
-    #             })
-    #     rows.sort(
-    #         key=lambda r: r["cy"]
-    #     )
 
-    #     html = []
-    #     PAGE_WIDTH = 1.0
-    #     AVG_CHAR_WIDTH = 0.010
-    #     SENTENCE_ENDINGS = (".", "!", "?")
-    #     paragraph_buffer = []
+    def _detect_word_columns(self, rows, n_bins=100, coverage_threshold=0.15,
+                              min_gap_ratio=0.02, min_zone=0.15, max_zone=0.85,
+                              min_words_per_column=5, min_column_height_ratio=0.25):
+        words = [w for row in rows for w in row["words"]]
+        if len(rows) < 4 or len(words) < 2 * min_words_per_column:
+            return None
 
-    #     def flush_paragraph():
-    #         if paragraph_buffer:
-    #             html.append("<p>{}</p>".format(" ".join(paragraph_buffer)))
-    #             paragraph_buffer.clear()
+        x0 = min(w["left"] for w in words)
+        x1 = max(w["right"] for w in words)
+        width = x1 - x0
+        if width <= 0:
+            return None
 
-    #     for row in rows:
-    #         row["words"].sort(
-    #             key=lambda w: w["left"]
-    #         )
-    #         spans = []
-    #         current = []
-    #         prev = None
-    #         for word in row["words"]:
-    #             if prev is None:
-    #                 current.append(word)
-    #                 prev = word
-    #                 continue
-    #             gap = word["left"] - prev["right"]
-    #             if gap < AVG_CHAR_WIDTH * 2:
-    #                 current.append(word)
-    #             else:
-    #                 spans.append(current)
-    #                 current = [word]
-    #             prev = word
-    #         if current:
-    #             spans.append(current)
+        def to_bin(x):
+            return max(0, min(n_bins - 1, int((x - x0) / width * n_bins)))
 
-    #         row_text_parts = []
-    #         previous_span_right = 0
-    #         for span in spans:
-    #             span_left = span[0]["left"]
-    #             gap = span_left - previous_span_right
-    #             spaces = max(
-    #                 1,
-    #                 round(gap / AVG_CHAR_WIDTH)
-    #             )
-    #             text = " ".join(
-    #                 w["text"]
-    #                 for w in span
-    #             )
-    #             row_text_parts.append(
-    #                 "&nbsp;" * spaces + escape(text)
-    #             )
-    #             previous_span_right = span[-1]["right"]
+        n_rows = len(rows)
+        bin_row_count = [0] * n_bins
+        for row in rows:
+            row_bins = set()
+            for w in row["words"]:
+                for b in range(to_bin(w["left"]), to_bin(w["right"]) + 1):
+                    row_bins.add(b)
+            for b in row_bins:
+                bin_row_count[b] += 1
+        bin_fraction = [count / n_rows for count in bin_row_count]
 
-    #         paragraph_buffer.append("".join(row_text_parts))
+        lo, hi = int(min_zone * n_bins), int(max_zone * n_bins)
+        best_start, best_len = None, 0
+        run_start = None
+        for i in range(lo, hi):
+            if bin_fraction[i] <= coverage_threshold:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                if i - run_start > best_len:
+                    best_start, best_len = run_start, i - run_start
+                run_start = None
+        if run_start is not None and hi - run_start > best_len:
+            best_start, best_len = run_start, hi - run_start
 
-    #         last_word_text = row["words"][-1]["text"].strip()
-    #         if last_word_text.endswith(SENTENCE_ENDINGS):
-    #             flush_paragraph()
+        if best_start is None or (best_len / n_bins) * width < min_gap_ratio * width:
+            return None
 
-    #     flush_paragraph()  # trailing text with no terminal punctuation
+        split_x = x0 + (best_start + best_len / 2.0) / n_bins * width
 
-    #     return "\n".join(html)
+        left_words = [w for w in words if w["cx"] < split_x]
+        right_words = [w for w in words if w["cx"] >= split_x]
+        if len(left_words) < min_words_per_column or len(right_words) < min_words_per_column:
+            return None
+
+        top = min(w["top"] for w in words)
+        bottom = max(w["bottom"] for w in words)
+        total_height = max(bottom - top, 1e-6)
+        left_height = max(w["bottom"] for w in left_words) - min(w["top"] for w in left_words)
+        right_height = max(w["bottom"] for w in right_words) - min(w["top"] for w in right_words)
+        if left_height < min_column_height_ratio * total_height or \
+           right_height < min_column_height_ratio * total_height:
+            return None
+
+        left_bounds = (min(w["left"] for w in left_words), max(w["right"] for w in left_words))
+        right_bounds = (min(w["left"] for w in right_words), max(w["right"] for w in right_words))
+        return split_x, [left_bounds, right_bounds]
+
+    # --- func to split a row whose words actually belong to two different columns that
+    # happened to land in the same row band, using the row's own word gap near split_x ---
+    def _split_row_by_column(self, row, split_x, min_word_gap=0.04, gutter_tolerance=0.08):
+        ws = sorted(row["words"], key=lambda w: w["left"])
+        if not ws or not (ws[0]["left"] < split_x < ws[-1]["right"]):
+            return [row]
+
+        for i in range(len(ws) - 1):
+            gap = ws[i + 1]["left"] - ws[i]["right"]
+            mid = (ws[i]["right"] + ws[i + 1]["left"]) / 2.0
+            if gap >= min_word_gap and abs(mid - split_x) <= gutter_tolerance:
+                left_part, right_part = ws[:i + 1], ws[i + 1:]
+                return [
+                    {"cy": row["cy"], "words": left_part},
+                    {"cy": row["cy"], "words": right_part},
+                ]
+        # No internal gutter found - it's a genuine full-width line (e.g. a heading), keep as-is
+        return [row]
+
+    # --- func to order rows left-column-then-right-column, using full-width rows (that
+    # weren't split above) as band separators, mirroring Page._reorder_by_columns ---
+    def _reorder_rows_by_column(self, rows, split_x, column_bounds, full_width_ratio=0.6):
+        combined_left = column_bounds[0][0]
+        combined_right = column_bounds[-1][1]
+        combined_width = max(combined_right - combined_left, 1e-6)
+
+        rows_sorted = sorted(rows, key=lambda r: r["cy"])
+
+        bands = []
+        current_left, current_right = [], []
+
+        def flush():
+            nonlocal current_left, current_right
+            if current_left or current_right:
+                current_left.sort(key=lambda r: r["cy"])
+                current_right.sort(key=lambda r: r["cy"])
+                bands.append(current_left + current_right)
+                current_left, current_right = [], []
+
+        for row in rows_sorted:
+            row_left = min(w["left"] for w in row["words"])
+            row_right = max(w["right"] for w in row["words"])
+            is_full_width = (row_right - row_left) >= full_width_ratio * combined_width and \
+                row_left < split_x < row_right
+            if is_full_width:
+                flush()
+                bands.append([row])
+            else:
+                row_cx = (row_left + row_right) / 2.0
+                if row_cx < split_x:
+                    current_left.append(row)
+                else:
+                    current_right.append(row)
+        flush()
+
+        return [row for band in bands for row in band]
 
     def build_page_html(self, detailed_blocks, page_number):
 
@@ -1471,9 +1447,38 @@ class HTMLBuilderChromeLens:
 
                 })
 
-        rows.sort(
-            key=lambda r: r["cy"]
-        )
+        # Exclude genuine full-width rows (headings/tables: wide, and no internal gap
+        # bigger than ordinary word-spacing) from the rows fed into gutter detection.
+        # With only a handful of rows on a page, even one such row can look "rare
+        # enough" under a pure row-fraction threshold to be mistaken for part of the
+        # gutter - excluding it outright avoids that regardless of how many rows there
+        # are. A minimum gap of several character-widths is used as an absolute
+        # floor (not relative to page/row width) since ordinary word-spacing is a
+        # roughly fixed number of character-widths regardless of a row's own extent.
+        min_gutter_gap = 4 * 0.010
+        overall_word_x0 = min(w["left"] for row in rows for w in row["words"])
+        overall_word_x1 = max(w["right"] for row in rows for w in row["words"])
+        overall_width_for_filter = max(overall_word_x1 - overall_word_x0, 1e-6)
+
+        def is_full_width_no_gutter(row):
+            ws = sorted(row["words"], key=lambda w: w["left"])
+            row_width = ws[-1]["right"] - ws[0]["left"]
+            if row_width < 0.6 * overall_width_for_filter:
+                return False
+            gaps = (ws[i + 1]["left"] - ws[i]["right"] for i in range(len(ws) - 1))
+            return not any(gap >= min_gutter_gap for gap in gaps)
+
+        gutter_detection_rows = [row for row in rows if not is_full_width_no_gutter(row)]
+
+        column_info = self._detect_word_columns(gutter_detection_rows)
+        if column_info is None:
+            rows.sort(key=lambda r: r["cy"])
+        else:
+            split_x, column_bounds = column_info
+            split_rows = []
+            for row in rows:
+                split_rows.extend(self._split_row_by_column(row, split_x))
+            rows = self._reorder_rows_by_column(split_rows, split_x, column_bounds)
 
         html = []
 
@@ -1518,183 +1523,6 @@ class HTMLBuilderChromeLens:
             )
 
         return "\n".join(html)
-
-    # def build_page_html(self, detailed_blocks, page_number):
-
-    #     words = []
-
-    #     for block in detailed_blocks:
-
-    #         for line in block.get("lines", []):
-
-    #             for word in line.get("words", []):
-
-    #                 txt = word.get("text", "").strip()
-
-    #                 if not txt:
-    #                     continue
-
-    #                 g = word["geometry"]
-
-    #                 left = g["center_x"] - g["width"] / 2
-    #                 right = g["center_x"] + g["width"] / 2
-    #                 top = g["center_y"] - g["height"] / 2
-    #                 bottom = g["center_y"] + g["height"] / 2
-
-    #                 words.append({
-
-    #                     "text": txt,
-
-    #                     "left": left,
-    #                     "right": right,
-
-    #                     "top": top,
-    #                     "bottom": bottom,
-
-    #                     "cx": g["center_x"],
-    #                     "cy": g["center_y"],
-
-    #                     "width": g["width"],
-    #                     "height": g["height"]
-
-    #                 })
-
-    #     if not words:
-    #         return ""
-
-    #     median_height = median(
-    #         w["height"]
-    #         for w in words
-    #     )
-
-    #     row_threshold = median_height * 0.60
-
-    #     words.sort(
-    #         key=lambda w: (
-    #             w["cy"],
-    #             w["left"]
-    #         )
-    #     )
-
-
-    #     rows = []
-
-    #     for word in words:
-
-    #         found = False
-
-    #         for row in rows:
-
-    #             if abs(row["cy"] - word["cy"]) <= row_threshold:
-
-    #                 row["words"].append(word)
-
-    #                 n = len(row["words"])
-
-    #                 row["cy"] = (
-    #                     row["cy"] * (n - 1)
-    #                     + word["cy"]
-    #                 ) / n
-
-    #                 found = True
-    #                 break
-
-    #         if not found:
-
-    #             rows.append({
-
-    #                 "cy": word["cy"],
-
-    #                 "words": [word]
-
-    #             })
-
-    #     rows.sort(
-    #         key=lambda r: r["cy"]
-    #     )
-
-    #     html = []
-
-    #     PAGE_WIDTH = 1.0
-
-    #     AVG_CHAR_WIDTH = 0.010
-
-    #     for row in rows:
-
-    #         row["words"].sort(
-    #             key=lambda w: w["left"]
-    #         )
-
-    #         spans = []
-
-    #         current = []
-
-    #         prev = None
-
-    #         for word in row["words"]:
-
-    #             if prev is None:
-
-    #                 current.append(word)
-
-    #                 prev = word
-
-    #                 continue
-
-    #             gap = word["left"] - prev["right"]
-
-    #             # if close -> same span
-    #             if gap < AVG_CHAR_WIDTH * 2:
-
-    #                 current.append(word)
-
-    #             else:
-
-    #                 spans.append(current)
-
-    #                 current = [word]
-
-    #             prev = word
-
-    #         if current:
-    #             spans.append(current)
-
-    #         row_html = []
-
-    #         previous_span_right = 0
-
-    #         for span in spans:
-
-    #             span_left = span[0]["left"]
-
-    #             gap = span_left - previous_span_right
-
-    #             spaces = max(
-    #                 1,
-    #                 round(gap / AVG_CHAR_WIDTH)
-    #             )
-
-    #             text = " ".join(
-    #                 w["text"]
-    #                 for w in span
-    #             )
-
-    #             row_html.append(
-    #                 "&nbsp;" * spaces +
-    #                 f"<span>{escape(text)}</span>"
-    #             )
-
-    #             previous_span_right = span[-1]["right"]
-
-
-
-    #         html.append(
-    #             "<p>{}</p>".format(
-    #                 "".join(row_html)
-    #             )
-    #         )
-
-    #     return "\n".join(html)
 
     def get_html(self):
         if not self.builder:

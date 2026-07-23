@@ -13,6 +13,5 @@ pymupdf
 fasttext
 paddlepaddle==3.1.1
 paddleocr==3.7.0
-iiif
-iiif-prezi
+iiif-prezi3
 Pillow
