@@ -1328,10 +1328,10 @@ class Main:
                     self.process_pages(pdf_type)
                 self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
             else:
-                if pdf_type in {'egazette'}:
-                    self.logger.info('using chrome lens for the scanned copy')
-                    self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
-                else:
+                # if pdf_type in {'egazette'}:
+                #     self.logger.info('using chrome lens for the scanned copy')
+                #     self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
+                # else:
                     self.is_scanned_copy = True
                     self.process_scanned_copy(pdf_type, base_name_of_file,
                                               start_page, end_page)
