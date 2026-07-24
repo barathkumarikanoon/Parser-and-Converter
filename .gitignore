@@ -5,4 +5,3 @@ cache_pdf/
 *.py[cod]
 test/actual_html/
 test/diff_results/
-test/expected_html/
