@@ -8,7 +8,7 @@ import difflib
 import logging
 import csv
 
-from legallayout.source.Main import Main
+from source.Main import Main
 
 
 class TestPdfToHtmlDiff(unittest.TestCase):
@@ -69,7 +69,19 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                     start_page  = test_case.get('start_page', None),
                     end_page = test_case.get('end_page', None),
                     # output_dir = test_case.get('output_dir',''),
-                    is_amendment=test_case.get('is_amendment', False)
+                    is_amendment=test_case.get('is_amendment', False),
+                    scanned_copy=test_case.get('scanned_copy', False),
+                    table_extract=test_case.get('table_extract', False),
+                    has_doc_end=test_case.get('has_doc_end', False),
+                    is_footnote_continuation=test_case.get('is_footnote_continuation', False),
+                    ocr_language=test_case.get('ocr_language', 'en'),
+                    min_img_pixels=test_case.get('min_img_pixels', 0),
+                    server_root=test_case.get('server_root'),
+                    public_base_url=test_case.get('public_base_url'),
+                    rights=test_case.get('rights'),
+                    provider_id=test_case.get('provider_id'),
+                    provider_name=test_case.get('provider_name'),
+                    attribution=test_case.get('attribution')
                 )
                 self.assertTrue(success, f"Failed to process PDF: {test_case['pdf_name']}")
 
@@ -86,12 +98,28 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                     'pdf_type': test_case.get('pdf_type', 'default'),
                     'is_amendment': test_case.get('is_amendment', False),
                     'has_sidenotes' : test_case.get('has_sidenotes', False),
+                    'scanned_copy': test_case.get('scanned_copy', False),
+                    'table_extract': test_case.get('table_extract', False),
                     'status': 'PASS' if diff_result['is_match'] else 'DIFF',
                     'diff_file': diff_result.get('diff_file')
                 })
 
         # Generate summary report
         self._generate_test_report(results)
+
+    @staticmethod
+    def _parse_bool(value):
+        return value.strip().lower() in ['true', 'yes', '1']
+
+    @staticmethod
+    def _compute_output_filename(base_stem, start_page, end_page, total_pgs, suffix):
+        if start_page or end_page:
+            if start_page is None:
+                start_page = 1
+            elif end_page is None:
+                end_page = total_pgs - 1 + int(start_page)
+            return f"{base_stem}pg:{start_page}_pg:{end_page}{suffix}"
+        return f"{base_stem}{suffix}"
 
     @classmethod
     def _load_test_cases_from_csv(cls):
@@ -110,15 +138,32 @@ class TestPdfToHtmlDiff(unittest.TestCase):
 
                     # Parse optional parameters
                     pdf_type = row.get('pdf_type', '').strip() or None
-                    is_amendment = row.get('is_amendment', '').strip().lower() in ['true', 'yes', '1']
-                    # start_page = row.get('start_page', '').strip()
-                    # end_page = row.get('end_page', '').strip()
+                    is_amendment = cls._parse_bool(row.get('is_amendment', ''))
+                    start_page = row.get('start_page', '').strip()
+                    end_page = row.get('end_page', '').strip()
 
-                    # start_page = int(start_page) if start_page.isdigit() else None
-                    # end_page = int(end_page) if end_page.isdigit() else None
-                    has_sidenotes = row.get('has_sidenotes', '').strip().lower() in ['true', 'yes', '1']
-                    base_name = pdf_path.stem 
-                    if pdf_type == 'acts':
+                    start_page = int(start_page) if start_page.isdigit() else None
+                    end_page = int(end_page) if end_page.isdigit() else None
+                    has_sidenotes = cls._parse_bool(row.get('has_sidenotes', ''))
+                    scanned_copy = cls._parse_bool(row.get('scanned_copy', ''))
+                    table_extract = cls._parse_bool(row.get('table_extract', ''))
+                    has_doc_end = cls._parse_bool(row.get('has_doc_end', ''))
+                    is_footnote_continuation = cls._parse_bool(row.get('is_footnote_continuation', ''))
+                    ocr_language = row.get('ocr_language', '').strip() or 'en'
+                    min_img_pixels_raw = row.get('min_img_pixels', '').strip()
+                    min_img_pixels = int(min_img_pixels_raw) if min_img_pixels_raw.isdigit() else 0
+                    server_root_raw = row.get('server_root', '').strip()
+                    server_root = str(Path(server_root_raw).expanduser()) if server_root_raw else None
+                    public_base_url = row.get('public_base_url', '').strip() or None
+                    rights = row.get('rights', '').strip() or None
+                    provider_id = row.get('provider_id', '').strip() or None
+                    provider_name = row.get('provider_name', '').strip() or None
+                    attribution = row.get('attribution', '').strip() or None
+
+                    base_name = pdf_path.stem
+                    if scanned_copy:
+                        base_name += '_scanned'
+                    if pdf_type in {'acts', 'sebi_circulars'}:
                         expected_file = 'bluebell'
                     else:
                         expected_file = 'html'
@@ -128,46 +173,64 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                         'filename': filename,
                         'pdf_type': pdf_type,
                         'is_amendment': is_amendment,
-                        # 'start_page': start_page,
-                        # 'end_page': end_page,
+                        'start_page': start_page,
+                        'end_page': end_page,
                         'has_sidenotes' : has_sidenotes,
+                        'scanned_copy': scanned_copy,
+                        'table_extract': table_extract,
+                        'has_doc_end': has_doc_end,
+                        'is_footnote_continuation': is_footnote_continuation,
+                        'ocr_language': ocr_language,
+                        'min_img_pixels': min_img_pixels,
+                        'server_root': server_root,
+                        'public_base_url': public_base_url,
+                        'rights': rights,
+                        'provider_id': provider_id,
+                        'provider_name': provider_name,
+                        'attribution': attribution,
                         'expected_html': cls.expected_output_dir / f"{base_name}.{expected_file}",
                         'actual_html': cls.actual_output_dir / f"{base_name}.{expected_file}"
                     })
         except Exception as e:
             print(f"Error reading CSV file {cls.csv_file}: {e}")
 
-    @classmethod
-    def _generate_config_suffix(cls, pdf_type, is_amendment, has_sidenotes):#start_page, end_page):
-        """Generate a suffix based on configuration parameters."""
-        suffix_parts = []
-        if pdf_type:
-            suffix_parts.append(f"type-{pdf_type}")
-        if is_amendment:
-            suffix_parts.append("amendment")
-        # if start_page is not None:
-        #     suffix_parts.append(f"start-{start_page}")
-        # if end_page is not None:
-        #     suffix_parts.append(f"end-{end_page}")
-        if has_sidenotes:
-            suffix_parts.append("has_sidenotes")
-
-        return f"_{'_'.join(suffix_parts)}" if suffix_parts else ""
-
     def _process_pdf(self, test_case, pdf_type=None, is_amendment=False, has_sidenotes = False,
-                     char_margin = None, word_margin = None, line_margin = None, 
-                     start_page = None, end_page = None):
+                     char_margin = None, word_margin = None, line_margin = None,
+                     start_page = None, end_page = None, scanned_copy = False, table_extract = False,
+                     has_doc_end = False, is_footnote_continuation = False, ocr_language = 'en',
+                     min_img_pixels = 0, server_root = None, public_base_url = None,
+                     rights = None, provider_id = None, provider_name = None, attribution = None):
         """Process a single PDF file and generate HTML output."""
+        source_path = Path(test_case['pdf_path'])
+        pdf_path_for_main = test_case['pdf_path']
+        renamed_copy = None
+        if test_case['pdf_name'] != source_path.stem:
+            renamed_copy = self.actual_output_dir / f"{test_case['pdf_name']}{source_path.suffix}"
+            shutil.copy2(source_path, renamed_copy)
+            pdf_path_for_main = str(renamed_copy)
+
         try:
             # Create Main instance
             main = Main(
-                pdfPath=test_case['pdf_path'],
+                pdfPath=pdf_path_for_main,
                 # start=start_page,
                 # end=end_page,
                 is_amendment_pdf=is_amendment,
                 output_dir=str(self.actual_output_dir),
                 pdf_type=pdf_type,
-                has_side_notes = has_sidenotes
+                has_side_notes = has_sidenotes,
+                has_doc_end = has_doc_end,
+                is_footnote_continuation = is_footnote_continuation,
+                min_img_pixels = min_img_pixels,
+                ocr_language = ocr_language,
+                is_scanned_copy = scanned_copy,
+                table_extract = table_extract,
+                public_base_url = public_base_url,
+                server_root = server_root,
+                rights = rights,
+                provider_id = provider_id,
+                provider_name = provider_name,
+                attribution = attribution
             )
 
             # Parse PDF
@@ -179,6 +242,13 @@ class TestPdfToHtmlDiff(unittest.TestCase):
             # Build HTML
             main.buildHTML(start_page, end_page)
 
+            suffix = test_case['actual_html'].suffix
+            filename = self._compute_output_filename(
+                test_case['pdf_name'], start_page, end_page, main.total_pgs, suffix
+            )
+            test_case['actual_html'] = self.actual_output_dir / filename
+            test_case['expected_html'] = self.expected_output_dir / filename
+
             # Clean up cache
             main.clear_cache_pdf()
             main.clear_cache()
@@ -188,6 +258,10 @@ class TestPdfToHtmlDiff(unittest.TestCase):
         except Exception as e:
             logging.error(f"Error processing PDF {test_case['pdf_name']}: {e}")
             return False
+
+        finally:
+            if renamed_copy and renamed_copy.exists():
+                renamed_copy.unlink()
 
     def _compare_html_output(self, test_case):
         """Compare actual HTML output with expected baseline."""
@@ -255,6 +329,8 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                 f.write(f"Type: {result.get('pdf_type', 'default')}\n")
                 f.write(f"Amendment: {result.get('is_amendment', False)}\n")
                 f.write(f"Sidenotes: {result.get('has_sidenotes', False)}\n")
+                f.write(f"Scanned copy: {result.get('scanned_copy', False)}\n")
+                f.write(f"Table extract: {result.get('table_extract', False)}\n")
                 f.write(f"Status: {result['status']}\n")
                 if result.get('diff_file'):
                     f.write(f"Diff file: {result['diff_file']}\n")
@@ -273,7 +349,13 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                 is_amendment_pdf=False,
                 output_dir=str(self.actual_output_dir),
                 pdf_type=None,
-                has_side_notes = False
+                has_side_notes = False,
+                has_doc_end = False,
+                is_footnote_continuation = False,
+                min_img_pixels = 0,
+                ocr_language = 'en',
+                is_scanned_copy = False,
+                table_extract = False
             )
             success = main.parsePDF(None, char_margin = None, word_margin = None, \
                                     line_margin = None, start_page = None, end_page = None)

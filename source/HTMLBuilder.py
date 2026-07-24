@@ -1,12 +1,11 @@
 import re
 import math
-from collections import OrderedDict
 import numpy as np
 import logging
 import pandas as pd
 from difflib import SequenceMatcher
 import copy
-
+from pathlib import Path
 from .Table import TableBuilder
 from .SentenceEndDetector import LegalSentenceDetector
 from .NormalizeText import NormalizeText
@@ -18,7 +17,7 @@ VOID_TAGS = {"br"}
 
 class HTMLBuilder(TableBuilder):
     
-    def __init__(self, sentence_completion_punctuation = tuple(), pdf_type = None):
+    def __init__(self, unique_images, sentence_completion_punctuation = tuple(), pdf_type = None):
         TableBuilder.__init__(self)
         self.logger = logging.getLogger(__name__)
         self.pdf_type = pdf_type
@@ -29,18 +28,21 @@ class HTMLBuilder(TableBuilder):
         self.stack_for_level = []
         self.hierarchy = ("section","subsection","para","subpara","subsubpara")
         self.level_hierarchy = ('level1', 'level2', 'level3', 'level4','level5')
-        self.is_real_sentence_end =LegalSentenceDetector().is_real_sentence_end
+        self._sentence_detector = LegalSentenceDetector()
+        self.is_real_sentence_end = self._sentence_detector.is_real_sentence_end
         self.previous_sentence_end_status = True
         self.is_pre_added = False
         self.normalize_text = NormalizeText().normalize_text
         self.builder = ""
+        self.unique_images = unique_images
+        self.pending_header_footer = []
         self.main_builder = '''<!DOCTYPE HTML>
 <html>
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body {
-    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
     line-height: 1.6;
     white-space: normal;
   }
@@ -71,6 +73,22 @@ class HTMLBuilder(TableBuilder):
   }
   p {
     white-space: pre-wrap;
+  }
+
+  p.figure-text {
+    display: none;
+  }
+
+  span.header-text{
+    display:None;
+  }
+  
+  span.footer-text{
+    display:None;
+  }
+  
+  h4 {
+    text-align: center;
   }
 
   table {
@@ -239,7 +257,7 @@ class HTMLBuilder(TableBuilder):
                           line_texts.append(text.text)
                   line = ''.join(line_texts).replace("\n", " ").strip()
                   if line:
-                      doc += f"<center><h4>{self.normalize_text(line)}</h4></center>\n"
+                      doc += f"<h4>{self.normalize_text(line)}</h4>\n"
               self.builder += doc
         except Exception as e:
           self.logger.exception("Error while adding title - [%s] in html: %s",tb.extract_text_from_tb(),e)
@@ -746,17 +764,42 @@ class HTMLBuilder(TableBuilder):
              return True
         return False
     
-    def addFigure(self, tb, page):
-      if tb.figname in page.figures.pics:
-          if self.pending_tag and self.pending_text:
-            self.flushPrevious()
-          if self.pending_table:
-            self.flushTables()
-          # if self.stack_for_level:
-          #   self.close_levels()
-          img_path = page.figures.pics[tb.figname]
-          self.builder += f'<a href="{img_path}" target="_blank">[View Image]</a>\n'
+    from pathlib import Path
 
+    def extract_img_path(self, full_path):
+      try:
+        p = Path(full_path)
+        parts = p.parts
+
+        if 'manifest' in parts:
+            idx = parts.index('manifest')
+            return str(Path(*parts[idx:]))
+        else:
+            return None  # or raise error
+      except Exception as e:
+         self.logger.warning(f'Extracting img path while building html {e}')
+         return None
+    
+    def addFigure(self, tb, page):
+      try:
+        if tb.figname in self.unique_images:
+            if self.pending_tag and self.pending_text:
+              self.flushPrevious()
+            if self.pending_table:
+              self.flushTables()
+            # if self.stack_for_level:
+            #   self.close_levels()
+             
+            img_path = self.extract_img_path(self.unique_images[tb.figname] \
+            .get("path",""))
+
+            self.builder += f'<a href="{img_path}" target="_blank">[View Image]</a>\n'
+
+            text_content = self.unique_images[tb.figname].get("text", "")
+            if text_content:
+                self.builder += f'<p class="figure-text">{text_content}</p>\n'
+      except Exception as e:
+         self.logger.warning(f'While adding figure to html, {e}')
    
     def add_pre(self):
         html = copy.deepcopy(self.builder)
@@ -797,13 +840,38 @@ class HTMLBuilder(TableBuilder):
         elif facts_case_pattern.search(text):
             self.add_pre()
         
+    def add_header(self, text):
+        if not self.pending_table:
+            if self.pending_tag and self.pending_text:
+                self.pending_text += f'<span class="header-text">{text}</span>\n'
+            else:
+                self.builder += f'<span class="header-text">{text}</span>\n'
         
+        else:
+           header = f'<span class="header-text">{text}</span>\n'
+           self.pending_header_footer.append(header)
 
+    def add_footer(self, text):
+        if not self.pending_table:
+            if self.pending_tag and self.pending_text:
+                self.pending_text += f'<span class="footer-text">{text}</span>\n'
+            else:
+                self.builder += f'<span class="footer-text">{text}</span>\n' 
+
+        else:
+           footer = f'<span class="footer-text">{text}</span>\n'
+           self.pending_header_footer.append(footer) 
+
+    def flush_pending_header_footer(self):
+        if self.pending_header_footer:
+            self.builder += '\n'
+            for item in self.pending_header_footer:
+                self.builder += item
+            self.pending_header_footer = []
         
     def build(self, page, has_side_notes):#, section_end_page):
         visited_for_table = set()
-        # if not page.is_single_column_page:
-        #    page.all_tbs = self.get_orderBy_textboxes(page)
+        self._sentence_detector.column_bounds = page.column_bounds if page.is_multicolumn else None
         # try:
         #   if section_end_page and int(section_end_page)+1 == int(page.pg_num):
         #       while self.stack_for_section:
@@ -834,12 +902,24 @@ class HTMLBuilder(TableBuilder):
                     next_text_tb = next_tb
 
             at_page_end = (idx == len(all_items) - 1)
-            if label == "header" or label == "footer" :#or self.is_pg_num(tb,page.pg_width):
-               continue
-            if not ((isinstance(label, tuple) and label[0] == "table")):
+            if label == "header":
+                self.add_header(
+                  self.normalize_text(tb.extract_text_from_tb())
+               )
+                continue
+
+            elif label == "footer":#or self.is_pg_num(tb,page.pg_width):
+                self.add_footer(
+                  self.normalize_text(tb.extract_text_from_tb())
+               )
+                continue
+            
+            if not ((isinstance(label, tuple) and (label[0] == "table" or\
+                                                   label[0] == "borderless_table"))):
                 if self.pending_table is not None and len(self.pending_table) <= 2:
                     self.addTable(self.pending_table[0])
                     self.pending_table = None
+                    self.flush_pending_header_footer()
             
             if self.pdf_type == 'sebi' and not self.is_pre_added and label in ('title', 'level1'):
                 self.check_for_pre_ended(self.normalize_text(tb.extract_text_from_tb()), label)
@@ -849,6 +929,26 @@ class HTMLBuilder(TableBuilder):
                 if table_id not in visited_for_table:
                     table_obj = page.tabular_datas.tables.get(table_id)
                     table_width = page.tabular_datas.get_table_width(table_id)
+
+                    if table_obj is not None:
+                        if self.pending_table is None:
+                            self.pending_table = [table_obj, table_width]
+                        
+                        else:
+                            if self.is_table_continuation(table_obj, table_width):
+                                self.merge_tables(table_obj, table_width)#, html_builder=self)
+                               
+                            else:
+                                self.addTable(self.pending_table[0])
+                                self.pending_table = [table_obj, table_width]
+
+                    visited_for_table.add(table_id)
+            
+            elif isinstance(label, tuple) and label[0] == "borderless_table":
+                table_id = label[1]
+                if table_id not in visited_for_table:
+                    table_obj = page.borderless_tabular_datas.tables.get(table_id)
+                    table_width = page.borderless_tabular_datas.get_table_width(table_id)
 
                     if table_obj is not None:
                         if self.pending_table is None:
@@ -919,34 +1019,12 @@ class HTMLBuilder(TableBuilder):
           return True
       
       return False
-       
-    def get_orderBy_textboxes(self,page):
-      column_gap = 0.1 * page.pg_width
-      items = list(page.all_tbs.items())
-      items.sort(key=lambda pair:pair[0].coords[0])
 
-      columns = []
-      current = []
-      prev_x0 =None
-
-      for tb, label in items:
-        if prev_x0 is None or (tb.coords[0]-prev_x0) < column_gap:
-           current.append((tb,label))
-        else:
-           columns.append(current)
-           current=[(tb,label)]
-        prev_x0 = tb.coords[0]
-      if current:
-         columns.append(current)
-      for col in columns:
-         col.sort(key=lambda  pair: -pair[0].coords[3])
-
-      flat = [pair for col in columns for pair in col]
-      return OrderedDict(flat)           
-    
     def close_html(self):
-       html = self.main_builder + self.builder + "\n</body>\n</html>"
-       return html
+        if not self.builder:
+           return None
+        html = self.main_builder + self.builder + "\n</body>\n</html>"
+        return html
     
     def get_html(self):
         self.flushPrevious()
@@ -1035,3 +1113,432 @@ class HTMLBuilder(TableBuilder):
 
           except Exception as e:
               self.logger.exception("Error while adding section [%s]: %s", text, e)
+
+
+import asyncio
+import io
+from html import escape
+
+import pymupdf
+from PIL import Image
+from chrome_lens_py import LensAPI
+from statistics import median
+
+
+class HTMLBuilderChromeLens:
+
+    def __init__(self, pdf_path):
+        self.pdf_path = pdf_path
+        self.lens = LensAPI()
+        self.builder = ""
+        self.total_pages = 0
+        self.logger = logging.getLogger(__name__)
+
+    async def process_page(self, page):
+
+        pix = page.get_pixmap(
+            dpi=300,
+            alpha=False
+        )
+
+        image = Image.open(
+            io.BytesIO(
+                pix.tobytes("png")
+            )
+        )
+
+        result = await self.lens.process_image(
+            image_path=image,
+            output_format="detailed"
+        )
+
+        return result.get(
+            "detailed_blocks",
+            []
+        )
+
+    async def _build_async(
+        self,
+        start_page,
+        end_page
+    ):
+
+        doc = pymupdf.open(
+            self.pdf_path
+        )
+
+        try:
+
+            for page_num in range(
+                start_page,
+                end_page + 1
+            ):
+
+                page = doc[
+                    page_num - 1
+                ]
+
+                detailed_blocks = await self.process_page(
+                    page
+                )
+
+                self.builder += (
+                    self.build_page_html(
+                        detailed_blocks,
+                        page_num
+                    )
+                    + "\n\n"
+                )
+
+        finally:
+
+            doc.close()
+
+    def build(
+        self,
+        start_page=None,
+        end_page=None
+    ):
+
+        doc = pymupdf.open(
+            self.pdf_path
+        )
+
+        self.total_pages = len(
+            doc
+        )
+
+        doc.close()
+
+        if start_page is None:
+            start_page = 1
+
+        if end_page is None:
+            end_page = self.total_pages
+
+        start_page = max(
+            1,
+            start_page
+        )
+
+        end_page = min(
+            self.total_pages,
+            end_page
+        )
+
+        i = 1
+
+        while i <= 3:
+            try:
+                asyncio.run(
+                    self._build_async(
+                        start_page,
+                        end_page
+                    )
+                )
+            
+            except Exception as e:
+               self.logger.warning(f'While using chrome lens to build html: {e}')
+            
+            i += 1
+
+    def _detect_word_columns(self, rows, n_bins=100, coverage_threshold=0.15,
+                              min_gap_ratio=0.02, min_zone=0.15, max_zone=0.85,
+                              min_words_per_column=5, min_column_height_ratio=0.25):
+        words = [w for row in rows for w in row["words"]]
+        if len(rows) < 4 or len(words) < 2 * min_words_per_column:
+            return None
+
+        x0 = min(w["left"] for w in words)
+        x1 = max(w["right"] for w in words)
+        width = x1 - x0
+        if width <= 0:
+            return None
+
+        def to_bin(x):
+            return max(0, min(n_bins - 1, int((x - x0) / width * n_bins)))
+
+        n_rows = len(rows)
+        bin_row_count = [0] * n_bins
+        for row in rows:
+            row_bins = set()
+            for w in row["words"]:
+                for b in range(to_bin(w["left"]), to_bin(w["right"]) + 1):
+                    row_bins.add(b)
+            for b in row_bins:
+                bin_row_count[b] += 1
+        bin_fraction = [count / n_rows for count in bin_row_count]
+
+        lo, hi = int(min_zone * n_bins), int(max_zone * n_bins)
+        best_start, best_len = None, 0
+        run_start = None
+        for i in range(lo, hi):
+            if bin_fraction[i] <= coverage_threshold:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                if i - run_start > best_len:
+                    best_start, best_len = run_start, i - run_start
+                run_start = None
+        if run_start is not None and hi - run_start > best_len:
+            best_start, best_len = run_start, hi - run_start
+
+        if best_start is None or (best_len / n_bins) * width < min_gap_ratio * width:
+            return None
+
+        split_x = x0 + (best_start + best_len / 2.0) / n_bins * width
+
+        left_words = [w for w in words if w["cx"] < split_x]
+        right_words = [w for w in words if w["cx"] >= split_x]
+        if len(left_words) < min_words_per_column or len(right_words) < min_words_per_column:
+            return None
+
+        top = min(w["top"] for w in words)
+        bottom = max(w["bottom"] for w in words)
+        total_height = max(bottom - top, 1e-6)
+        left_height = max(w["bottom"] for w in left_words) - min(w["top"] for w in left_words)
+        right_height = max(w["bottom"] for w in right_words) - min(w["top"] for w in right_words)
+        if left_height < min_column_height_ratio * total_height or \
+           right_height < min_column_height_ratio * total_height:
+            return None
+
+        left_bounds = (min(w["left"] for w in left_words), max(w["right"] for w in left_words))
+        right_bounds = (min(w["left"] for w in right_words), max(w["right"] for w in right_words))
+        return split_x, [left_bounds, right_bounds]
+
+    # --- func to split a row whose words actually belong to two different columns that
+    # happened to land in the same row band, using the row's own word gap near split_x ---
+    def _split_row_by_column(self, row, split_x, min_word_gap=0.04, gutter_tolerance=0.08):
+        ws = sorted(row["words"], key=lambda w: w["left"])
+        if not ws or not (ws[0]["left"] < split_x < ws[-1]["right"]):
+            return [row]
+
+        for i in range(len(ws) - 1):
+            gap = ws[i + 1]["left"] - ws[i]["right"]
+            mid = (ws[i]["right"] + ws[i + 1]["left"]) / 2.0
+            if gap >= min_word_gap and abs(mid - split_x) <= gutter_tolerance:
+                left_part, right_part = ws[:i + 1], ws[i + 1:]
+                return [
+                    {"cy": row["cy"], "words": left_part},
+                    {"cy": row["cy"], "words": right_part},
+                ]
+        # No internal gutter found - it's a genuine full-width line (e.g. a heading), keep as-is
+        return [row]
+
+    # --- func to order rows left-column-then-right-column, using full-width rows (that
+    # weren't split above) as band separators, mirroring Page._reorder_by_columns ---
+    def _reorder_rows_by_column(self, rows, split_x, column_bounds, full_width_ratio=0.6):
+        combined_left = column_bounds[0][0]
+        combined_right = column_bounds[-1][1]
+        combined_width = max(combined_right - combined_left, 1e-6)
+
+        rows_sorted = sorted(rows, key=lambda r: r["cy"])
+
+        bands = []
+        current_left, current_right = [], []
+
+        def flush():
+            nonlocal current_left, current_right
+            if current_left or current_right:
+                current_left.sort(key=lambda r: r["cy"])
+                current_right.sort(key=lambda r: r["cy"])
+                bands.append(current_left + current_right)
+                current_left, current_right = [], []
+
+        for row in rows_sorted:
+            row_left = min(w["left"] for w in row["words"])
+            row_right = max(w["right"] for w in row["words"])
+            is_full_width = (row_right - row_left) >= full_width_ratio * combined_width and \
+                row_left < split_x < row_right
+            if is_full_width:
+                flush()
+                bands.append([row])
+            else:
+                row_cx = (row_left + row_right) / 2.0
+                if row_cx < split_x:
+                    current_left.append(row)
+                else:
+                    current_right.append(row)
+        flush()
+
+        return [row for band in bands for row in band]
+
+    def build_page_html(self, detailed_blocks, page_number):
+
+        words = []
+
+        for block in detailed_blocks:
+
+            for line in block.get("lines", []):
+
+                for word in line.get("words", []):
+
+                    txt = word.get("text", "").strip()
+
+                    if not txt:
+                        continue
+
+                    g = word["geometry"]
+
+                    words.append({
+
+                        "text": txt,
+
+                        "left": g["center_x"] - g["width"] / 2,
+                        "right": g["center_x"] + g["width"] / 2,
+
+                        "top": g["center_y"] - g["height"] / 2,
+                        "bottom": g["center_y"] + g["height"] / 2,
+
+                        "cx": g["center_x"],
+                        "cy": g["center_y"],
+
+                        "width": g["width"],
+                        "height": g["height"]
+
+                    })
+
+        if not words:
+            return ""
+
+        median_height = median(
+            w["height"]
+            for w in words
+        )
+
+        row_threshold = median_height * 0.60
+
+        words.sort(
+            key=lambda w: (
+                w["cy"],
+                w["left"]
+            )
+        )
+
+        rows = []
+
+        for word in words:
+
+            found = False
+
+            for row in rows:
+
+                if abs(row["cy"] - word["cy"]) <= row_threshold:
+
+                    row["words"].append(word)
+
+                    n = len(row["words"])
+
+                    row["cy"] = (
+                        row["cy"] * (n - 1)
+                        + word["cy"]
+                    ) / n
+
+                    found = True
+                    break
+
+            if not found:
+
+                rows.append({
+
+                    "cy": word["cy"],
+
+                    "words": [word]
+
+                })
+
+        # Exclude genuine full-width rows (headings/tables: wide, and no internal gap
+        # bigger than ordinary word-spacing) from the rows fed into gutter detection.
+        # With only a handful of rows on a page, even one such row can look "rare
+        # enough" under a pure row-fraction threshold to be mistaken for part of the
+        # gutter - excluding it outright avoids that regardless of how many rows there
+        # are. A minimum gap of several character-widths is used as an absolute
+        # floor (not relative to page/row width) since ordinary word-spacing is a
+        # roughly fixed number of character-widths regardless of a row's own extent.
+        min_gutter_gap = 4 * 0.010
+        overall_word_x0 = min(w["left"] for row in rows for w in row["words"])
+        overall_word_x1 = max(w["right"] for row in rows for w in row["words"])
+        overall_width_for_filter = max(overall_word_x1 - overall_word_x0, 1e-6)
+
+        def is_full_width_no_gutter(row):
+            ws = sorted(row["words"], key=lambda w: w["left"])
+            row_width = ws[-1]["right"] - ws[0]["left"]
+            if row_width < 0.6 * overall_width_for_filter:
+                return False
+            gaps = (ws[i + 1]["left"] - ws[i]["right"] for i in range(len(ws) - 1))
+            return not any(gap >= min_gutter_gap for gap in gaps)
+
+        gutter_detection_rows = [row for row in rows if not is_full_width_no_gutter(row)]
+
+        column_info = self._detect_word_columns(gutter_detection_rows)
+        if column_info is None:
+            rows.sort(key=lambda r: r["cy"])
+        else:
+            split_x, column_bounds = column_info
+            split_rows = []
+            for row in rows:
+                split_rows.extend(self._split_row_by_column(row, split_x))
+            rows = self._reorder_rows_by_column(split_rows, split_x, column_bounds)
+
+        html = []
+
+        AVG_CHAR_WIDTH = 0.010
+
+        for row in rows:
+
+            row["words"].sort(
+                key=lambda w: w["left"]
+            )
+
+            line = ""
+
+            previous_right = None
+
+            for word in row["words"]:
+
+                if previous_right is None:
+
+                    indent = max(
+                        0,
+                        round(word["left"] / AVG_CHAR_WIDTH)
+                    )
+
+                    line += " " * indent + word["text"]
+
+                else:
+
+                    gap = word["left"] - previous_right
+
+                    spaces = max(
+                        1,
+                        round(gap / AVG_CHAR_WIDTH)
+                    )
+
+                    line += " " * spaces + word["text"]
+
+                previous_right = word["right"]
+
+            html.append(
+                f'<p style="white-space: pre-wrap;">{escape(line)}</p>'
+            )
+
+        return "\n".join(html)
+
+    def get_html(self):
+        if not self.builder:
+           self.logger.warning(f'OOPS! chrome lens couldn\'t generate html for pdf path:{self.pdf_path}')
+           return None
+
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Document</title>
+</head>
+<body>
+
+{self.builder}
+
+</body>
+</html>
+"""

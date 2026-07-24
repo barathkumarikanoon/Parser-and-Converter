@@ -29,7 +29,8 @@ class Amendment:
                 self.logger.error(f"Invalid page number: {page.pg_num}")
                 continue
             
-            if ((label is not None and isinstance(label, tuple) and label[0] == "table") \
+            if ((label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                     label[0] == "borderless_table")) \
               or (label is None)): #and startPage is not None and endPage is not None and  startPage <= page_num <= endPage:
                 doubleQuote_count = text.count('"')
                 singleQuote_count = text.count("'") 
@@ -54,7 +55,8 @@ class Amendment:
                                                text.endswith(';\' or') or text.endswith('\'; or')))):
                         self.isAmendmentPDF = True
                         self.logger.debug(f"Detected self-contained quote on page {page.pg_num}. Marked as amendment PDF.")
-                        if label is not None and isinstance(label, tuple) and label[0] == "table":
+                        if label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                               label[0] == 'borderless_table'):
                             continue
                         page.all_tbs[tb] = ["amendment"]
                         
@@ -64,7 +66,8 @@ class Amendment:
                         self.quote_stack.append(text[0])
                         self.logger.debug(f"Detected opening quote with imbalance on page {page.pg_num}. Pushed to quote_stack.")
                         self.isAmendmentPDF = True
-                        if label is not None and isinstance(label, tuple) and label[0] == "table":
+                        if label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                               label[0] == "borderless_table"):
                             continue
                         page.all_tbs[tb] = ["amendment"]
                     
@@ -72,7 +75,8 @@ class Amendment:
                         self.quote_stack.append(text[0])
                         self.logger.debug(f"Detected opening quote with imbalance on page {page.pg_num}. Pushed to quote_stack.")
                         self.isAmendmentPDF = True
-                        if label is not None and isinstance(label, tuple) and label[0] == "table":
+                        if label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                               label[0] == "borderless_table"):
                             continue
                         page.all_tbs[tb] = ["amendment"]
                         
@@ -88,7 +92,8 @@ class Amendment:
                          ):
                         self.quote_stack.pop()
                         self.logger.debug(f"Detected closing quote on page {page.pg_num}. Popped from quote_stack.")
-                        if label is not None and isinstance(label, tuple) and label[0] == "table":
+                        if label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                               label[0] == "borderless_table"):
                             continue
                         page.all_tbs[tb] = ["amendment"]
                     
@@ -102,14 +107,16 @@ class Amendment:
                          ):
                         self.quote_stack.pop()
                         self.logger.debug(f"Detected closing quote on page {page.pg_num}. Popped from quote_stack.")
-                        if label is not None and isinstance(label, tuple) and label[0] == "table":
+                        if label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                               label[0] == "borderless_table"):
                             continue
                         page.all_tbs[tb] = ["amendment"]
                         
 
                     # Inside an open quote block
                     elif self.quote_stack:
-                        if label is not None and isinstance(label, tuple) and label[0] == "table":
+                        if label is not None and isinstance(label, tuple) and (label[0] == "table" or \
+                                                                               label[0] == "borderless_table"):
                             continue
                         page.all_tbs[tb] = ["amendment"]
                         self.logger.debug(f"Inside open quote block on page {page.pg_num}.The text [{text}] marked as amendment.")

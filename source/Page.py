@@ -7,7 +7,7 @@ import logging
 
 
 from .TextBox import TextBox
-from .TableExtraction import TableExtraction
+from .TableExtraction import TableExtraction, BorderlessTableExtraction
 from .CompareLevel import CompareLevel, CompareLevelSebi
 from .NormalizeText import NormalizeText
 from .Figure import Figure,Pictures
@@ -30,22 +30,32 @@ class SectionState:
 class Page:
     def __init__(self,pg,pdfPath, base_name_of_file, output_dir, 
                  pdf_type, has_side_notes, is_amendment_pdf, 
-                 font_mapper, unique_images, min_img_size):
+                 font_mapper, unique_images, min_img_size, ocr_language,
+                 scanned_copy):
         self.logger = logging.getLogger(__name__)
         self.pdf_path = pdfPath
         self.page_in_xml = pg
         self.pg_width, self.pg_height = self.get_pg_coords(pg)
+        self.body_startX = 0.000
+        self.body_endX   = self.pg_width
         self.pg_num = pg.attrib["id"]
         self.logger.debug(f"page: {self.pg_num} --- page_height: {self.pg_height} , page_width: {self.pg_width}")
         self.all_tbs = {}
         self.all_figbox = {}
         self.has_side_notes = has_side_notes
         self.pdf_type = pdf_type
+        self.ocr_language = ocr_language
         self.is_amendment_pdf = is_amendment_pdf
         self.figures = Pictures(self.pdf_path, self.pg_num, base_name_of_file, 
-                                output_dir, unique_images, min_img_size)
-        self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type)
+                                output_dir, unique_images, min_img_size,
+                                ocr_language, scanned_copy)
+        self.tabular_datas = TableExtraction(self.pdf_path,self.pg_num, pdf_type,
+                                            scanned_copy)
+        self.borderless_tabular_datas = None
         self.side_notes_datas ={}
+        self.is_multicolumn = False
+        self.column_bounds = []
+        self.column_split_x = None
         self.font_mapper = font_mapper
         self.title_type_map = {
             'schedule' :is_schedule,
@@ -148,7 +158,10 @@ class Page:
             self.all_tbs.update(self.all_figbox)
 
             # Sort while preserving mapping
-            self.all_tbs = dict(sorted(self.all_tbs.items(), key=sort_key))
+            if self.is_multicolumn:
+                self.all_tbs = dict(self._reorder_by_columns(list(self.all_tbs.items())))
+            else:
+                self.all_tbs = dict(sorted(self.all_tbs.items(), key=sort_key))
 
     def get_side_notes(self): #,startPage,endPage):
         try:
@@ -162,8 +175,7 @@ class Page:
             # if startPage is not None and endPage is not None and int(self.pg_num) >=startPage and int(self.pg_num)<=endPage:
             if self.has_side_notes:
                 if not hasattr(self, 'body_startX') and not hasattr(self, 'body_endX'):
-                    self.logger.warning("Body boundaries (body_startX, body_endX) \
-                                        are not defined for page %s", self.pg_num)
+                    self.logger.warning("Body boundaries (body_startX, body_endX) are not defined for page %s", self.pg_num)
                     return  # Skip if body region not defined
                 
                 pattern = re.compile(r'^(\d+\s+of\s+\d+\.|Ord\.?\s*\d+\s+of\s+\d+\. | Ordinance\.?\s*\d+\s+of\s+\d+\.)$')
@@ -499,6 +511,13 @@ class Page:
                 print("From table:",label[1])
                 print(tb.extract_text_from_tb())
     
+    def print_borderless_table_content(self):
+        print("i'm from borderless table contents")
+        for tb,label in self.all_tbs.items():
+            if isinstance(label, tuple) and label[0] == "borderless_table":
+                print("From table:",label[1])
+                print(tb.extract_text_from_tb())
+    
     def print_amendment(self):
         print("i'm from amendment")
         for tb,label in self.all_tbs.items():
@@ -596,7 +615,135 @@ class Page:
         self.body_endX = max(tb.coords[2] for tb in body_candidates)
         self.logger.debug(f"page: {self.pg_num} --- Calculated body-startx: {self.body_startX} ,body-endX: {self.body_endX}")
         return round(self.body_endX - self.body_startX, 2)
-    
+
+    # --- func to detect whether the page body is laid out in multiple (usually two) columns ---
+    def detect_multicolumn_layout(self, min_items_per_column=3, min_column_height_ratio=0.25,
+                                   min_gap_ratio=0.03, min_gap_em_ratio=1.0, max_overlap_ratio=0.15):
+        self.is_multicolumn = False
+        self.column_bounds = []
+        self.column_split_x = None
+
+        all_candidates = [tb for tb, label in self.all_tbs.items() if label is None]
+        if len(all_candidates) < 2 * min_items_per_column:
+            return
+
+        page_mid = self.pg_width / 2.0
+        candidates = [tb for tb in all_candidates if not (tb.coords[0] < page_mid < tb.coords[2])]
+
+        candidates = [tb for tb in candidates if tb.height <= 1.5 * tb.width]
+        if len(candidates) < 2 * min_items_per_column:
+            return
+
+        x_centers = np.array([[(tb.coords[0] + tb.coords[2]) / 2.0] for tb in candidates])
+
+        x_spread = float(x_centers.max() - x_centers.min())
+        if x_spread < min_gap_ratio * self.pg_width:
+            return
+
+        try:
+            km = KMeans(n_clusters=2, n_init=10, random_state=0).fit(x_centers)
+        except Exception as e:
+            self.logger.debug(f"Page {self.pg_num}: multicolumn KMeans failed: {e}")
+            return
+
+        centers = km.cluster_centers_.flatten()
+        left_cluster_id = int(np.argmin(centers))
+        right_cluster_id = 1 - left_cluster_id
+
+        left_items = [tb for tb, lbl in zip(candidates, km.labels_) if lbl == left_cluster_id]
+        right_items = [tb for tb, lbl in zip(candidates, km.labels_) if lbl == right_cluster_id]
+
+        if len(left_items) < min_items_per_column or len(right_items) < min_items_per_column:
+            return
+
+        left_font_sizes = [tb.avg_font_size for tb in left_items if tb.avg_font_size]
+        right_font_sizes = [tb.avg_font_size for tb in right_items if tb.avg_font_size]
+        if left_font_sizes and right_font_sizes:
+            left_font_med = float(np.median(left_font_sizes))
+            right_font_med = float(np.median(right_font_sizes))
+            smaller, larger = sorted((left_font_med, right_font_med))
+            if larger > 0 and (smaller / larger) < 0.5:
+                return
+
+        left_height = sum(tb.height for tb in left_items)
+        right_height = sum(tb.height for tb in right_items)
+        if left_height < min_column_height_ratio * self.pg_height or \
+           right_height < min_column_height_ratio * self.pg_height:
+            return
+
+        left_x0 = min(tb.coords[0] for tb in left_items)
+        left_x1 = max(tb.coords[2] for tb in left_items)
+        right_x0 = min(tb.coords[0] for tb in right_items)
+        right_x1 = max(tb.coords[2] for tb in right_items)
+
+        gap = right_x0 - left_x1
+        font_sizes = [tb.avg_font_size for tb in candidates if tb.avg_font_size]
+        typical_font_size = float(np.median(font_sizes)) if font_sizes else None
+        min_gap = min_gap_em_ratio * typical_font_size if typical_font_size else min_gap_ratio * self.pg_width
+        if gap < min_gap:
+            return
+
+        overlap = max(0.0, min(left_x1, right_x1) - max(left_x0, right_x0))
+        narrower_width = min(left_x1 - left_x0, right_x1 - right_x0)
+        if narrower_width > 0 and (overlap / narrower_width) > max_overlap_ratio:
+            return
+
+        self.is_multicolumn = True
+        self.column_bounds = [(left_x0, left_x1), (right_x0, right_x1)]
+        self.column_split_x = (left_x1 + right_x0) / 2.0
+        self.logger.debug(
+            f"Page {self.pg_num}: detected multicolumn layout, "
+            f"column_bounds={self.column_bounds}, split_x={self.column_split_x}"
+        )
+
+    # --- band-based reading-order reorder shared by apply_column_reading_order and sort_all_boxes ---
+    def _reorder_by_columns(self, items, full_width_ratio=0.6):
+        split_x = self.column_split_x
+        combined_x0 = self.column_bounds[0][0]
+        combined_x1 = self.column_bounds[-1][1]
+        combined_width = max(combined_x1 - combined_x0, 1.0)
+
+        def y0_desc(pair):
+            return -pair[0].coords[1]
+
+        sorted_items = sorted(items, key=y0_desc)
+
+        bands = []
+        current_left, current_right = [], []
+
+        def flush():
+            nonlocal current_left, current_right
+            if current_left or current_right:
+                current_left.sort(key=y0_desc)
+                current_right.sort(key=y0_desc)
+                bands.append(current_left + current_right)
+                current_left, current_right = [], []
+
+        for tb, label in sorted_items:
+            x0, y0, x1, y1 = tb.coords
+            is_full_width = (x1 - x0) >= full_width_ratio * combined_width and x0 < split_x < x1
+            if is_full_width:
+                flush()
+                bands.append([(tb, label)])
+            else:
+                center = (x0 + x1) / 2.0
+                if center < split_x:
+                    current_left.append((tb, label))
+                else:
+                    current_right.append((tb, label))
+        flush()
+
+        return [pair for band in bands for pair in band]
+
+    # --- func to reorder all_tbs into correct left-column-then-right-column reading order ---
+    def apply_column_reading_order(self):
+        if not self.is_multicolumn:
+            return
+        ordered = self._reorder_by_columns(list(self.all_tbs.items()))
+        self.all_tbs = dict(ordered)
+        self.logger.debug(f"Page {self.pg_num}: applied multicolumn reading order")
+
+
     def find_closest_side_note(self, tb_bbox, side_note_datas, page_height, vertical_threshold_ratio=0.05): #0.05
         try:
             tb_x0, tb_y0, tb_x1, tb_y1 = tb_bbox
@@ -646,11 +793,11 @@ class Page:
             if match:
                 left_sidenote_end_coords.append(tb.coords[0])
         average_left = sum(left_sidenote_end_coords)/len(left_sidenote_end_coords) if left_sidenote_end_coords else 0
-        if average_left > 0:
+        if average_left > 0 and hasattr(self, 'body_startX'):
             self.body_startX = max(round(average_left, 2), self.body_startX)
         
         average_right = sum(right_sidenote_start_coords) / len(right_sidenote_start_coords) if right_sidenote_start_coords else 0
-        if average_right > 0:
+        if average_right > 0 and hasattr(self, 'body_endX'):
             if self.body_endX < 0:
                 self.body_endX = round(average_right, 2)
             else:
@@ -757,7 +904,8 @@ class Page:
             if label is not None:
                 if isinstance(label, tuple) and label[0] == 'article' and not side_note_status:
                     continue
-                elif isinstance(label,tuple) and label[0] == 'table':
+                elif isinstance(label,tuple) and (label[0] == 'table' or \
+                                                  label[0] == 'borderless_table'):
                     continue
                 elif isinstance(label,list) and label[0] == 'amendment':
                     continue
@@ -879,7 +1027,8 @@ class Page:
 
         # if startPage is not None and endPage is not None and startPage <= page_num <= endPage:
         for tb,label in self.all_tbs.items():
-            if label is not None and isinstance(label,tuple) and label[0] == 'table':
+            if label is not None and isinstance(label,tuple) and (label[0] == 'table' or \
+                                                                  label[0] == 'borderless_table'):
                 continue
             texts = tb.extract_text_from_tb().strip()
             texts = texts.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
@@ -944,7 +1093,7 @@ class Page:
         try:
             x_min_table, y_min_table, x_max_table, y_max_table = table_box
             x_min_textbox, y_min_textbox, x_max_textbox, y_max_textbox = tb_box
-            table_width = y_max_table - y_min_table
+            table_width = x_max_table - x_min_table
             width_ratio = round(table_width / self.pg_width , 2)
 
             # --- CASE 1: wide table ---
@@ -973,6 +1122,28 @@ class Page:
                     if self.all_tbs[tb] is None and self.bbox_satisfies(tb.coords,tab_bbox):
                         self.all_tbs[tb] = ("table",idx)
                     self.logger.debug(f"Page {self.pg_num}: Labelled textbox within table {idx}")
+                except Exception as e:
+                    self.logger.warning(f"Page {self.pg_num}: Failed to label textbox '{tb}' for table {idx} -- {e}")
+    
+    def label_borderless_table_tbs(self):
+        if self.borderless_tabular_datas is None:
+            return
+
+        item_objs = getattr(self.borderless_tabular_datas, "table_item_objs", {}) or {}
+
+        for idx, tab_bbox in self.borderless_tabular_datas.table_bbox.items():
+            obj_ids = item_objs.get(idx)
+            for tb in self.all_tbs.keys():
+                try:
+                    if self.all_tbs[tb] is not None:
+                        continue
+                    if obj_ids is not None:
+                        is_member = id(tb) in obj_ids
+                    else:
+                        is_member = self.bbox_satisfies(tb.coords, tab_bbox)
+                    if is_member:
+                        self.all_tbs[tb] = ("borderless_table", idx)
+                        self.logger.debug(f"Page {self.pg_num}: Labelled textbox within table {idx}")
                 except Exception as e:
                     self.logger.warning(f"Page {self.pg_num}: Failed to label textbox '{tb}' for table {idx} -- {e}")
 
@@ -1356,7 +1527,8 @@ class Page:
                 text = text.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
                 if label in ['footnote', 'header', 'footer', 'title']:
                     is_sentence_completed = True
-                elif isinstance(label, tuple) and label[0] == 'table':
+                elif isinstance(label, tuple) and (label[0] == 'table' or \
+                                                   label[0] == 'borderless_table'):
                     is_sentence_completed = True
                 else:
                     is_sentence_completed = text.endswith(sentence_completion_punctutation)
@@ -1406,3 +1578,45 @@ class Page:
         except Exception as e:
             self.logger.error(f"Error in get_hierarchy: {e}")
             return False
+    
+    def reclaim_header_footer_for_continuation(self, continuation_template, top_band_ratio=0.30, x_tol_ratio=0.03):
+        if not continuation_template:
+            return
+
+        cols = continuation_template.get("columns_norm", [])
+        if not cols:
+            return
+        tmpl_x0 = min(c0 for c0, _ in cols) * self.pg_width - self.pg_width * x_tol_ratio
+        tmpl_x1 = max(c1 for _, c1 in cols) * self.pg_width + self.pg_width * x_tol_ratio
+        top_cut = self.pg_height * (1.0 - top_band_ratio)
+
+        reclaimable = {"header", "footer", "side notes"}
+        for tb, label in list(self.all_tbs.items()):
+            if label not in reclaimable:
+                continue
+            x0, y0, x1, y1 = tb.coords
+            if y1 < top_cut:
+                continue
+            center_x = (x0 + x1) / 2.0
+            if tmpl_x0 <= center_x <= tmpl_x1:
+                self.all_tbs[tb] = None
+                self.logger.debug(
+                    f"Page {self.pg_num}: Reclaimed '{label}' textbox for continuation candidacy"
+                )
+
+    def get_borderless_table(self, pdf_type, header_classifier=None, region_merge_classifier=None,
+                             continuation_template=None, continuation_classifier=None):
+        self.borderless_tabular_datas = BorderlessTableExtraction(
+                self.all_tbs, pdf_type, self.pg_width, self.pg_height,
+                header_classifier=header_classifier,
+                region_merge_classifier=region_merge_classifier,
+                continuation_classifier=continuation_classifier,
+                continuation_template=continuation_template,
+            )
+
+        return self.borderless_tabular_datas.continuation_out
+
+    def get_borderless_continuation_template(self):
+        if self.borderless_tabular_datas is None:
+            return None
+        return getattr(self.borderless_tabular_datas, "continuation_out", None)
