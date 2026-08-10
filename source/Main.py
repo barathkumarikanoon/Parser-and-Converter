@@ -1613,7 +1613,8 @@ def get_arg_parser():
     parser.add_argument('-mip', '--min-img-pixels', dest = 'min_img_pixels', action = 'store', \
                       required = False,  default = 0,  help = 'minimum pixel area threshold for initial filtering (area = dimension^2). Images are further filtered based on text content detection.')
     parser.add_argument('-ol', '--ocr-language', dest='ocr_language', action='store', \
-                      required=False, default='en', help='language code for OCR (default: en, two letter code)')
+                      required=False, default='eng', choices=TESSERACT_LANGUAGES,
+                      help=f'tesseract language code for OCR (default: eng). One of: {", ".join(TESSERACT_LANGUAGES)}')
     parser.add_argument('-sc', '--scanned-copy', dest = 'scanned_copy', action = 'store_true',
                         required = False, default = False, help = 'mention if the pdf copy is scanned')
     parser.add_argument('-te', '--table-extract', dest = 'table_extract', action = 'store_true',

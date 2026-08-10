@@ -90,7 +90,7 @@ class Pictures:
             for img in self.walk_layout(element)
         ]
 
-    def register_global(self, img_name, path, text_content = None, text_language = None):
+    def register_global(self, img_name, path, text_content = None, text_language = None, width = None, height = None):
         reg = self.unique_images.setdefault(
             img_name,
             {
@@ -98,6 +98,8 @@ class Pictures:
                 "path": path,
                 "text": text_content if text_content else "",
                 "language": text_language,
+                "width": width,
+                "height": height,
                 "pages": set()
             }
         )
@@ -281,7 +283,8 @@ class Pictures:
                             converted = img.convert("RGB")
 
                         converted.save(final_path, "PNG")
-                    
+                        img_width, img_height = converted.size
+
                     if temp_path != final_path:
                         if not os.path.exists(final_path):
                             os.replace(
@@ -303,14 +306,18 @@ class Pictures:
                         "name": img_name,
                         "path": final_path,
                         "text": text_content,
-                        "language": text_language
+                        "language": text_language,
+                        "width": img_width,
+                        "height": img_height
                     }
 
                     self.register_global(
                         img_name,
                         final_path,
                         text_content,
-                        text_language
+                        text_language,
+                        img_width,
+                        img_height
                     )
 
                 except Exception:
