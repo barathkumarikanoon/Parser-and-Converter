@@ -104,6 +104,12 @@ class HTMLBuilder(TableBuilder):
   td {
     white-space: pre-wrap;
   }
+
+  img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+  }
 </style>
 </head>
 <body>
@@ -790,10 +796,18 @@ class HTMLBuilder(TableBuilder):
             # if self.stack_for_level:
             #   self.close_levels()
              
-            img_path = self.extract_img_path(self.unique_images[tb.figname] \
-            .get("path",""))
+            img_data = self.unique_images[tb.figname]
+            img_path = self.extract_img_path(img_data.get("path",""))
+            width = img_data.get("width")
+            height = img_data.get("height")
 
-            self.builder += f'<a href="{img_path}" target="_blank">[View Image]</a>\n'
+            size_attrs = ""
+            if width:
+                size_attrs += f' width="{width}"'
+            if height:
+                size_attrs += f' height="{height}"'
+
+            self.builder += f'<img src="{img_path}"{size_attrs} loading="lazy">\n'
 
             text_content = self.unique_images[tb.figname].get("text", "")
             if text_content:
