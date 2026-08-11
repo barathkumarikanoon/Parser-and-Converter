@@ -302,13 +302,15 @@ class Main:
     
     def remove_empty_parent_dir(self, file_path):
         try:
-            parent_dir = os.path.dirname(file_path)
-            if parent_dir and os.path.isdir(parent_dir):
-                os.rmdir(parent_dir)
+            current = os.path.dirname(file_path)
+            while current and os.path.isdir(current) and os.path.basename(current) != "images":
+                os.rmdir(current)
 
                 self.logger.debug(
-                    f"Removed empty image directory: {parent_dir}"
+                    f"Removed empty image directory: {current}"
                 )
+
+                current = os.path.dirname(current)
 
         except OSError:
             pass
