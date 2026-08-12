@@ -1,19 +1,24 @@
 import re
 import math
-from collections import OrderedDict
 import numpy as np
 import logging
 import pandas as pd
 from difflib import SequenceMatcher
-from sklearn.cluster import DBSCAN
-from bs4 import BeautifulSoup
-
+import copy
+from pathlib import Path
+from .Table import TableBuilder
 from .SentenceEndDetector import LegalSentenceDetector
 from .NormalizeText import NormalizeText
 
-class HTMLBuilder:
+
+RELEVANT_TAGS = {"body", "section", "p", "table", "tr", "td", "a", "blockquote", "br",
+                 "h4", "center", "li"}
+VOID_TAGS = {"br"}
+
+class HTMLBuilder(TableBuilder):
     
-    def __init__(self, sentence_completion_punctuation = tuple(), pdf_type = None):
+    def __init__(self, unique_images, sentence_completion_punctuation = tuple(), pdf_type = None):
+        TableBuilder.__init__(self)
         self.logger = logging.getLogger(__name__)
         self.pdf_type = pdf_type
         self.pending_text = ""
@@ -23,19 +28,21 @@ class HTMLBuilder:
         self.stack_for_level = []
         self.hierarchy = ("section","subsection","para","subpara","subsubpara")
         self.level_hierarchy = ('level1', 'level2', 'level3', 'level4','level5')
-        self.pending_table = None
-        self.is_real_sentence_end =LegalSentenceDetector().is_real_sentence_end
+        self._sentence_detector = LegalSentenceDetector()
+        self.is_real_sentence_end = self._sentence_detector.is_real_sentence_end
+        self.previous_sentence_end_status = True
+        self.is_pre_added = False
         self.normalize_text = NormalizeText().normalize_text
-        self.min_word_threshold_tableRows = 2
-        self.table_terminators = {".", "?", "!"} #";", ":",
         self.builder = ""
+        self.unique_images = unique_images
+        self.pending_header_footer = []
         self.main_builder = '''<!DOCTYPE HTML>
 <html>
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body {
-    font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
     line-height: 1.6;
     white-space: normal;
   }
@@ -68,6 +75,22 @@ class HTMLBuilder:
     white-space: pre-wrap;
   }
 
+  p.figure-text {
+    display: none;
+  }
+
+  span.header-text{
+    display:None;
+  }
+  
+  span.footer-text{
+    display:None;
+  }
+  
+  h4 {
+    text-align: center;
+  }
+
   table {
     border-collapse: collapse;
     width: 100%;
@@ -80,6 +103,12 @@ class HTMLBuilder:
 
   td {
     white-space: pre-wrap;
+  }
+
+  img {
+    display: block;
+    max-width: 100%;
+    height: auto;
   }
 </style>
 </head>
@@ -106,19 +135,17 @@ class HTMLBuilder:
                     if self.stack_for_level[-1] == self.stack_for_level[-2]:
                         tag = self.stack_for_level.pop()
                         if tag == 0:
-                            self.builder += "</section>\n"
-                        else:
-                            self.builder += "</li>\n"
+                            self.builder += "</p>\n"
                     else:
                         tag = self.stack_for_level.pop()
                         if tag == 0:
-                            self.builder += "</section>\n"
+                            self.builder += "</p>\n"
                         else:
                             self.builder += "</li>\n</ul>\n"
                   else:
                       tag = self.stack_for_level.pop()
                       if tag == 0:
-                            self.builder += "</section>\n"
+                            self.builder += "</p>\n"
                       else:
                             self.builder += "</li>\n</ul>\n"
         except Exception as e:
@@ -126,8 +153,8 @@ class HTMLBuilder:
           
     def check_for_last_token(self, html):
       last_token, last_tag = self.get_last_token(html)
-      if last_tag and last_token and (last_tag!='h4'):
-          if not last_token.endswith(('.','?','!',":-", "---", "...", '—',':','."', ".'",';"',";'")):
+      if last_tag and last_token: 
+          if not last_token.endswith(('.','?','!',';',':',":-", "---", "...", '—',':','."', ".'",';"',";'", '…')): #, '-'
              return True, last_tag
       return False, last_tag 
     
@@ -142,15 +169,24 @@ class HTMLBuilder:
                         self.builder += self.pending_text
                         self.pending_tag = None
                         self.pending_text = ""
+                        self.previous_sentence_end_status = is_sentence_completed
                         return True
                     else:
                         self.pending_text += (' '+text.strip())
+                        self.previous_sentence_end_status = is_sentence_completed
                         return True
         return False
     
     def handle_continuation(self, html, text, next_text, at_page_end, tb, next_text_tb, pg_height, pg_width):
         status, last_tag = self.check_for_last_token(html)
         if status and last_tag:
+            if self.stack_for_section:
+               self.builder += (" "+text.strip()+" ")
+               return True
+            if self.stack_for_level:
+               self.builder += (" "+text.strip()+" ")
+               self.previous_sentence_end_status = self.is_real_sentence_end(text, next_text, at_page_end, tb, next_text_tb, pg_height, pg_width)
+               return True
             is_sentence_completed = self.is_real_sentence_end(text, next_text, at_page_end, tb, next_text_tb, pg_height, pg_width)
             if is_sentence_completed:
                 self.pending_text += (" "+text.strip())
@@ -158,23 +194,27 @@ class HTMLBuilder:
                 self.builder += self.pending_text
                 self.pending_tag = None
                 self.pending_text = ""
+                self.previous_sentence_end_status = is_sentence_completed
                 return True
             else:
+                self.pending_tag = last_tag
                 self.pending_text += (' '+text.strip())
+                self.previous_sentence_end_status = is_sentence_completed
                 return True
         return False
     # --- func to add Title in the html ---
     def addTitle(self, tb,pg_width,pg_height, next_text, next_text_tb,  at_page_end,next_label = None):
         try:
           text = tb.extract_text_from_tb().strip()
-          sebi_level_close_re = re.compile(r'^(?:(?:Date|Dated)\s*[:\-]?\s*(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})|(?:Place|At)\s*[:\-]?\s*[A-Z][A-Za-z .,&-]*|\(.*?(?:Judgment\s+pronounced|Order\s+pronounced|Decision\s+pronounced).*?\))$', re.IGNORECASE)
-
+          #original
+          sebi_level_close_re = re.compile(r'^(?:(?:Date|Dated)\s*[:\-]{1}\s*(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})|(?:Place)\s*[:\-]{1}\s*[A-Z][A-Za-z .,&-]*|\(.*?(?:Judgment\s+pronounced|Order\s+pronounced|Decision\s+pronounced).*?\)|Sd/-)$', re.IGNORECASE)
           if self.handle_pending_text_continuation(text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
-            return
+                return
                   
-          if self.handle_continuation(self.builder, text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
+          if not self.previous_sentence_end_status and self.handle_continuation(self.builder, text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
                 return
           
+          self.previous_sentence_end_status = self.is_real_sentence_end(text, next_text, at_page_end, tb, next_text_tb, pg_height, pg_width)
           if not self.stack_for_section:
               self.flushPrevious()
           else:
@@ -190,25 +230,25 @@ class HTMLBuilder:
           else:
               if text and sebi_level_close_re.match(text):
                   self.close_levels()
+              elif self.stack_for_level: #and self.stack_for_level[-1] == 0:
+                 self.close_levels()
               elif self.stack_for_level and next_label == 'level1':
                   while self.stack_for_level:
                           if len(self.stack_for_level) >= 2:
                             if self.stack_for_level[-1] == self.stack_for_level[-2]:
                                 tag = self.stack_for_level.pop()
                                 if tag == 0:
-                                    self.builder += "</section>\n"
-                                else:
-                                    self.builder += "</li>\n"
+                                    self.builder += "</p>\n"
                             else:
                                 tag = self.stack_for_level.pop()
                                 if tag == 0:
-                                    self.builder += "</section>\n"
+                                    self.builder += "</p>\n"
                                 else:
                                     self.builder += "</li>\n</ul>\n"
                           else:
                               tag = self.stack_for_level.pop()
                               if tag == 0:
-                                    self.builder += "</section>\n"
+                                    self.builder += "</p>\n"
                               else:
                                     self.builder += "</li>\n</ul>\n"
               
@@ -223,7 +263,7 @@ class HTMLBuilder:
                           line_texts.append(text.text)
                   line = ''.join(line_texts).replace("\n", " ").strip()
                   if line:
-                      doc += f"<center><h4>{self.normalize_text(line)}</h4></center>\n"
+                      doc += f"<h4>{self.normalize_text(line)}</h4>\n"
               self.builder += doc
         except Exception as e:
           self.logger.exception("Error while adding title - [%s] in html: %s",tb.extract_text_from_tb(),e)
@@ -231,7 +271,9 @@ class HTMLBuilder:
     # --- func to add the table in the html ---
     def addTable(self, table):
         try:
-          if (not self.stack_for_section) or (not self.stack_for_level):
+          if (not self.stack_for_section):
+              self.flushPrevious()
+          elif (not self.stack_for_level):
               self.flushPrevious()
           # else:
           #     # Close everything up to and including the last "section"
@@ -240,8 +282,17 @@ class HTMLBuilder:
           #         self.builder += "</section>\n"
           #         if tag == 0:
           #             break
-
-          self.builder += self.normalize_text(table.to_html(index=False, header = False, border=1).replace("\\n"," "))
+          # if self.stack_for_level:
+          #    self.close_levels()
+          if self.stack_for_level and self.stack_for_level[-1] == 0:
+             self.close_levels()
+          table_html = (
+              table.replace('\n', '&#10;', regex=True)   # preserve newline inside HTML
+                  .to_html(escape=False, index=False, header=False)
+                  .replace("<table", "<table style='white-space: pre-wrap;'")
+            )
+          self.builder += self.normalize_text(table_html)
+          # self.builder += self.normalize_text(table.to_html(index=False, header = False, border=1).replace("\\n",""))
           self.builder += "\n" 
         except Exception as e:
             self.logger.exception("Error while adding table in html - %s .\nTable preview\n",e, table.head().to_string(index=False))
@@ -252,7 +303,7 @@ class HTMLBuilder:
           self.builder += "</section>\n"
        
     # --- func to add the unknown label of textbox in the html - classified as <p> tag ---
-    def addItalicBlockQuote(self, text, next_text, text_tb, next_text_tb, pg_height, pg_width, at_page_end):
+    def addItalicBlockQuote(self, text, next_text, text_tb, next_text_tb, pg_height, pg_width, at_page_end, tb):
         try:
             is_sentence_completed = self.is_real_sentence_end(text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width)
             if self.pending_tag and self.pending_tag != 'blockquote':
@@ -260,30 +311,38 @@ class HTMLBuilder:
                 self.builder += self.pending_text
                 self.pending_tag = None
                 self.pending_text = ""
-            if not self.pending_tag and not self.pending_text and is_sentence_completed:
+            elif self.stack_for_level and self.stack_for_level[-1] == 0:
+                self.close_levels()
+               
+            if not self.previous_sentence_end_status and self.handle_continuation(self.builder, text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
+                return
+            if (not self.pending_tag) and (not self.pending_text) and is_sentence_completed:
               self.builder += f"<blockquote>{text}</blockquote>\n"
               self.pending_tag = None
               self.pending_text = ""
-
-            elif not self.pending_tag and not self.pending_text and not is_sentence_completed:
+              self.previous_sentence_end_status = is_sentence_completed
+            elif (not self.pending_tag) and (not self.pending_text) and (not is_sentence_completed):
               self.pending_tag = "blockquote"
               self.pending_text = f"<blockquote>{text}"
-            
+              self.previous_sentence_end_status = is_sentence_completed
             elif self.pending_text and self.pending_tag and is_sentence_completed:
                 self.pending_text += (" "+text.strip())
                 self.pending_text += f"</{self.pending_tag}>\n"
                 self.builder += self.pending_text
                 self.pending_tag = None
                 self.pending_text = ""
+                self.previous_sentence_end_status = is_sentence_completed
 
             else:
                 self.pending_text += (' '+text.strip())
-                
+                self.previous_sentence_end_status = is_sentence_completed
         except Exception as e:
             self.logger.exception("Error while adding italic blockquote text [%s] : %s",text, e)
 
     def addUnlabelled(self,text, next_text, text_tb, next_text_tb, pg_height, pg_width, at_page_end):
-      sebi_level_close_re = re.compile(r'^(?:(?:Date|Dated)\s*[:\-]?\s*(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})|(?:Place|At)\s*[:\-]?\s*[A-Z][A-Za-z .,&-]*|\(.*?(?:Judgment\s+pronounced|Order\s+pronounced|Decision\s+pronounced).*?\))$', re.IGNORECASE)
+      #original
+      sebi_level_close_re = re.compile(r'^(?:(?:Date|Dated)\s*[:\-]{1}\s*(?:\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|[A-Za-z]+\s+\d{1,2},\s*\d{4})|(?:Place)\s*[:\-]{1}\s*[A-Z][A-Za-z .,&-]*|\(.*?(?:Judgment\s+pronounced|Order\s+pronounced|Decision\s+pronounced).*?\)|Sd/-)$', re.IGNORECASE)
+      
       try:
         if self.stack_for_section:
           if re.fullmatch(r'—{3,}', text.strip()):
@@ -301,39 +360,46 @@ class HTMLBuilder:
         elif self.stack_for_level:
           if text and sebi_level_close_re.match(text):
                   self.close_levels()
-                  return
+                  # return
           if self.pdf_type != 'acts':
             is_sentence_completed = self.is_real_sentence_end(text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width)
           else:
             is_sentence_completed = text.strip().endswith(self.sentence_completion_punctuation)
           if is_sentence_completed:
-            self.builder += (' ' +text )#+"<br>")
+            self.builder += (' ' +text +"<br>")
+            self.previous_sentence_end_status = is_sentence_completed
           else:
             if text in set(["•","▪","▫","✓","✕","o"]) and self.pending_text == "":
                self.pending_tag = 'blockquote'
                self.pending_text = f'<blockquote>{text}'   
+               self.previous_sentence_end_status = is_sentence_completed
             else:   
                 self.builder += (' ' + text)
+                self.previous_sentence_end_status = is_sentence_completed
         else:
             if self.pdf_type != 'acts':
               is_sentence_completed = self.is_real_sentence_end(text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width)
             else:
               is_sentence_completed = text.strip().endswith(self.sentence_completion_punctuation)
-            if not self.pending_tag and not self.pending_text and is_sentence_completed:
+            if (not self.pending_tag) and (not self.pending_text) and is_sentence_completed:
               self.builder += f"<p>{text}</p>\n"
               self.pending_tag = None
               self.pending_text = ""
-            elif not self.pending_tag and not self.pending_text and not is_sentence_completed:
+              self.previous_sentence_end_status = is_sentence_completed
+            elif (not self.pending_tag) and (not self.pending_text) and (not is_sentence_completed):
               self.pending_tag = "p"
               self.pending_text = f"<p>{text}"
+              self.previous_sentence_end_status = is_sentence_completed
             elif self.pending_text and self.pending_tag and is_sentence_completed:
                 self.pending_text += (" "+text.strip())
                 self.pending_text += f"</{self.pending_tag}>\n"
                 self.builder += self.pending_text
                 self.pending_tag = None
                 self.pending_text = ""
+                self.previous_sentence_end_status = is_sentence_completed
             else:
                 self.pending_text += (' '+text.strip())
+                self.previous_sentence_end_status = is_sentence_completed
 
       except Exception as e:
         self.logger.exception("Error while adding unlabelled text [%s] : %s",text, e)
@@ -384,102 +450,45 @@ class HTMLBuilder:
         return None
       
     def get_last_token(self, html):
-        """
-        Extract the last token and the last unclosed tag from an HTML string.
+        tag_stack = []
 
-        Returns:
-            (last_token, last_open_tag)
-            - If the last tag is unclosed → (token, tagname)
-            - Otherwise → (None, None)
-        """
-        # Try lxml first, fallback to built-in parser
-        try:
-            soup = BeautifulSoup(html, "lxml")
-        except Exception:
-            soup = BeautifulSoup(html, "html.parser")
+        # Regex to find all opening and closing tags
+        for match in re.finditer(r'<(/?)(\w+)[^>]*?>', html):
+            closing, tag_name = match.groups()
+            tag_name = tag_name.lower()
+            
+            # Only process relevant tags
+            if tag_name not in RELEVANT_TAGS:
+                continue
 
-        # Find the last tag
-        last_tag = None
-        for tag in soup.find_all(True):
-            last_tag = tag
+            # Ignore void/self-closing tags
+            if tag_name in VOID_TAGS:
+                continue
 
-        if not last_tag:
+            if closing:  # closing tag
+                if tag_name in tag_stack:
+                    last_index = len(tag_stack) - 1 - tag_stack[::-1].index(tag_name)
+                    tag_stack.pop(last_index)
+            else:  # opening tag
+                tag_stack.append(tag_name)
+
+        # No unclosed tags
+        if not tag_stack:
             return None, None
 
-        # Check if input HTML does NOT close this tag
-        if not str(html).strip().endswith(f"</{last_tag.name}>"):
-            # Extract last text token
-            text_only = soup.get_text().strip()
-            tokens = text_only.split()
+        # Last unclosed tag
+        last_open_tag = tag_stack[-1]
+
+        # Extract content inside last unclosed tag from the end
+        pattern = rf'<{last_open_tag}[^>]*?>([^<]*)$'
+        m = re.search(pattern, html, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            tokens = content.split()
             last_token = tokens[-1] if tokens else ""
-            return last_token, last_tag.name
-
-        # If properly closed, return None
-        return None, None
-
-      
-    def addLevel(self, text, hierarchy_index, next_text,tb, next_text_tb, pg_height,pg_width,  at_page_end):
-          try:
-              
-              # if self.handle_pending_text_continuation(text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
-              #       return
-                   
-              # if self.handle_continuation(self.builder, text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
-              #       return
-                  
-              if not self.stack_for_level:
-                  self.flushPrevious()
-              else:
-                  self.flushPrevious()
-                  if hierarchy_index == 0:
-                      while self.stack_for_level:
-                          if len(self.stack_for_level) >= 2:
-                            if self.stack_for_level[-1] == self.stack_for_level[-2]:
-                                tag = self.stack_for_level.pop()
-                                if tag == 0:
-                                    self.builder += "</section>\n"
-                                else:
-                                    self.builder += "</li>\n"
-                            else:
-                                tag = self.stack_for_level.pop()
-                                if tag == 0:
-                                    self.builder += "</section>\n"
-                                else:
-                                    self.builder += "</li>\n</ul>\n"
-                          else:
-                              tag = self.stack_for_level.pop()
-                              if tag == 0:
-                                    self.builder += "</section>\n"
-                              else:
-                                    self.builder += "</li>\n</ul>\n"
-                  
-                  else:
-                      while self.stack_for_level and self.stack_for_level[-1] > hierarchy_index:
-                          if len(self.stack_for_level) >= 2:
-                              if self.stack_for_level[-1] == self.stack_for_level[-2]:
-                                  self.stack_for_level.pop()
-                                  self.builder += "</li>\n"
-                              else:
-                                  self.stack_for_level.pop()
-                                  self.builder += "</li>\n</ul>\n"
-              # Open new tag depending on level
-              if hierarchy_index == 0:
-                  # Paragraph level always opens fresh
-                  self.builder += f"<section>{text}"
-              else:
-                  # If going deeper than parent, open a new <ul>
-                  if not self.stack_for_level or self.stack_for_level[-1] < hierarchy_index:
-                      self.builder += "<ul>\n"
-                  self.builder += f"<li>{text}"
-
-              # Push this level onto stack
-              self.stack_for_level.append(hierarchy_index)
-
-              self.logger.debug("Opened section at hierarchy level: %d", hierarchy_index)
-
-          except Exception as e:
-              self.logger.exception("Error while adding section [%s]: %s", text, e)
-              
+            return last_token, last_open_tag
+        else:
+            return "", last_open_tag
 
     # --- func to add the section labelled textbox in the html ---
     def addSection(self,tb,side_note_datas,page_height,hierarchy_index):
@@ -532,10 +541,10 @@ class HTMLBuilder:
               rest_text_type = self.findType(rest_text)
               if rest_text_type is None:
                   if is_sentence_completed:
-                    self.builder += f"<section class=\"section\">{prefix}<br>{rest_text}\n" #<br>
+                    self.builder += f"<section class=\"section\">{prefix}{rest_text}\n" #<br>{rest_text}\n" #<br>
                     self.stack_for_section.append(hierarchy_index)
                   else:
-                      self.builder +=f"<section class=\"section\">{prefix}<br>{rest_text}\n"
+                      self.builder +=f"<section class=\"section\">{prefix} {rest_text}\n" #<br>{rest_text}\n"
                       self.stack_for_section.append(hierarchy_index)
               else:
                   self.builder += f"<section class=\"section\">{prefix}\n"
@@ -553,7 +562,6 @@ class HTMLBuilder:
 
     
     def findType(self,texts):
-      # group_re = re.compile(r'^\(([^\s\)]+)\)\s*\S*',re.IGNORECASE)
       group_re = re.compile(r'^\(\s*([^\s\)]+)\s*\)\s*\S*', re.IGNORECASE)
 
       if group_re.match(texts.strip()):
@@ -631,31 +639,39 @@ class HTMLBuilder:
         except Exception as e:
           self.logger.exception("Error while adding subpara [%s]: %s",text,e)
         
-    def addBlockQuote(self, text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width):
+    def addBlockQuote(self, text, next_text, text_tb, next_text_tb, pg_height, pg_width, at_page_end, tb):
         text = text.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
         is_sentence_completed = self.is_real_sentence_end(text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width) #text.strip().endswith(self.sentence_completion_punctuation)
-        
+
         if self.pending_tag and self.pending_tag != "blockquote":
             self.pending_text += f"</{self.pending_tag}>\n"
             self.builder += self.pending_text
             self.pending_tag = None
             self.pending_text = ""
-        if not self.pending_tag and not self.pending_text and is_sentence_completed:
+        elif self.stack_for_level and self.stack_for_level[-1] == 0:
+            self.close_levels()
+            
+        if not self.previous_sentence_end_status and self.handle_continuation(self.builder, text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
+                return
+        if (not self.pending_tag) and (not self.pending_text) and is_sentence_completed:
           self.builder += f"<blockquote>{text}</blockquote>\n"
           self.pending_tag = None
           self.pending_text = ""
-        elif not self.pending_tag and not self.pending_text and not is_sentence_completed:
+          self.previous_sentence_end_status = is_sentence_completed
+        elif (not self.pending_tag) and (not self.pending_text) and (not is_sentence_completed):
           self.pending_tag = "blockquote"
           self.pending_text = f"<blockquote>{text}"
+          self.previous_sentence_end_status = is_sentence_completed
         elif self.pending_text and self.pending_tag and is_sentence_completed:
             self.pending_text += (" "+text.strip())
             self.pending_text += f"</{self.pending_tag}>\n"
             self.builder += self.pending_text
             self.pending_tag = None
             self.pending_text = ""
+            self.previous_sentence_end_status = is_sentence_completed
         else:
-           
             self.pending_text += (' '+text.strip())
+            self.previous_sentence_end_status = is_sentence_completed
 
     # ---func to add the textbox labelled as amendments in the html ---
     def addAmendment(self,label,tb,side_notes,pg_height):
@@ -741,7 +757,7 @@ class HTMLBuilder:
         self.logger.exception("Error in add_amendment_section [%s]: %s",text, e)
        
     def is_section(self,texts):
-      section_re = re.compile(r'^\s*[\' | \"]?\d+[A-Z]*(?:-[A-Z]+)?\s*\.\s*\S*', re.IGNORECASE)
+      section_re = re.compile(r'^\s*[\' | \"]?\d+[A-Z]*(?:-[A-Z]+)?\s*\.\s*\S*', re.IGNORECASE) # 
       texts = texts.strip()
       texts = texts.replace('“', '"').replace('”', '"').replace('‘‘','"').replace('’’','"').replace('‘', "'").replace('’', "'")
       if section_re.match(texts):
@@ -754,103 +770,130 @@ class HTMLBuilder:
              return True
         return False
     
-    # --- func to build the textbox  as html ---
-    # def build(self, page, section_end_page):
-    #     visited_for_table = set()
-    #     # if not page.is_single_column_page:
-    #     #    page.all_tbs = self.get_orderBy_textboxes(page)
-    #     try:
-    #       if section_end_page and int(section_end_page)+1 == int(page.pg_num):
-    #           while self.stack_for_section:
-    #               popped_index = self.stack_for_section.pop()
-    #               self.builder += "</section>"
-    #               self.logger.debug("Closed section at hierarchy level: %d", popped_index)
-    #     except Exception as e:
-    #         self.logger.warning(f'when closing sections tag after section end page - {e}')
-              
-    #     all_items = list(page.all_tbs.items())
-    #     for idx, (tb, label) in enumerate(all_items):
-    #         next_text = None
-    #         next_text_coords = None
-    #         if idx + 1 < len(all_items):
-    #             next_tb, next_label = all_items[idx + 1]
-                
-    #             if next_label is None:  # only consider unlabelled continuation
-    #                 next_text = self.normalize_text(next_tb.extract_text_from_tb())
-    #                 next_text_coords = next_tb.coords
-    #             elif self.is_nextlabel_blockquote(label, next_label):
-    #                 next_text = self.normalize_text(next_tb.extract_text_from_tb())
-    #                 next_text_coords = next_tb.coords
-    #             elif next_label[:-1] == 'level':
-    #                 next_text = self.normalize_text(next_tb.extract_text_from_tb())
-    #                 next_text_coords = next_tb.coords
-    #         at_page_end = (idx == len(all_items) - 1)
+    from pathlib import Path
 
-    #         if label == "header" or label == "footer" or self.is_pg_num(tb,page.pg_width):
-    #            continue
-    #         if not ((isinstance(label, tuple) and label[0] == "table")):
-    #             if self.pending_table is not None and len(self.pending_table) <= 2:
-    #                 self.addTable(self.pending_table[0])
-    #                 self.pending_table = None
-    #         if isinstance(label, tuple) and label[0] == "table":
-    #             table_id = label[1]
-    #             if table_id not in visited_for_table:
-    #                 table_obj = page.tabular_datas.tables.get(table_id)
-    #                 table_width = page.tabular_datas.get_table_width(table_id)
+    def extract_img_path(self, full_path):
+      try:
+        p = Path(full_path)
+        parts = p.parts
 
-    #                 if table_obj is not None:
-    #                     if self.pending_table is None:
-    #                         self.pending_table = [table_obj, table_width]
-                        
-    #                     else:
-    #                         if self.is_table_continuation(table_obj, table_width):
-    #                             self.merge_tables(table_obj, table_width)
-                               
-    #                         else:
-    #                             self.addTable(self.pending_table[0])
-    #                             self.pending_table = [table_obj, table_width]
+        if 'manifest' in parts:
+            idx = parts.index('manifest')
+            return str(Path(*parts[idx:]))
+        else:
+            return None  # or raise error
+      except Exception as e:
+         self.logger.warning(f'Extracting img path while building html {e}')
+         return None
+    
+    def addFigure(self, tb, page):
+      try:
+        if tb.figname in self.unique_images:
+            if self.pending_tag and self.pending_text:
+              self.flushPrevious()
+            if self.pending_table:
+              self.flushTables()
+            # if self.stack_for_level:
+            #   self.close_levels()
+             
+            img_data = self.unique_images[tb.figname]
+            img_path = self.extract_img_path(img_data.get("path",""))
+            width = img_data.get("width")
+            height = img_data.get("height")
 
-    #                 visited_for_table.add(table_id)
+            size_attrs = ""
+            if width:
+                size_attrs += f' width="{width}"'
+            if height:
+                size_attrs += f' height="{height}"'
 
-    #         elif isinstance(label,list) and label[0] == "amendment":
-    #            self.addAmendment(label,tb,page.side_notes_datas,page.pg_height)
-    #         elif isinstance(label, tuple) and label[1] == 'blockquote':
-    #            self.addItalicBlockQuote(tb.extract_text_from_tb(), next_text, tb.coords, next_text_coords, page.pg_height, page.pg_width, at_page_end)
-    #         elif label == "title":
-    #             self.addTitle(tb,page.pg_width,page.pg_height, next_label)
-    #         elif label == "section":
-    #             self.addSection(tb,page.side_notes_datas,page.pg_height,self.hierarchy.index(label))
-    #         elif label == "subsection":
-    #             self.addSubsection(tb.extract_text_from_tb(),self.hierarchy.index(label))
-    #         elif label == "para":
-    #             self.addPara(tb.extract_text_from_tb(),self.hierarchy.index(label))
-    #         elif label == "subpara":
-    #             self.addSubpara(tb.extract_text_from_tb(),self.hierarchy.index(label))
-    #         elif label == 'blockquote':
-    #             self.addBlockQuote(tb.extract_text_from_tb(), next_text,tb.coords, next_text_coords, page.pg_height, page.pg_width,  at_page_end)
-    #         elif label == 'level1' or label == 'level2' or label == 'level3' or label == 'level4':
-    #             self.addLevel(tb.extract_text_from_tb(), self.level_hierarchy.index(label))
-    #         # elif label == 'level2':
-    #         #     self.addLevel2(tb.extract_text_from_tb(), self.level_hierarchy.index(label))
-    #         # elif label == 'level3':
-    #         #     self.addLevel3(tb.extract_text_from_tb(), self.level_hierarchy.index(label))
-    #         # elif label == 'level4':
-    #         #     self.addLevel4(tb.extract_text_from_tb(), self.level_hierarchy.index(label))
-    #         elif label is None:
-    #             if not self.is_pg_num(tb,page.pg_width):
-    #               self.addUnlabelled(tb.extract_text_from_tb(), next_text,tb.coords, next_text_coords, page.pg_height, page.pg_width,  at_page_end)
-    def build(self, page, section_end_page):
+            self.builder += f'<img src="{img_path}"{size_attrs} loading="lazy">\n'
+
+            text_content = self.unique_images[tb.figname].get("text", "")
+            if text_content:
+                self.builder += f'<p class="figure-text">{text_content}</p>\n'
+      except Exception as e:
+         self.logger.warning(f'While adding figure to html, {e}')
+   
+    def add_pre(self):
+        html = copy.deepcopy(self.builder)
+        cleaned_html = re.sub(r'</?center>', '', html)
+        cleaned_html = re.sub(r'</?h4>', '', cleaned_html)
+        self.main_builder += f'<pre>\n{cleaned_html}</pre>\n'
+        self.builder = ""
+        self.is_pre_added = True
+
+    def check_for_pre_ended(self, text, label):
+        text = text.strip()
+        if not text:
+           return False
+        background_re = re.compile(
+                            r'(?i)\bB\s*[\W_]*A\s*[\W_]*C\s*[\W_]*K\s*[\W_]*G\s*[\W_]*R\s*[\W_]*O\s*[\W_]*U\s*[\W_]*N\s*[\W_]*D\b'
+                        )
+
+        toc_re = re.compile(
+            r'(?i)\b(?:table\s*[\W_]*of\s*[\W_]*contents?|table\s*[\W_]*contents?|contents?)\b',
+            re.IGNORECASE
+        )
+
+        section_re = re.compile(
+            r'^(?!\s*\d{1,4}\.\d{1,4}\.\d{2,4})\s*[1]\d{0,2}[A-Z]?\.(?!\))(?:\s+.*)?$',
+            # re.IGNORECASE
+        )
+
+        facts_case_pattern = re.compile(
+                      r'f\s*a\s*c\s*t\s*s\s*.*o\s*f\s*.*t\s*h\s*e\s*.*c\s*a\s*s\s*e\s*.*i\s*n\s*.*b\s*r\s*i\s*e\s*f',
+                      re.IGNORECASE
+                  )
+        if background_re.search(text):
+            self.add_pre()
+        elif toc_re.search(text):
+            self.add_pre()
+        elif section_re.search(text):
+            self.add_pre()
+        elif facts_case_pattern.search(text):
+            self.add_pre()
+        
+    def add_header(self, text):
+        if not self.pending_table:
+            if self.pending_tag and self.pending_text:
+                self.pending_text += f'<span class="header-text">{text}</span>\n'
+            else:
+                self.builder += f'<span class="header-text">{text}</span>\n'
+        
+        else:
+           header = f'<span class="header-text">{text}</span>\n'
+           self.pending_header_footer.append(header)
+
+    def add_footer(self, text):
+        if not self.pending_table:
+            if self.pending_tag and self.pending_text:
+                self.pending_text += f'<span class="footer-text">{text}</span>\n'
+            else:
+                self.builder += f'<span class="footer-text">{text}</span>\n' 
+
+        else:
+           footer = f'<span class="footer-text">{text}</span>\n'
+           self.pending_header_footer.append(footer) 
+
+    def flush_pending_header_footer(self):
+        if self.pending_header_footer:
+            self.builder += '\n'
+            for item in self.pending_header_footer:
+                self.builder += item
+            self.pending_header_footer = []
+        
+    def build(self, page, has_side_notes):#, section_end_page):
         visited_for_table = set()
-        # if not page.is_single_column_page:
-        #    page.all_tbs = self.get_orderBy_textboxes(page)
-        try:
-          if section_end_page and int(section_end_page)+1 == int(page.pg_num):
-              while self.stack_for_section:
-                  popped_index = self.stack_for_section.pop()
-                  self.builder += "</section>"
-                  self.logger.debug("Closed section at hierarchy level: %d", popped_index)
-        except Exception as e:
-            self.logger.warning(f'when closing sections tag after section end page - {e}')
+        self._sentence_detector.column_bounds = page.column_bounds if page.is_multicolumn else None
+        # try:
+        #   if section_end_page and int(section_end_page)+1 == int(page.pg_num):
+        #       while self.stack_for_section:
+        #           popped_index = self.stack_for_section.pop()
+        #           self.builder += "</section>"
+        #           self.logger.debug("Closed section at hierarchy level: %d", popped_index)
+        # except Exception as e:
+        #     self.logger.warning(f'when closing sections tag after section end page - {e}')
               
         all_items = list(page.all_tbs.items())
         for idx, (tb, label) in enumerate(all_items):
@@ -859,22 +902,42 @@ class HTMLBuilder:
             if idx + 1 < len(all_items):
                 next_tb, next_label = all_items[idx + 1]
                 
-                if next_label is None:  # only consider unlabelled continuation
+                # if next_label is None:  # only consider unlabelled continuation
+                #     next_text = self.normalize_text(next_tb.extract_text_from_tb())
+                #     next_text_tb = next_tb
+                # elif self.is_nextlabel_blockquote(label, next_label):
+                #     next_text = self.normalize_text(next_tb.extract_text_from_tb())
+                #     next_text_tb = next_tb
+                # elif next_label[:-1] == 'level' or next_label == 'blockquote' or next_label == 'title' or (isinstance(next_label, tuple) and next_label[1] == 'blockquote'):
+                #     next_text = self.normalize_text(next_tb.extract_text_from_tb())
+                #     next_text_tb = next_tb
+                if next_label not in ("figure", "header", "footer"):
                     next_text = self.normalize_text(next_tb.extract_text_from_tb())
                     next_text_tb = next_tb
-                elif self.is_nextlabel_blockquote(label, next_label):
-                    next_text = self.normalize_text(next_tb.extract_text_from_tb())
-                    next_text_tb = next_tb
-                elif next_label[:-1] == 'level' or next_label == 'title' or (isinstance(next_label, tuple) and next_label[1] == 'blockquote'):
-                    next_text = self.normalize_text(next_tb.extract_text_from_tb())
-                    next_text_tb = next_tb
+
             at_page_end = (idx == len(all_items) - 1)
-            if label == "header" or label == "footer" or self.is_pg_num(tb,page.pg_width):
-               continue
-            if not ((isinstance(label, tuple) and label[0] == "table")):
+            if label == "header":
+                self.add_header(
+                  self.normalize_text(tb.extract_text_from_tb())
+               )
+                continue
+
+            elif label == "footer":#or self.is_pg_num(tb,page.pg_width):
+                self.add_footer(
+                  self.normalize_text(tb.extract_text_from_tb())
+               )
+                continue
+            
+            if not ((isinstance(label, tuple) and (label[0] == "table" or\
+                                                   label[0] == "borderless_table"))):
                 if self.pending_table is not None and len(self.pending_table) <= 2:
                     self.addTable(self.pending_table[0])
                     self.pending_table = None
+                    self.flush_pending_header_footer()
+            
+            if self.pdf_type == 'sebi' and not self.is_pre_added and label in ('title', 'level1'):
+                self.check_for_pre_ended(self.normalize_text(tb.extract_text_from_tb()), label)
+
             if isinstance(label, tuple) and label[0] == "table":
                 table_id = label[1]
                 if table_id not in visited_for_table:
@@ -887,7 +950,27 @@ class HTMLBuilder:
                         
                         else:
                             if self.is_table_continuation(table_obj, table_width):
-                                self.merge_tables(table_obj, table_width)
+                                self.merge_tables(table_obj, table_width)#, html_builder=self)
+                               
+                            else:
+                                self.addTable(self.pending_table[0])
+                                self.pending_table = [table_obj, table_width]
+
+                    visited_for_table.add(table_id)
+            
+            elif isinstance(label, tuple) and label[0] == "borderless_table":
+                table_id = label[1]
+                if table_id not in visited_for_table:
+                    table_obj = page.borderless_tabular_datas.tables.get(table_id)
+                    table_width = page.borderless_tabular_datas.get_table_width(table_id)
+
+                    if table_obj is not None:
+                        if self.pending_table is None:
+                            self.pending_table = [table_obj, table_width]
+                        
+                        else:
+                            if self.is_table_continuation(table_obj, table_width):
+                                self.merge_tables(table_obj, table_width)#, html_builder=self)
                                
                             else:
                                 self.addTable(self.pending_table[0])
@@ -898,7 +981,7 @@ class HTMLBuilder:
             elif isinstance(label,list) and label[0] == "amendment":
                self.addAmendment(label,tb,page.side_notes_datas,page.pg_height)
             elif isinstance(label, tuple) and label[1] == 'blockquote':
-               self.addItalicBlockQuote(self.normalize_text(tb.extract_text_from_tb()), next_text, tb, next_text_tb, page.pg_height, page.pg_width, at_page_end)
+               self.addItalicBlockQuote(self.normalize_text(tb.extract_text_from_tb()), next_text, tb, next_text_tb, page.pg_height, page.pg_width, at_page_end, tb)
             elif label == "title":
                 self.addTitle(tb,page.pg_width,page.pg_height, next_text, next_text_tb,at_page_end,next_label)
             elif label == "section":
@@ -910,11 +993,13 @@ class HTMLBuilder:
             elif label == "subpara":
                 self.addSubpara(self.normalize_text(tb.extract_text_from_tb()),self.hierarchy.index(label))
             elif label == 'blockquote':
-                self.addBlockQuote(self.normalize_text(tb.extract_text_from_tb()), next_text,tb, next_text_tb, page.pg_height, page.pg_width,  at_page_end)
+                self.addBlockQuote(self.normalize_text(tb.extract_text_from_tb()), next_text,tb, next_text_tb, page.pg_height, page.pg_width,  at_page_end, tb)
             elif label == 'level1' or label == 'level2' or label == 'level3' or label == 'level4':
                 self.addLevel(self.normalize_text(tb.extract_text_from_tb()), self.level_hierarchy.index(label), next_text,tb, next_text_tb, page.pg_height, page.pg_width,  at_page_end)
+            elif label == "figure":
+               self.addFigure(tb, page)
             elif label is None:
-                if not self.is_pg_num(tb,page.pg_width):
+                # if not self.is_pg_num(tb,page.pg_width):
                   self.addUnlabelled(self.normalize_text(tb.extract_text_from_tb()), next_text,tb, next_text_tb, page.pg_height, page.pg_width,  at_page_end)
 
     def is_pg_num(self,tb,pg_width):
@@ -948,237 +1033,526 @@ class HTMLBuilder:
           return True
       
       return False
-       
-    def get_orderBy_textboxes(self,page):
-      column_gap = 0.1 * page.pg_width
-      items = list(page.all_tbs.items())
-      items.sort(key=lambda pair:pair[0].coords[0])
 
-      columns = []
-      current = []
-      prev_x0 =None
-
-      for tb, label in items:
-        if prev_x0 is None or (tb.coords[0]-prev_x0) < column_gap:
-           current.append((tb,label))
-        else:
-           columns.append(current)
-           current=[(tb,label)]
-        prev_x0 = tb.coords[0]
-      if current:
-         columns.append(current)
-      for col in columns:
-         col.sort(key=lambda  pair: -pair[0].coords[3])
-
-      flat = [pair for col in columns for pair in col]
-      return OrderedDict(flat)           
-    
     def close_html(self):
-       html = self.main_builder + self.builder + "\n</body>\n</html>"
-       return html
+        if not self.builder:
+           return None
+        html = self.main_builder + self.builder + "\n</body>\n</html>"
+        return html
     
     def get_html(self):
         self.flushPrevious()
         self.flushTables()
         return self.close_html()
     
-    def is_sequential(self, text1, text2):
-        """Check if two strings represent sequential numbers."""
-        try:
-            s1, s2 = str(text1).strip(), str(text2).strip()
-            if s1.isdigit() and s2.isdigit():
-                return int(s2) == int(s1) + 1
-            n1, n2 = re.findall(r"\d+", s1), re.findall(r"\d+", s2)
-            if n1 and n2:
-                return int(n2[0]) == int(n1[0]) + 1
-            return False
-        except:
-            return False
-
-    def row_similarity(self, row1, row2):
-        """Compute similarity ratio between two rows."""
-        s1, s2 = " ".join(str(x) for x in row1), " ".join(str(x) for x in row2)
-        return SequenceMatcher(None, s1, s2).ratio()
-
-    def _has_serial_number(self, cell):
-        """
-        Check if a cell looks like a serial number:
-        - Arabic numerals
-        - Roman numerals
-        - Alphanumeric IDs (A1, B.2, Sec-3)
-        """
-        text = str(cell).strip().lower()
-        if not text or text in ["nan", ""]:
-            return False
-
-        # Digits
-        if text.isdigit():
-            return True
-
-        # Roman numerals
-        if re.fullmatch(r"(m{0,3})(cm|cd|d?c{0,3})"
-                        r"(xc|xl|l?x{0,3})(ix|iv|v?i{0,3})", text):
-            return True
-
-        # Alphanumeric IDs
-        if re.fullmatch(r"[a-z]\d+(\.\d+)?", text):
-            return True
-        if re.fullmatch(r"\d+(\.\d+)?[a-z]", text):
-            return True
-        if re.fullmatch(r"(sec|art|clause)[\-\s]?\d+", text):
-            return True
-
-        # Ends with a dot, like "1." or "ii."
-        if re.fullmatch(r"\d+\.", text) or re.fullmatch(r"[ivxlcdm]+\.", text):
-            return True
-
-        return False
-
-    def _is_numeric_or_symbolic(self, cell):
-        """Return True if cell is purely numeric/measurement/symbolic."""
-        text = str(cell).strip().lower()
-        if not text or text in ["-", "—", "–", "na", "n/a", "nil", "none", "✓", "x"]:
-            return True
-        if re.fullmatch(r"\d+(\.\d+)?(\s?(kg|g|mg|cm|mm|m|km|%|hrs?|days?|years?))?", text):
-            return True
-        return False
-
-    def _looks_like_continuation(self, prev_text, curr_text, curr_row):
-        """Heuristics when serial numbers are absent."""
-        prev_text, curr_text = str(prev_text).strip(), str(curr_text).strip()
-
-        # Guard: numeric/measurement-only rows should not merge
-        numeric_like = sum(self._is_numeric_or_symbolic(c) for c in curr_row[1:])
-        if numeric_like >= len(curr_row) - 2:  # all except maybe one col
-            return False
-
-        # Rule 1: prev doesn’t end with punctuation + curr starts lowercase
-        if prev_text and prev_text[-1] not in self.table_terminators and curr_text and curr_text[0].islower():
-            return True
-
-        # Rule 2: curr row is sparse (only 1 column filled beyond first col)
-        non_empty_cols = sum(bool(str(c).strip()) for c in curr_row[1:])
-        if non_empty_cols == 1:
-            return True
-
-        # Rule 3: curr row very short (few words)
-        if len(curr_text.split()) < self.min_word_threshold_tableRows:
-            return True
-
-        return False
-
-    def merge_broken_rows(self, table):
-        """
-        Merge rows where first column is missing OR looks like a continuation.
-        Handles Camelot-style DataFrames like the one you shared.
-        """
-        merged = []
-        for idx, row in table.iterrows():
-            row_list = list(row)
-
-            if not merged:
-                merged.append(row_list)
-                continue
-
-            prev = merged[-1]
-            first_cell = str(row_list[0]).strip()
-            # Case 1: Explicit serial number → new row
-            if self._has_serial_number(first_cell):
-                merged.append(row_list)
-                continue
-
-            # Case 2: Camelot-style continuation → col1 text, col2 empty
-            prev_text = str(prev[1]) if len(prev) > 1 else ""
-            curr_text = str(row_list[1]) if len(row_list) > 1 else ""
-            col2_text = str(row_list[2]) if len(row_list) > 2 else ""
-
-            if curr_text and not col2_text.strip():
-                prev[1] = (str(prev[1]).rstrip() + " " + curr_text.lstrip()).strip()
-                continue
-
-            # Case 3: Heuristic continuation
-            if self._looks_like_continuation(prev_text, curr_text, row_list):
-                for c in range(1, len(row_list)):
-                    if str(row_list[c]).strip() and str(row_list[c]).lower() not in ["nan", ""]:
-                        prev[c] = (str(prev[c]).rstrip() + " " +
-                                   str(row_list[c]).lstrip()).strip()
-            else:
-                merged.append(row_list)
-
-        return pd.DataFrame(merged, columns=table.columns)
-
-    def is_table_continuation(self, table2, table2_width):
-      """Check if table2 is a continuation of pending_table."""
-      table1, table1_width = self.pending_table
-
-      # 1. Width similarity check
-      width_ratio = min(table1_width, table2_width) / max(table1_width, table2_width)
-      if width_ratio < 0.95:
-          return False
-
-      # 2. Column count check
-      if table1.shape[1] != table2.shape[1]:
-          return False
-      if table2.shape[1] == table1.shape[1] and table2.iloc[0].isnull().sum() >= table2.shape[1] - 1:
-          return True
-      # 3. Check for serial restart (likely new table)
-      first_col_prev_last = str(table1.iloc[-1, 0]).strip()
-      first_col_curr_first = str(table2.iloc[0, 0]).strip()
-      
-      # If first column of next table is 1, A, or (a) → new table
-      first_col_pattern = re.compile(
-          r"^(\(?[1aAiI]\)?[\.\)]?|[\[\(]?[1aAiI][\]\)]?)$",
-          re.IGNORECASE
-      )
-
-      # Example usage
-      first_col_curr_first = table2.iloc[0, 0]  # first cell of next table
-      if first_col_pattern.match(str(first_col_curr_first).strip()):
-          return False
-
-      # 4. Sequential numbering check (only if not restarting)
-      if self.is_sequential(first_col_prev_last, first_col_curr_first):
-          return True
-
-      # 5. Header similarity check
-      header_sim = self.row_similarity(table1.iloc[0], table2.iloc[0])
-      if header_sim > 0.9:
-          return True
-
-      # 6. Fallback: treat as new table
-      return False
-
-
-    def merge_tables(self, table2, table2_width):
-        """Merge table2 into pending_table with broken-row handling."""
-        table1, table1_width = self.pending_table
-
-        # Step 1: Header similarity → skip duplicate header
-        header_sim = self.row_similarity(table1.iloc[0], table2.iloc[0])
-        if header_sim > 0.9:
-            table2 = table2.iloc[1:].reset_index(drop=True)
-
-        # Step 2: Align columns if mismatch
-        if table2.shape[1] != table1.shape[1]:
-            if table2.shape[1] < table1.shape[1]:
-                for i in range(table1.shape[1] - table2.shape[1]):
-                    table2[f"_pad{i}"] = ""
-            else:
-                table2 = table2.iloc[:, :table1.shape[1]]
-
-        table2.columns = table1.columns
-
-        # Step 3: Merge and handle broken rows
-        merged_table = pd.concat([table1, table2], ignore_index=True)
-        merged_table = self.merge_broken_rows(merged_table)
-
-        # Step 4: Update average width
-        avg_width = (table1_width + table2_width) / 2.0
-        self.pending_table = [merged_table, avg_width]
-
-
     def flushTables(self):
         """Flush pending_table into final storage."""
         if self.pending_table is not None and len(self.pending_table) <= 2:
             self.addTable(self.pending_table[0])
             self.pending_table = None
+
+    
+    def addLevel(self, text, hierarchy_index, next_text,tb, next_text_tb, pg_height,pg_width,  at_page_end):
+          try:
+              
+              # if self.handle_pending_text_continuation(text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
+              #       return
+                   
+              if not self.previous_sentence_end_status and self.handle_continuation(self.builder, text, next_text,at_page_end, tb, next_text_tb, pg_height, pg_width):
+                    return
+              if not self.stack_for_level:
+                  self.flushPrevious()
+              else:
+                  self.flushPrevious()
+                  if hierarchy_index == 0:
+                      while self.stack_for_level:
+                          if len(self.stack_for_level) >= 2:
+                            if self.stack_for_level[-1] == self.stack_for_level[-2]:
+                                tag = self.stack_for_level.pop()
+                                if tag == 0:
+                                    self.builder += "</p>\n"
+                            else:
+                                tag = self.stack_for_level.pop()
+                                if tag == 0:
+                                    self.builder += "</p>\n"
+                                else:
+                                    self.builder += "</li>\n</ul>\n"
+                          else:
+                              tag = self.stack_for_level.pop()
+                              if tag == 0:
+                                    self.builder += "</p>\n"
+                              else:
+                                    self.builder += "</li>\n</ul>\n"
+
+                  else:
+                      if self.stack_for_level and self.stack_for_level[-1] > 0 \
+                        and self.stack_for_level[-1] == hierarchy_index:
+                          self.builder += "</li>\n"
+                      # original
+                      while self.stack_for_level and self.stack_for_level[-1] > hierarchy_index:
+                          if len(self.stack_for_level) >= 2:
+                              if self.stack_for_level[-1] == self.stack_for_level[-2]:
+                                  self.stack_for_level.pop()
+                              else:
+                                  tag = self.stack_for_level.pop()
+                                  self.builder += "</li>\n</ul>\n"
+                                  if tag == hierarchy_index + 1:
+                                        self.builder += "</li>\n"
+                          else:
+                              tag = self.stack_for_level.pop()
+                              if tag == 0:
+                                    self.builder += "</p>\n"
+                              else:
+                                    self.builder += "</li>\n</ul>\n"
+                                    if tag == hierarchy_index + 1:
+                                        self.builder += "</li>\n"
+              
+              self.previous_sentence_end_status = self.is_real_sentence_end(text, next_text, at_page_end, tb, next_text_tb, pg_height, pg_width)
+              # Open new tag depending on level
+              if hierarchy_index == 0:
+                  # Paragraph level always opens fresh
+                  self.builder += f"<p>{text}"
+              else:
+                  # If going deeper than parent, open a new <ul>
+                  if self.stack_for_level and self.stack_for_level[-1] == 0 and hierarchy_index == 1:
+                     self.close_levels()
+                  if not self.stack_for_level or self.stack_for_level[-1] < hierarchy_index:
+                      self.builder += "<ul>\n"
+                  self.builder += f"<li>{text}"
+
+              # Push this level onto stack
+              self.stack_for_level.append(hierarchy_index)
+
+              self.logger.debug("Opened section at hierarchy level: %d", hierarchy_index)
+
+          except Exception as e:
+              self.logger.exception("Error while adding section [%s]: %s", text, e)
+
+
+import asyncio
+import io
+from html import escape
+
+import pymupdf
+from PIL import Image
+from chrome_lens_py import LensAPI
+from statistics import median
+
+
+class HTMLBuilderChromeLens:
+
+    def __init__(self, pdf_path):
+        self.pdf_path = pdf_path
+        self.lens = LensAPI()
+        self.builder = ""
+        self.total_pages = 0
+        self.logger = logging.getLogger(__name__)
+
+    async def process_page(self, page):
+
+        pix = page.get_pixmap(
+            dpi=300,
+            alpha=False
+        )
+
+        image = Image.open(
+            io.BytesIO(
+                pix.tobytes("png")
+            )
+        )
+
+        result = await self.lens.process_image(
+            image_path=image,
+            output_format="detailed"
+        )
+
+        return result.get(
+            "detailed_blocks",
+            []
+        )
+
+    async def _build_async(
+        self,
+        start_page,
+        end_page
+    ):
+
+        doc = pymupdf.open(
+            self.pdf_path
+        )
+
+        try:
+
+            for page_num in range(
+                start_page,
+                end_page + 1
+            ):
+
+                page = doc[
+                    page_num - 1
+                ]
+
+                detailed_blocks = await self.process_page(
+                    page
+                )
+
+                self.builder += (
+                    self.build_page_html(
+                        detailed_blocks,
+                        page_num
+                    )
+                    + "\n\n"
+                )
+
+        finally:
+
+            doc.close()
+
+    def build(
+        self,
+        start_page=None,
+        end_page=None
+    ):
+
+        doc = pymupdf.open(
+            self.pdf_path
+        )
+
+        self.total_pages = len(
+            doc
+        )
+
+        doc.close()
+
+        if start_page is None:
+            start_page = 1
+
+        if end_page is None:
+            end_page = self.total_pages
+
+        start_page = max(
+            1,
+            start_page
+        )
+
+        end_page = min(
+            self.total_pages,
+            end_page
+        )
+
+        i = 1
+
+        while i <= 3:
+            try:
+                asyncio.run(
+                    self._build_async(
+                        start_page,
+                        end_page
+                    )
+                )
+            
+            except Exception as e:
+               self.logger.warning(f'While using chrome lens to build html: {e}')
+            
+            i += 1
+
+    def _detect_word_columns(self, rows, n_bins=100, coverage_threshold=0.15,
+                              min_gap_ratio=0.02, min_zone=0.15, max_zone=0.85,
+                              min_words_per_column=5, min_column_height_ratio=0.25):
+        words = [w for row in rows for w in row["words"]]
+        if len(rows) < 4 or len(words) < 2 * min_words_per_column:
+            return None
+
+        x0 = min(w["left"] for w in words)
+        x1 = max(w["right"] for w in words)
+        width = x1 - x0
+        if width <= 0:
+            return None
+
+        def to_bin(x):
+            return max(0, min(n_bins - 1, int((x - x0) / width * n_bins)))
+
+        n_rows = len(rows)
+        bin_row_count = [0] * n_bins
+        for row in rows:
+            row_bins = set()
+            for w in row["words"]:
+                for b in range(to_bin(w["left"]), to_bin(w["right"]) + 1):
+                    row_bins.add(b)
+            for b in row_bins:
+                bin_row_count[b] += 1
+        bin_fraction = [count / n_rows for count in bin_row_count]
+
+        lo, hi = int(min_zone * n_bins), int(max_zone * n_bins)
+        best_start, best_len = None, 0
+        run_start = None
+        for i in range(lo, hi):
+            if bin_fraction[i] <= coverage_threshold:
+                if run_start is None:
+                    run_start = i
+            elif run_start is not None:
+                if i - run_start > best_len:
+                    best_start, best_len = run_start, i - run_start
+                run_start = None
+        if run_start is not None and hi - run_start > best_len:
+            best_start, best_len = run_start, hi - run_start
+
+        if best_start is None or (best_len / n_bins) * width < min_gap_ratio * width:
+            return None
+
+        split_x = x0 + (best_start + best_len / 2.0) / n_bins * width
+
+        left_words = [w for w in words if w["cx"] < split_x]
+        right_words = [w for w in words if w["cx"] >= split_x]
+        if len(left_words) < min_words_per_column or len(right_words) < min_words_per_column:
+            return None
+
+        top = min(w["top"] for w in words)
+        bottom = max(w["bottom"] for w in words)
+        total_height = max(bottom - top, 1e-6)
+        left_height = max(w["bottom"] for w in left_words) - min(w["top"] for w in left_words)
+        right_height = max(w["bottom"] for w in right_words) - min(w["top"] for w in right_words)
+        if left_height < min_column_height_ratio * total_height or \
+           right_height < min_column_height_ratio * total_height:
+            return None
+
+        left_bounds = (min(w["left"] for w in left_words), max(w["right"] for w in left_words))
+        right_bounds = (min(w["left"] for w in right_words), max(w["right"] for w in right_words))
+        return split_x, [left_bounds, right_bounds]
+
+    # --- func to split a row whose words actually belong to two different columns that
+    # happened to land in the same row band, using the row's own word gap near split_x ---
+    def _split_row_by_column(self, row, split_x, min_word_gap=0.04, gutter_tolerance=0.08):
+        ws = sorted(row["words"], key=lambda w: w["left"])
+        if not ws or not (ws[0]["left"] < split_x < ws[-1]["right"]):
+            return [row]
+
+        for i in range(len(ws) - 1):
+            gap = ws[i + 1]["left"] - ws[i]["right"]
+            mid = (ws[i]["right"] + ws[i + 1]["left"]) / 2.0
+            if gap >= min_word_gap and abs(mid - split_x) <= gutter_tolerance:
+                left_part, right_part = ws[:i + 1], ws[i + 1:]
+                return [
+                    {"cy": row["cy"], "words": left_part},
+                    {"cy": row["cy"], "words": right_part},
+                ]
+        # No internal gutter found - it's a genuine full-width line (e.g. a heading), keep as-is
+        return [row]
+
+    # --- func to order rows left-column-then-right-column, using full-width rows (that
+    # weren't split above) as band separators, mirroring Page._reorder_by_columns ---
+    def _reorder_rows_by_column(self, rows, split_x, column_bounds, full_width_ratio=0.6):
+        combined_left = column_bounds[0][0]
+        combined_right = column_bounds[-1][1]
+        combined_width = max(combined_right - combined_left, 1e-6)
+
+        rows_sorted = sorted(rows, key=lambda r: r["cy"])
+
+        bands = []
+        current_left, current_right = [], []
+
+        def flush():
+            nonlocal current_left, current_right
+            if current_left or current_right:
+                current_left.sort(key=lambda r: r["cy"])
+                current_right.sort(key=lambda r: r["cy"])
+                bands.append(current_left + current_right)
+                current_left, current_right = [], []
+
+        for row in rows_sorted:
+            row_left = min(w["left"] for w in row["words"])
+            row_right = max(w["right"] for w in row["words"])
+            is_full_width = (row_right - row_left) >= full_width_ratio * combined_width and \
+                row_left < split_x < row_right
+            if is_full_width:
+                flush()
+                bands.append([row])
+            else:
+                row_cx = (row_left + row_right) / 2.0
+                if row_cx < split_x:
+                    current_left.append(row)
+                else:
+                    current_right.append(row)
+        flush()
+
+        return [row for band in bands for row in band]
+
+    def build_page_html(self, detailed_blocks, page_number):
+
+        words = []
+
+        for block in detailed_blocks:
+
+            for line in block.get("lines", []):
+
+                for word in line.get("words", []):
+
+                    txt = word.get("text", "").strip()
+
+                    if not txt:
+                        continue
+
+                    g = word["geometry"]
+
+                    words.append({
+
+                        "text": txt,
+
+                        "left": g["center_x"] - g["width"] / 2,
+                        "right": g["center_x"] + g["width"] / 2,
+
+                        "top": g["center_y"] - g["height"] / 2,
+                        "bottom": g["center_y"] + g["height"] / 2,
+
+                        "cx": g["center_x"],
+                        "cy": g["center_y"],
+
+                        "width": g["width"],
+                        "height": g["height"]
+
+                    })
+
+        if not words:
+            return ""
+
+        median_height = median(
+            w["height"]
+            for w in words
+        )
+
+        row_threshold = median_height * 0.60
+
+        words.sort(
+            key=lambda w: (
+                w["cy"],
+                w["left"]
+            )
+        )
+
+        rows = []
+
+        for word in words:
+
+            found = False
+
+            for row in rows:
+
+                if abs(row["cy"] - word["cy"]) <= row_threshold:
+
+                    row["words"].append(word)
+
+                    n = len(row["words"])
+
+                    row["cy"] = (
+                        row["cy"] * (n - 1)
+                        + word["cy"]
+                    ) / n
+
+                    found = True
+                    break
+
+            if not found:
+
+                rows.append({
+
+                    "cy": word["cy"],
+
+                    "words": [word]
+
+                })
+
+        # Exclude genuine full-width rows (headings/tables: wide, and no internal gap
+        # bigger than ordinary word-spacing) from the rows fed into gutter detection.
+        # With only a handful of rows on a page, even one such row can look "rare
+        # enough" under a pure row-fraction threshold to be mistaken for part of the
+        # gutter - excluding it outright avoids that regardless of how many rows there
+        # are. A minimum gap of several character-widths is used as an absolute
+        # floor (not relative to page/row width) since ordinary word-spacing is a
+        # roughly fixed number of character-widths regardless of a row's own extent.
+        min_gutter_gap = 4 * 0.010
+        overall_word_x0 = min(w["left"] for row in rows for w in row["words"])
+        overall_word_x1 = max(w["right"] for row in rows for w in row["words"])
+        overall_width_for_filter = max(overall_word_x1 - overall_word_x0, 1e-6)
+
+        def is_full_width_no_gutter(row):
+            ws = sorted(row["words"], key=lambda w: w["left"])
+            row_width = ws[-1]["right"] - ws[0]["left"]
+            if row_width < 0.6 * overall_width_for_filter:
+                return False
+            gaps = (ws[i + 1]["left"] - ws[i]["right"] for i in range(len(ws) - 1))
+            return not any(gap >= min_gutter_gap for gap in gaps)
+
+        gutter_detection_rows = [row for row in rows if not is_full_width_no_gutter(row)]
+
+        column_info = self._detect_word_columns(gutter_detection_rows)
+        if column_info is None:
+            rows.sort(key=lambda r: r["cy"])
+        else:
+            split_x, column_bounds = column_info
+            split_rows = []
+            for row in rows:
+                split_rows.extend(self._split_row_by_column(row, split_x))
+            rows = self._reorder_rows_by_column(split_rows, split_x, column_bounds)
+
+        html = []
+
+        AVG_CHAR_WIDTH = 0.010
+
+        for row in rows:
+
+            row["words"].sort(
+                key=lambda w: w["left"]
+            )
+
+            line = ""
+
+            previous_right = None
+
+            for word in row["words"]:
+
+                if previous_right is None:
+
+                    indent = max(
+                        0,
+                        round(word["left"] / AVG_CHAR_WIDTH)
+                    )
+
+                    line += " " * indent + word["text"]
+
+                else:
+
+                    gap = word["left"] - previous_right
+
+                    spaces = max(
+                        1,
+                        round(gap / AVG_CHAR_WIDTH)
+                    )
+
+                    line += " " * spaces + word["text"]
+
+                previous_right = word["right"]
+
+            html.append(
+                f'<p style="white-space: pre-wrap;">{escape(line)}</p>'
+            )
+
+        return "\n".join(html)
+
+    def get_html(self):
+        if not self.builder:
+           self.logger.warning(f'OOPS! chrome lens couldn\'t generate html for pdf path:{self.pdf_path}')
+           return None
+
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Document</title>
+</head>
+<body>
+
+{self.builder}
+
+</body>
+</html>
+"""

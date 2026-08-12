@@ -7,99 +7,429 @@ import re
 import codecs
 import logging
 import shutil
-from .ParserTool import ParserTool
+from .ParserTool import ParserTool, ChromeLensParserTool
 from .Page import Page, SectionState
-from .HTMLBuilder import HTMLBuilder
+from .HTMLBuilder import HTMLBuilder, HTMLBuilderChromeLens
+from .Acts import Acts
+from .SebiCirculars import SebiCirculars
 from .Amendment import Amendment
-# from BqLayout import BqLayout
+from .Utils import *
+from .FontMapper import DynamicFontMapper
+from .Manifest import IIIFManifest
+from .TableExtraction import HeaderRowClassifier, RegionMergeClassifier, ContinuationClassifier
 
 class Main:
-    def __init__(self,pdfPath,start,end,is_amendment_pdf,output_dir, pdf_type):
-        self.logger = logging.getLogger(__name__)
+    def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
+                 is_footnote_continuation, min_img_pixels, ocr_language, is_scanned_copy,
+                 table_extract, public_base_url=None, server_root=None,
+                 rights=None, provider_id=None, provider_name=None, attribution=None,
+                 figure_text=False): #start,end,is_amendment_pdf,output_dir, pdf_type):
+        self.logger = logging.getLogger('source.Main')
+        if self.is_url_like(output_dir):
+            raise ValueError(
+                f"output_dir ('{output_dir}') looks like a URL, not a local filesystem "
+                f"path where output files get written. Did you mean to pass that as "
+                f"public_base_url/-pu instead? The public URL used for IIIF manifest "
+                f"links is always supplied separately and never derived from output_dir."
+            )
+        if server_root:
+            if self.is_url_like(server_root):
+                raise ValueError(
+                    f"server_root ('{server_root}') looks like a URL, not a local "
+                    f"filesystem path. It must be the local directory that corresponds "
+                    f"to the web server's document root; the public URL is supplied "
+                    f"separately via public_base_url/-pu."
+                )
+            try:
+                Path(output_dir).resolve().relative_to(Path(server_root).resolve())
+            except ValueError:
+                raise ValueError(
+                    f"output_dir ('{output_dir}') is not located within "
+                    f"server_root ('{server_root}') - IIIF manifest URLs can't be "
+                    f"expressed relative to a server root that doesn't contain the "
+                    f"output directory."
+                )
+
+        if rights and not self.is_url_like(rights):
+            self.logger.warning(
+                f"[!] rights ('{rights}') doesn't look like a URI (IIIF requires a "
+                f"Creative Commons or RightsStatements.org URI) - ignoring it."
+            )
+            rights = None
+        if provider_id and not self.is_url_like(provider_id):
+            self.logger.warning(
+                f"[!] provider_id ('{provider_id}') doesn't look like a URI - ignoring it."
+            )
+            provider_id = None
+
         self.pdf_path = pdfPath
         self.output_dir = output_dir
-        self.section_start_page = start
-        self.section_end_page = end
+        self.server_root = server_root
+        self.rights = rights
+        self.provider_id = provider_id
+        self.provider_name = provider_name
+        self.attribution = attribution
         self.parserTool = ParserTool()
         self.total_pgs = 0
         self.all_pgs = {}
-        self.html_builder = self.get_htmlBuilder(pdf_type)
+        self.pdf_type = pdf_type  # Store pdf_type for later use
+        self.has_doc_end = has_doc_end
         self.is_amendment_pdf = is_amendment_pdf
+        self.has_side_notes = has_side_notes
         self.amendment = Amendment()
         self.section_state = SectionState()
+        self.article_state = SectionState()
+        self.title_state = SectionState()
+        self.is_preamble_reached = False
+        self.section_shorttitle_notend_status = False
+        self.is_footnote_continuation = is_footnote_continuation
+        self.fontmapper = DynamicFontMapper(self.pdf_path, out_dir=self.output_dir)
+        self.unique_images = {}
+        self.all_footnote_text = {}
+        self.html_builder = None
+        self.min_img_pixels = min_img_pixels
+        self.ocr_language = ocr_language
+        self.is_scanned_copy = is_scanned_copy
+        self.table_extract = table_extract
+        self.figure_text = figure_text
+        self.public_base_url = public_base_url
+        # Public URL of the IIIF manifest (egazette only), set by write_manifest() once
+        self.manifest_url = None
+        self.header_classifier = HeaderRowClassifier.default()
+        self.region_merge_classifier = RegionMergeClassifier.default()
+        self.continuation_classifier = ContinuationClassifier.default()
+        # Column template carried between pages so a borderless table that runs off the
+        # bottom of one page can be picked up at the top of the next (set per page in the
+        # processing loops, reset here so it never leaks across documents/runs).
+        self.pending_continuation = None
+        # self.fontmapper.extract_fonts()
+
+    def get_all_footnote_text(self):
+
+        FOOTNOTE_START_RE = re.compile(
+            r'^\{\{\^\{\{FOOTNOTE\s*(.+?)\}\}\}\}'
+        )
+
+        active_footnote_num = None
+
+        for pg_num in sorted(self.all_pgs.keys()):
+
+            page = self.all_pgs[pg_num]
+
+            for tb in page.all_tbs.keys():
+
+                if page.all_tbs[tb] != 'footnote':
+                    continue
+
+                for textline in tb.tbox.findall(".//textline"):
+
+                    line_parts = []
+
+                    pending_superscript = []
+
+                    for text in textline.findall(".//text"):
+
+                        raw = text.text or ""
+
+                        if not raw:
+                            continue
+
+                        is_super = False
+
+                        if "bbox" in text.attrib:
+
+                            try:
+
+                                bbox = tuple(
+                                    map(
+                                        float,
+                                        text.attrib["bbox"].split(",")
+                                    )
+                                )
+
+                                if bbox in tb.footnotes_superscript:
+
+                                    pending_superscript.append(
+                                        tb.footnotes_superscript[bbox]
+                                    )
+
+                                    is_super = True
+
+                            except Exception:
+                                pass
+
+                        if not is_super:
+
+                            if pending_superscript:
+
+                                marker = "".join(
+                                    pending_superscript
+                                )
+
+                                line_parts.append(
+                                    "{{^{{FOOTNOTE "
+                                    + marker +
+                                    "}}}}"
+                                )
+
+                                pending_superscript = []
+
+                            line_parts.append(raw)
+
+                    if pending_superscript:
+
+                        marker = "".join(
+                            pending_superscript
+                        )
+
+                        line_parts.append(
+                            "{{^{{FOOTNOTE "
+                            + marker +
+                            "}}}}"
+                        )
+
+                    text = "".join(line_parts)
+
+                    text = re.sub(
+                        r'\s+',
+                        ' ',
+                        text
+                    ).strip()
+
+                    if not text:
+                        continue
+
+                    start_match = FOOTNOTE_START_RE.match(text)
+
+                    if start_match:
+
+                        footnote_num = (
+                            start_match.group(1).strip()
+                        )
+
+                        active_footnote_num = footnote_num
+
+                        cleaned_text = FOOTNOTE_START_RE.sub(
+                            '',
+                            text,
+                            count=1
+                        ).strip()
+
+                        if (
+                            footnote_num
+                            not in self.all_footnote_text
+                        ):
+
+                            self.all_footnote_text[
+                                footnote_num
+                            ] = cleaned_text
+
+                        else:
+
+                            self.all_footnote_text[
+                                footnote_num
+                            ] += "\n" + cleaned_text
+
+                    else:
+
+                        if not active_footnote_num:
+                            continue
+
+                        self.all_footnote_text[
+                            active_footnote_num
+                        ] += "\n" + text
+
+            if not self.is_footnote_continuation:
+
+                active_footnote_num = None
+
+    def finalize_unique_images(self):
+
+        remove_hashes = []
+
+        for img_hash, meta in self.unique_images.items():
+
+            if meta.get("count", 0) > 1:
+
+                img_path = meta.get("path")
+
+
+                if img_path and os.path.exists(img_path):
+
+                    try:
+                        os.remove(img_path)
+
+                        self.logger.info(
+                            f"Deleted duplicate image: {img_path}"
+                        )
+
+                        self.remove_empty_parent_dir(img_path)
+                    
+                    except Exception as e:
+
+                        self.logger.warning(
+                            f"Failed deleting image "
+                            f"{img_path}: {e}"
+                        )
+
+
+                for pg_num in meta.get("pages", set()):
+                    pg_num = int(pg_num)
+                    page_obj = self.all_pgs.get(pg_num)
+                    if page_obj and hasattr(page_obj, "figures"):
+                        try:
+                            page_obj.figures.remove_hash(img_hash)
+
+                        except Exception as e:
+
+                            self.logger.warning(
+                                f"Failed removing image hash "
+                                f"{img_hash} from page {pg_num}: {e}"
+                            )
+
+
+                remove_hashes.append(img_hash)
+
+
+        for img_hash in remove_hashes:
+
+            del self.unique_images[img_hash]
+
+        self.logger.info(
+            f"Remaining unique images: "
+            f"{len(self.unique_images)}"
+        )
     
-    def get_htmlBuilder(self, pdf_type):
+    def remove_empty_parent_dir(self, file_path):
+        try:
+            current = os.path.dirname(file_path)
+            while current and os.path.isdir(current) and os.path.basename(current) != "images":
+                os.rmdir(current)
+
+                self.logger.debug(
+                    f"Removed empty image directory: {current}"
+                )
+
+                current = os.path.dirname(current)
+
+        except OSError:
+            pass
+
+        except Exception:
+            self.logger.exception(
+                f"Failed removing directory for: {file_path}"
+            )
+    
+    def get_htmlBuilder(self, pdf_type, docend_symbol = False):
         if pdf_type == 'sebi':
             sentence_completion_punctutation = ("'.",'".',".'", '."', "';", ";'", ';"','";') #( ".", ":", "?",  ".'", '."', ";", ";'", ';"')
-            return HTMLBuilder(sentence_completion_punctutation, pdf_type)
-        elif pdf_type == 'acts':
-            sentence_completion_punctutation = ('.', ';', ':', '—')
-            return HTMLBuilder(sentence_completion_punctutation, pdf_type)
+            return HTMLBuilder(self.unique_images, sentence_completion_punctutation, pdf_type)
+        elif pdf_type in set(['acts']):
+            sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
+                                                ': or', '; and', ': and', ':––', ';––',\
+                                                '––', '."', '.\'', ';"', ';\'' , \
+                                                '.”', '.’', ';”' , ';’', ':-')
+            return Acts(sentence_completion_punctutation, pdf_type, docend_symbol)
+        elif pdf_type in set(['sebi_circulars']):
+            sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
+                                                ': or', '; and', ': and', ':––', ';––',\
+                                                '––', '."', '.\'', ';"', ';\'' , \
+                                                '.”', '.’', ';”' , ';’', ':-', '.]',
+                                                ',-', ':-', ';-', '--')
+            return SebiCirculars(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type, docend_symbol)
+
         else:
             sentence_completion_punctutation = ('.', ':')
-            return HTMLBuilder(sentence_completion_punctutation, pdf_type)
+            return HTMLBuilder(self.unique_images, sentence_completion_punctutation, pdf_type)
         
     # --- func to build HTML after text classification ---
-    def buildHTML(self, section_page_end):
+    def buildHTML(self, start_page, end_page): #, section_page_end):
+        if not self.html_builder:
+            return
+        if not self.all_pgs:
+            self.html_builder.build(start_page, end_page)
+            html_content = self.html_builder.get_html()
+            self.write_html(html_content, start_page, end_page)
+            return
+        
         for page in self.all_pgs.values():
             self.logger.info(f"HTML build starts for page num-{page.pg_num}")
-            self.html_builder.build(page, section_page_end)
+            self.html_builder.build(page, self.has_side_notes) #, section_page_end)
         
         self.logger.debug("Fetching Full HTML content")
-        html_content = self.html_builder.get_html()
-        self.write_html(html_content)
-
-
-    
-    # --- look for page header,footer,tables of all pages ---
-    def get_page_header_footer(self,pages):
-        self.sorted_footer_units = []
-        self.sorted_header_units = []
-        self.headers_footers = []
-        self.headers = []
-        self.footers = []
-        for pg in pages:
-            pdf_dir = self.get_path_cache_pdf()
-            if not self.pdf_path.lower().endswith(".pdf"):
-                
-                base_name = os.path.basename(self.pdf_path) + ".pdf"
-                new_pdf_path = os.path.join(pdf_dir, base_name)
-
-                
-                shutil.copy(self.pdf_path, new_pdf_path)
-
-                self.logger.debug(f"Copied input file to cache dir as: {new_pdf_path}")
-                self.pdf_path = new_pdf_path
-
-            page = Page(pg,self.pdf_path)
-            self.total_pgs +=1
-            self.all_pgs[self.total_pgs]=page
-            page.process_textboxes(pg)
-            page.label_table_tbs()
-            self.contour_header_footer_of_page(page)
-            
-
-        self.process_footer_and_header()
-        self.set_page_headers_footers()
+        if self.pdf_type not in set(['acts', 'sebi_circulars']):
+            html_content = self.html_builder.get_html()
+            self.write_html(html_content, start_page, end_page)
+        else:
+            content = self.html_builder.get_content()
+            self.write_bluebell(content, start_page, end_page)
 
     # --- classify the page texboxes sidenotes, section, para, titles(headings) ---
     def process_pages_acts(self, pdf_type):
+        self.pending_continuation = None
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
             # page.print_tbs()
             page.get_width_ofTB_moreThan_Half_of_pg()
             page.get_body_width_by_binning()
             # page.is_single_column_page = page.is_single_column_page()
-            page.get_side_notes(self.section_start_page,self.section_end_page)
+            page.find_sidenote_leftend_rightstart_coords()
+            page.get_side_notes() #self.section_start_page,self.section_end_page)
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
             if self.is_amendment_pdf:
-                self.amendment.check_for_amendment_acts(page,self.section_start_page,self.section_end_page)
-
-            page.get_section_para(self.section_state, self.section_start_page,self.section_end_page)
+                self.amendment.check_for_amendment_acts(page)#,self.section_start_page,self.section_end_page)
+            if self.table_extract:
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
+            page.get_article(self.article_state, self)
+            page.get_section_para(self.section_state, self)#, self.section_start_page,self.section_end_page)
             page.get_titles(pdf_type)
+            page.sort_all_boxes()
+            page.print_all()
+            # page.print_headers()
+            # page.print_footers()
 
-    
+    def process_pages_sebi_circulars(self, pdf_type):
+        prev_sent_end_status = True
+        sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
+                                                ': or', '; and', ': and', ':––', ';––',\
+                                                '––', '."', '.\'', ';"', ';\'' , \
+                                                '.”', '.’', ';”' , ';’', ':-', '.]',
+                                                ',-', ':-', ';-', '--')
+
+        self.pending_continuation = None
+        for page in self.all_pgs.values():
+            self.logger.info(f"Processing page num-{page.pg_num}")
+            page.get_width_ofTB_moreThan_Half_of_pg()
+            page.get_body_width_by_binning()
+            # page.is_single_column_page = page.is_single_column_page()
+            # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
+            # print(page.is_single_column_page)
+            if self.table_extract:
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
+            page.get_bulletins_sebi_circulars(self.section_state)
+            page.get_titles(pdf_type)
+            prev_sent_end_status = page.get_title_hierarchy(self.title_state, prev_sent_end_status, sentence_completion_punctutation)   
+            page.sort_all_boxes()
+            # page.print_blockquote()
+            # page.print_headers()
+            # page.print_footers()
+            # page.print_levels()
+            page.print_all()
+            # page.print_tbs()
+
     def process_pages_sebi(self, pdf_type):
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
@@ -108,10 +438,26 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
-            page.get_titles(pdf_type)
+            page.get_italic_blockquotes(pdf_type)
             self.amendment.check_for_blockquotes(page)
+            if self.table_extract:
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
+            # page.get_titles(pdf_type)
             page.get_bulletins(self.section_state)
+            page.get_titles(pdf_type)
+            page.sort_all_boxes()
+            # page.print_blockquote()
+            # page.print_headers()
+            # page.print_footers()
             # page.print_levels()
+            page.print_all()
+            # page.print_tbs()
             
     def process_pages(self, pdf_type):
         for page in self.all_pgs.values():
@@ -121,8 +467,20 @@ class Main:
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
+            if self.table_extract:
+                page.reclaim_header_footer_for_continuation(self.pending_continuation)
+                self.pending_continuation = page.get_borderless_table(
+                    pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
             page.get_titles(pdf_type)
-            page.get_bulletins(self.section_state)
+            # page.get_bulletins(self.section_state)
+            page.sort_all_boxes()
+            # page.print_headers()
+            # page.print_footers()
+            page.print_all()
 
     def print_labels(self, pdf_type):
         #for page in self.all_pgs.values():
@@ -137,222 +495,738 @@ class Main:
             # # page.print_tbs()
             # self.bq_layout.print_sections()
         pass
-    # --- in each page do contour to detect possible header/footer content ---
-    def contour_header_footer_of_page(self,pg):
+
+    # --- NEW ADAPTIVE HEADER/FOOTER DETECTION ---
+    def get_page_header_footer(self, pages, base_name_of_file, output_dir):
+        # Initialize page objects first
+        for pg in pages:
+            pdf_dir = self.get_path_cache_pdf()
+            if not self.pdf_path.lower().endswith(".pdf"):
+                base_name = os.path.basename(self.pdf_path) + ".pdf"
+                new_pdf_path = os.path.join(pdf_dir, base_name)
+                shutil.copy(self.pdf_path, new_pdf_path)
+                self.logger.debug(f"Copied input file to cache dir as: {new_pdf_path}")
+                self.pdf_path = new_pdf_path
+
+            page = Page(pg, self.pdf_path, base_name_of_file, output_dir,
+                        self.pdf_type, self.has_side_notes, self.is_amendment_pdf,
+                        self.fontmapper, self.unique_images, self.min_img_pixels,
+                        self.ocr_language,
+                        self.is_scanned_copy, self.figure_text)
+            self.total_pgs += 1
+            self.all_pgs[self.total_pgs] = page
+            page.process_textboxes()#pg)
+            page.get_figures()#pg)
+            page.label_table_tbs()
+
+            # page.line_based_header_footer_detection()
+        # Run adaptive header/footer detection
+        self.logger.info("Starting adaptive header/footer detection...")
+        if not self.is_scanned_copy:
+            self.adaptive_header_footer_detection(pages, self.pdf_type)
+
+        self.logger.info("Detecting multicolumn page layouts...")
+        for page in self.all_pgs.values():
+            page.detect_multicolumn_layout()
+            page.apply_column_reading_order()
+
+        if self.pdf_type in {'sebi_circulars'} :
+            previous_page_footnote_font_size  = None
+            seen_footnote = set()
+            for page in self.all_pgs.values():
+                if self.is_footnote_continuation:
+                    previous_page_footnote_font_size, seen_footnote = (
+                        page.get_footnotes(
+                            seen_footnote,
+                            previous_page_footnote_font_size
+                        )
+                    )
+                else:
+                    page.get_footnotes()
+
+        self.finalize_unique_images()
+        if not self.unique_images:
+            self.remove_empty_manifest_dir(base_name_of_file, output_dir)
+        self.get_all_footnote_text()
+        self.logger.info(self.all_footnote_text)
+
+    def remove_empty_manifest_dir(self, base_name_of_file, output_dir, image_base_dir="manifest"):
+        manifest_pdf_dir = os.path.join(output_dir, image_base_dir, base_name_of_file)
+        images_dir = os.path.join(manifest_pdf_dir, "images")
+        for directory in (images_dir, manifest_pdf_dir):
+            try:
+                if os.path.isdir(directory) and not os.listdir(directory):
+                    os.rmdir(directory)
+                    self.logger.debug(f"Removed empty manifest directory: {directory}")
+            except OSError as e:
+                self.logger.debug(f"Could not remove manifest directory {directory}: {e}")
+
+    def adaptive_header_footer_detection(self, pages, pdf_type=None):
+        self.adaptive_headers = []
+        self.adaptive_footers = []
+        page_elements = []
+        
+        # Simple working configuration
+        if pdf_type not in set(['sebi_circulars']):
+            HEADER_ZONE_THRESHOLD = 0.12#0.15    # Top 15% of page height
+            FOOTER_ZONE_THRESHOLD = 0.12#0.15    # Bottom 15% of page height
+            SIMILARITY_THRESHOLD =  0.8       # 80% similarity
+            MIN_OCCURRENCE_RATE =   0.4     # Must appear on at least 40% of pages
+            LINE_TOLERANCE = 0.02           # 2% of page height tolerance for same line detection
+        
+        else:
+            HEADER_ZONE_THRESHOLD = 0.12#0.15    # Top 15% of page height
+            FOOTER_ZONE_THRESHOLD = 0.12#0.15    # Bottom 15% of page height
+            SIMILARITY_THRESHOLD =  0.9       # 80% similarity
+            MIN_OCCURRENCE_RATE =   0.6     # Must appear on at least 40% of pages
+            LINE_TOLERANCE = 0.02 
+
         try:
-            units = []
-            for tb in pg.all_tbs.keys():
-                try:
-                    if pg.all_tbs[tb] is None:
-                        paragraph = tb.extract_text_from_tb()
-                        if not paragraph.isspace():
-                            units.append({'pg_num':pg.pg_num,'tb':tb,'para':paragraph,'x0':tb.coords[0],'y0':tb.coords[1]})
-                        else:
-                            continue
-                except Exception as e:
-                    self.logger.warning("Error extracting text or coordinates from textbox on page %d: %s", pg.pg_num, e)
-            if not units:
-                self.logger.info("No units detected for header/footer detection on page %s", pg.pg_num)
+            total_pages = len(pages)
+            self.logger.info("Starting adaptive header/footer detection on %d pages", total_pages)
+            
+            # Special handling for single-page PDFs
+            if total_pages == 1:
+                self.logger.info("Single-page PDF detected - using strict header/footer detection")
+                self._handle_single_page_header_footer_detection(pages, pdf_type, HEADER_ZONE_THRESHOLD, FOOTER_ZONE_THRESHOLD)
                 return
             
-            most_bottom_unit = sorted(units, key= lambda d: d['y0'], reverse=False)
-            footer_area_units = []
-            header_area_units = []
-
-            headers = [most_bottom_unit[-1]]
-            footers = [most_bottom_unit[0]]
-
-            for ele in most_bottom_unit:
-                smallest = most_bottom_unit[0]['y0']
-                largest = most_bottom_unit[-1]['y0']
-                if (ele['y0']-smallest) >= 0 and (ele['y0']- smallest) < 0.025 * pg.pg_height:
-                    if ele['para'] != most_bottom_unit[0]['para']:
-                        footers.append(ele)
-                        continue
-                    else:
-                        continue
-                if (largest - ele['y0']) >= 0 and (largest - ele['y0']) < 0.025* pg.pg_height:
-                    if ele['para'] != most_bottom_unit[-1]['para']:
-                        headers.append(ele)
-                        continue
-                    else:
-                        continue
-                
-                if ele['y0'] - pg.pg_height/2 >= 0:
-                    header_area_units.append(ele)
-                if ele['y0'] - pg.pg_height/2 < 0:
-                    footer_area_units.append(ele)
-                
-            header_area_units = sorted(header_area_units, key=lambda d: d['y0'], reverse=True)
-            self.sorted_footer_units.append(footer_area_units)
-            self.sorted_header_units.append(header_area_units)
-            headers = sorted(headers, key=lambda d: d['x0'], reverse=False)
-            footers = sorted(footers, key=lambda d: d['x0'], reverse=False)
-            headers = [el for el in headers if el['para'].strip()]
-            footers = [el for el in footers if el['para'].strip()]
-            headers = [el for el in headers if el['para'].strip()]
-            footers = [el for el in footers if el['para'].strip()]
-            header = '!!??!!'.join(el['para'] for el in headers)
-            footer = '!!??!!'.join(el['para'] for el in footers)
-            self.headers_footers.append({
-        'page': pg.pg_num,
-        'header': " ".join(header.split()),
-        'footer': " ".join(footer.split()),
-        'header_units': headers,
-        'footer_units': footers })
-            self.logger.debug("Detected header/footer on page %d: header='%s' | footer='%s'", 
-                          pg.pg_num, header[:100], footer[:100])
-        
-        except Exception as e:
-            self.logger.exception("Error during header/footer contour detection on page %d: %s", pg.pg_num, e)
-
-
-        
-    #  --- Detection of proper header/footer by squence matcher across all pages ---
-    def process_footer_and_header(self):
-        def similar(text1, text2):
-            try:
-                return SequenceMatcher(None, text1, text2).ratio()
-            except Exception as e:
-                self.logger.warning("Similarity check failed: %s vs %s | error: %s", text1, text2, e)
-                return 0.0
-
-        
-        MAX_HEADER_FOOTER_DEPTH = 100
-
-        try:
-            counter_in_loop_hf = 0
-            while counter_in_loop_hf < MAX_HEADER_FOOTER_DEPTH:
-                units_with_same_index = []
-                i_break = False
-                for el in self.sorted_footer_units:
-                    try:
-                        units_with_same_index.append(el[counter_in_loop_hf])
-                    except IndexError:
-                        continue
-                    except Exception as e:
-                        self.logger.warning("Unexpected error accessing footer unit: %s", e)
-                        continue
-                for unitt in units_with_same_index:
-                    similar_counter = 0
-                    for rest in units_with_same_index:
-                        if similar(unitt['para'],rest['para']) > 0.4:
-                            similar_counter += 1
-                    if similar_counter > 0.05 * self.total_pgs:
-                        a = " ".join(unitt['para'].split())
-                        for el in self.headers_footers:
-                            if el['page'] == unitt['pg_num']:
-                                el['footer'] = str(el['footer']+'!!??!!'+a)
-                                
-                    else:
-                        i_break = True
-                if i_break:
-                    break
-                counter_in_loop_hf +=1
-        except Exception as e:
-            self.logger.exception("Error while processing footers: %s", e)
-
-        #_____________
-
-        try:
-            counter_in_loop_hf = 0
-            while counter_in_loop_hf < MAX_HEADER_FOOTER_DEPTH:
-                units_with_same_index = []
-                i_break = False
-                for el in self.sorted_header_units:
-                    try:
-                        units_with_same_index.append(el[counter_in_loop_hf])
-                    except IndexError:
-                        continue
-                    except Exception as e:
-                        self.logger.warning("Unexpected error accessing header unit: %s", e)
-                        continue
-                for unitt in units_with_same_index:
-                    similar_counter = 0
-                    for rest in units_with_same_index:
-                        if similar(unitt['para'],rest['para']) > 0.4:
-                            similar_counter += 1
-                    if similar_counter > 0.05 * self.total_pgs:
-                        a = " ".join(unitt['para'].split())
-                        for el in self.headers_footers:
-                            if el['page'] == unitt['pg_num']:
-                                el['header'] = str(el['header']+'!!??!!'+a)
-                    else:
-                        i_break = True
-                if i_break:
-                    break
-                counter_in_loop_hf +=1
-        except Exception as e:
-            self.logger.exception("Error while processing headers: %s", e)
-        
-        #------------------------------------------------------
-
-        try:
-            for el in self.headers_footers:
-                counter_f = 0
-                counter_h = 0
-                for rest in self.headers_footers:
-                    if similar(el['footer'],rest['footer']) > 0.4:
-                        counter_f +=1
-                for rest in self.headers_footers:
-                    if similar(el['header'],rest['header']) > 0.4:
-                        counter_h +=1
-
-                if counter_f >= 0.05 * self.total_pgs :
-                    self.footers.append({
-                        'page': int(el['page']),
-                        'footers': [{'para': unit['para'], 'tb': unit['tb']} for unit in el.get('footer_units', [])]})
-                    self.logger.debug("Page %d footer accepted with %d similar entries.", el['page'], counter_f)
-
-                if counter_h >= 0.05 * self.total_pgs:
-                    self.headers.append({
-                    'page': int(el['page']),
-                    'headers': [{'para': unit['para'], 'tb': unit['tb']} for unit in el.get('header_units', [])]
-                    })
-                    self.logger.debug("Page %d header accepted with %d similar entries.", el['page'], counter_h)
-
-        except Exception as e:
-            self.logger.exception("Error during final header/footer classification: %s", e)
-
-    # --- once detected set the header and footer of the page, apply to their page object ---
-    def set_page_headers_footers(self):
-        try:
-            for pg in self.headers:
-                page_num = int(pg['page'])
+            # Step 1: Extract all textboxes with normalized coordinates
+            for pg_idx, pg in enumerate(pages):
+                page_num = pg_idx + 1
                 if page_num not in self.all_pgs:
-                    self.logger.warning("Page %d not found in all_pgs while setting headers.", page_num)
                     continue
-
-                for textbox in pg.get('headers', []):
-                    tb = textbox.get('tb')
-                    if tb in self.all_pgs[page_num].all_tbs:
-                        self.all_pgs[page_num].all_tbs[tb] = "header"
-                        self.logger.debug("Marked header on page %d for textbox: %s", page_num, tb)
-                    else:
-                        self.logger.warning("Textbox not found in page %d for header: %s", page_num, tb)
+                    
+                page_obj = self.all_pgs[page_num]
+                
+                for tb, label in page_obj.all_tbs.items():
+                    try:
+                        if label is not None:
+                            continue
+                        text = tb.extract_text_from_tb().strip()
+                        if not text or text.isspace():
+                            continue
+                            
+                        # Normalize coordinates as percentages of page dimensions
+                        x0_pct = tb.coords[0] / page_obj.pg_width
+                        y0_pct = tb.coords[1] / page_obj.pg_height
+                        x1_pct = tb.coords[2] / page_obj.pg_width
+                        y1_pct = tb.coords[3] / page_obj.pg_height
+                        
+                        width_pct = x1_pct - x0_pct
+                        height_pct = y1_pct - y0_pct
+                        
+                        # Calculate relative position zones
+                        is_header_zone = y0_pct >= (1 - HEADER_ZONE_THRESHOLD)
+                        is_footer_zone = y0_pct <= FOOTER_ZONE_THRESHOLD
+                        
+                        page_elements.append({
+                            'page_num': page_num,
+                            'text': text,
+                            'textbox': tb,
+                            'x0_pct': x0_pct,
+                            'y0_pct': y0_pct,
+                            'x1_pct': x1_pct,
+                            'y1_pct': y1_pct,
+                            'width_pct': width_pct,
+                            'height_pct': height_pct,
+                            'is_header_zone': is_header_zone,
+                            'is_footer_zone': is_footer_zone,
+                            'is_centered': abs(x0_pct + width_pct/2 - 0.5) < 0.1,
+                            'is_left_aligned': x0_pct < 0.1,
+                            'is_right_aligned': x1_pct > 0.9
+                        })
+                        
+                    except Exception as e:
+                        self.logger.warning("Error processing textbox on page %d: %s", page_num, e)
+                        continue
             
-            # for pg in self.footers:
-            #     page_num = int(pg['page'])
-            #     if page_num not in self.all_pgs:
-            #         self.logger.warning("Page %d not found in all_pgs while setting footers.", page_num)
-            #         continue
-            #     for textbox in pg.get('footers', []):
-            #         tb = textbox.get('tb')
-            #         if tb in self.all_pgs[page_num].all_tbs:
-            #             self.all_pgs[page_num].all_tbs[tb] = "footer"
-            #             self.logger.debug("Marked footer on page %d for textbox: %s", page_num, tb)
-            #         else:
-            #             self.logger.warning("Textbox not found in page %d for footer: %s", page_num, tb)
-
-
-            for attr in ['sorted_footer_units', 'sorted_header_units', 'headers_footers', 'headers', 'footers']:
-                if hasattr(self, attr):
-                    delattr(self, attr)
-                    self.logger.debug("Deleted attribute: %s", attr)
-                else:
-                    self.logger.debug("Attribute %s not found for deletion.", attr)
+            if not page_elements:
+                self.logger.warning("No valid page elements found for header/footer detection")
+                return
+                
+            # Count elements in zones
+            header_zone_count = sum(1 for elem in page_elements if elem['is_header_zone'])
+            footer_zone_count = sum(1 for elem in page_elements if elem['is_footer_zone'])
+            self.logger.info("Found %d elements in header zones, %d in footer zones", 
+                           header_zone_count, footer_zone_count)
+            
+            # Debug: Show coordinate distribution to understand the issue
+            if page_elements:
+                y_coords = [elem['y0_pct'] for elem in page_elements]
+                min_y = min(y_coords)
+                max_y = max(y_coords)
+                self.logger.info("Y-coordinate range: %.3f to %.3f", min_y, max_y)
+                self.logger.info("Header zone threshold (y >= %.3f), Footer zone threshold (y <= %.3f)", 
+                               1 - HEADER_ZONE_THRESHOLD, FOOTER_ZONE_THRESHOLD)
+                
+                # Show some sample elements with their coordinates
+                self.logger.info("Sample elements by Y position:")
+                sorted_elements = sorted(page_elements, key=lambda e: e['y0_pct'])
+                for i in [0, len(sorted_elements)//2, -1]:
+                    if 0 <= i < len(sorted_elements):
+                        elem = sorted_elements[i]
+                        self.logger.info("  Y=%.3f: '%s' (header_zone=%s, footer_zone=%s)", 
+                                       elem['y0_pct'], elem['text'][:40], 
+                                       elem['is_header_zone'], elem['is_footer_zone'])
+            
+            # Step 2: Simple similarity calculation
+            def calculate_similarity(elem1, elem2):
+                if re.fullmatch(r'\d+', elem1['text'].strip()) and re.fullmatch(r'\d+', elem2['text'].strip()):
+                    return 1.0
+                text_sim = SequenceMatcher(None, elem1['text'], elem2['text']).ratio()
+                x_sim = 1 - abs(elem1['x0_pct'] - elem2['x0_pct'])
+                y_sim = 1 - abs(elem1['y0_pct'] - elem2['y0_pct'])
+                width_sim = 1 - abs(elem1['width_pct'] - elem2['width_pct'])
+                
+                alignment_sim = 1.0 if (elem1['is_centered'] == elem2['is_centered'] and 
+                                      elem1['is_left_aligned'] == elem2['is_left_aligned'] and 
+                                      elem1['is_right_aligned'] == elem2['is_right_aligned']) else 0.8
+                
+                overall_sim = (text_sim * 0.4 + x_sim * 0.2 + y_sim * 0.2 + 
+                             width_sim * 0.1 + alignment_sim * 0.1)
+                
+                return overall_sim
+            
+            # Step 3: Find header candidates (including those marked by uploaded_by detection)
+            header_candidates = [elem for elem in page_elements if elem['is_header_zone']]
+            
+            # Add any headers marked by uploaded_by detection
+            uploaded_by_headers = [elem for elem in page_elements if elem.get('marked_by_uploaded_by') and elem.get('is_header_zone')]
+            for header_elem in uploaded_by_headers:
+                if header_elem not in header_candidates:
+                    header_candidates.append(header_elem)
+            
+            header_groups = self._group_similar_elements(header_candidates, calculate_similarity, 
+                                                       SIMILARITY_THRESHOLD, total_pages, MIN_OCCURRENCE_RATE)
+            
+            # Step 4: Find footer candidates with adaptive detection
+            footer_candidates = [elem for elem in page_elements if elem['is_footer_zone']]
+            
+            # Add special regex-based detection for "uploaded by" patterns in footer area (only for 'acts' pdf type)
+            uploaded_by_candidates = []
+            if pdf_type == 'acts':
+                self.logger.info("Processing 'uploaded by' patterns for PDF type 'acts'")
+                
+                # Group elements by page for easier processing
+                pages_dict = {}
+                for elem in page_elements:
+                    page_num = elem['page_num']
+                    if page_num not in pages_dict:
+                        pages_dict[page_num] = []
+                    pages_dict[page_num].append(elem)
+                
+                for elem in page_elements:
+                    text_lower = elem['text'].lower().strip()
+                    # Check if text matches "uploaded by" pattern and is in footer area (bottom 50% of page)
+                    if re.search(r'^uploaded\s*by\s*\S*\s*', text_lower) and elem['y0_pct'] <= 0.5:
+                        elem['is_footer_zone'] = True  # Mark as footer zone
+                        uploaded_by_candidates.append(elem)
+                        self.logger.info("Found 'uploaded by' pattern in footer area: page=%d, y=%.3f, text='%s'", 
+                                       elem['page_num'], elem['y0_pct'], elem['text'][:40])
+                        
+                        # Find and mark related textboxes on the same page within threshold areas
+                        page_num = elem['page_num']
+                        if page_num in pages_dict:
+                            self._mark_related_header_footer_textboxes(elem, pages_dict[page_num], uploaded_by_candidates, 
+                                                                     HEADER_ZONE_THRESHOLD, FOOTER_ZONE_THRESHOLD)
+            else:
+                self.logger.debug("Skipping 'uploaded by' pattern detection for PDF type '%s' (only works for 'acts')", pdf_type)
+            
+            # Add uploaded by candidates to footer candidates
+            footer_candidates.extend(uploaded_by_candidates)
+            
+            # If no footers found with current logic, try finding elements at actual bottom of pages
+            if not footer_candidates:
+                self.logger.info("No footers found with standard detection, trying adaptive approach...")
+                
+                # Group elements by page and find the ones at the bottom of each page
+                pages_dict = {}
+                for elem in page_elements:
+                    page_num = elem['page_num']
+                    if page_num not in pages_dict:
+                        pages_dict[page_num] = []
+                    pages_dict[page_num].append(elem)
+                
+                # For each page, find elements that are actually at the bottom
+                adaptive_footer_candidates = []
+                for page_num, page_elems in pages_dict.items():
+                    if len(page_elems) < 2:
+                        continue
+                    
+                    # Sort by Y coordinate to find bottom elements
+                    sorted_elems = sorted(page_elems, key=lambda e: e['y0_pct'])
+                    
+                    # Take elements from the bottom portion of the page
+                    bottom_threshold = 0.25  # Bottom 25% of elements
+                    num_bottom_elements = max(1, int(len(sorted_elems) * bottom_threshold))
+                    bottom_elements = sorted_elems[:num_bottom_elements]
+                    
+                    # Add these as footer candidates
+                    for elem in bottom_elements:
+                        elem['is_footer_zone'] = True  # Mark as footer zone
+                        adaptive_footer_candidates.append(elem)
+                        self.logger.debug("Adaptive footer candidate: page=%d, y=%.3f, text='%s'", 
+                                        page_num, elem['y0_pct'], elem['text'][:40])
+                
+                footer_candidates.extend(adaptive_footer_candidates)
+                self.logger.info("Found %d adaptive footer candidates", len(adaptive_footer_candidates))
+            
+            # Group footer candidates, but handle "uploaded by" patterns separately
+            regular_footer_candidates = [elem for elem in footer_candidates 
+                                       if not re.search(r'^uploaded\s*by\s*\S*\s*', elem['text'].lower().strip())]
+            footer_groups = self._group_similar_elements(regular_footer_candidates, calculate_similarity,
+                                                       SIMILARITY_THRESHOLD, total_pages, MIN_OCCURRENCE_RATE)
+            
+            # Add special groups for "uploaded by" patterns with relaxed criteria
+            uploaded_by_groups = self._group_uploaded_by_patterns(uploaded_by_candidates, total_pages)
+            footer_groups.extend(uploaded_by_groups)
+            
+            self.logger.info("Grouped into %d header groups and %d footer groups", 
+                           len(header_groups), len(footer_groups))
+            
+            # Step 5: Simple validation - just use the groups as they are
+            self.adaptive_headers = header_groups
+            self.adaptive_footers = footer_groups
+            
+            self.logger.info("Adaptive detection complete: %d header groups, %d footer groups", 
+                           len(self.adaptive_headers), len(self.adaptive_footers))
+            
+            # Step 6: Extend headers/footers to include textboxes on same lines
+            self._extend_headers_footers_by_line(page_elements, LINE_TOLERANCE)
+            
+            # Step 7: Apply the detected headers and footers to pages
+            self._apply_adaptive_headers_footers()
+            
         except Exception as e:
-            self.logger.exception("Failed during set_page_headers_footers: %s", e)
+            self.logger.exception("Error during adaptive header/footer detection: %s", e)
+    
+    
+    def _analyze_header_footer_content(self, text):
+        import re
+        
+        text_lower = text.lower().strip()
+        
+        # Common header/footer patterns
+        header_footer_patterns = [
+            r'page\s*\d+',           # Page numbers
+            r'\d+\s*page',           # Page numbers (reverse)
+            r'^\d+$',                # Just numbers
+            r'chapter\s*\d+',        # Chapter references
+            r'section\s*\d+',        # Section references
+            r'\d{4}',                # Years
+            r'copyright',            # Copyright notices
+            r'©',                    # Copyright symbol
+            r'confidential',         # Confidentiality notices
+            r'draft',                # Draft notices
+            r'www\.',                # Web addresses
+            r'\.com|\.org|\.gov',    # Domain extensions
+            r'^\d+[-./]\d+',         # Date patterns
+            r'rev\.|revision',       # Revision markers
+            r'version\s*\d+',        # Version numbers
+            r'^uploaded\s*by\s*\S*\s*',  # Uploaded by patterns
+        ]
+        
+        # Content that's unlikely to be header/footer
+        unlikely_patterns = [
+            r'\w{50,}',              # Very long words (likely body text)
+            r'[.!?]\s+[A-Z]',        # Sentences (multiple sentences)
+            r'\w+\s+\w+\s+\w+\s+\w+\s+\w+',  # 5+ words (likely paragraph)
+        ]
+        
+        # Check for header/footer indicators
+        for pattern in header_footer_patterns:
+            if re.search(pattern, text_lower):
+                return True
+        
+        # Check for unlikely content
+        for pattern in unlikely_patterns:
+            if re.search(pattern, text):
+                return False
+        
+        # Additional heuristics
+        if len(text) < 5:  # Very short text might be page numbers
+            return True
+        
+        if len(text) > 100:  # Long text unlikely to be header/footer
+            return False
+        
+        # Check if it's mostly numbers or special characters
+        alphanumeric_ratio = sum(c.isalnum() for c in text) / len(text)
+        if alphanumeric_ratio < 0.5:  # Less than 50% alphanumeric
+            return True
+        
+        # Default to False for body content
+        return False
+    
+    def _group_uploaded_by_patterns(self, uploaded_by_candidates, total_pages):
+        groups = []
+        
+        if not uploaded_by_candidates:
+            return groups
+        
+        # Since "uploaded by" patterns can vary (different usernames), group them more loosely
+        # Just check if they have the basic "uploaded by" pattern
+        used_elements = set()
+        
+        for candidate in uploaded_by_candidates:
+            if id(candidate) in used_elements:
+                continue
+                
+            # Find all elements with "uploaded by" pattern
+            similar_elements = [candidate]
+            used_elements.add(id(candidate))
+            
+            for other in uploaded_by_candidates:
+                if id(other) in used_elements:
+                    continue
+                    
+                # For "uploaded by" patterns, just check if both match the pattern
+                # (don't require high text similarity since usernames will differ)
+                other_text_lower = other['text'].lower().strip()
+                if re.search(r'^uploaded\s*by\s*\S*\s*', other_text_lower):
+                    similar_elements.append(other)
+                    used_elements.add(id(other))
+            
+            # For "uploaded by" patterns, accept even single occurrences
+            # since they are explicitly identified by regex pattern
+            if len(similar_elements) >= 1:  # Accept even single occurrence
+                representative_text = "uploaded by [user]"  # Generic representative text
+                
+                avg_x0_pct = sum(elem['x0_pct'] for elem in similar_elements) / len(similar_elements)
+                avg_y0_pct = sum(elem['y0_pct'] for elem in similar_elements) / len(similar_elements)
+                
+                groups.append({
+                    'elements': similar_elements,
+                    'representative_text': representative_text,
+                    'avg_x0_pct': avg_x0_pct,
+                    'avg_y0_pct': avg_y0_pct,
+                    'occurrence_rate': len(similar_elements) / total_pages,
+                    'pages': [elem['page_num'] for elem in similar_elements],
+                    'quality_score': 0.9,  # High quality score for regex-matched patterns
+                    'pattern_type': 'uploaded_by'
+                })
+                
+                self.logger.info("Created 'uploaded by' footer group with %d elements across pages: %s", 
+                               len(similar_elements), [elem['page_num'] for elem in similar_elements])
+        
+        return groups
+    
+    def _handle_single_page_header_footer_detection(self, pages, pdf_type, header_zone_threshold, footer_zone_threshold):
+        try:
+            page_elements = []
+            page = pages[0]
+            page_num = 1
+            
+            if page_num not in self.all_pgs:
+                self.logger.warning("Page 1 not found in all_pgs for single-page detection")
+                return
+                
+            page_obj = self.all_pgs[page_num]
+            
+            # Extract all textboxes with normalized coordinates
+            for tb in page_obj.all_tbs.keys():
+                try:
+                    text = tb.extract_text_from_tb().strip()
+                    if not text or text.isspace():
+                        continue
+                        
+                    # Normalize coordinates as percentages of page dimensions
+                    x0_pct = tb.coords[0] / page_obj.pg_width
+                    y0_pct = tb.coords[1] / page_obj.pg_height
+                    x1_pct = tb.coords[2] / page_obj.pg_width
+                    y1_pct = tb.coords[3] / page_obj.pg_height
+                    
+                    width_pct = x1_pct - x0_pct
+                    height_pct = y1_pct - y0_pct
+                    
+                    # Calculate relative position zones
+                    is_header_zone = y0_pct >= (1 - header_zone_threshold)
+                    is_footer_zone = y0_pct <= footer_zone_threshold
+                    
+                    page_elements.append({
+                        'page_num': page_num,
+                        'text': text,
+                        'textbox': tb,
+                        'x0_pct': x0_pct,
+                        'y0_pct': y0_pct,
+                        'x1_pct': x1_pct,
+                        'y1_pct': y1_pct,
+                        'width_pct': width_pct,
+                        'height_pct': height_pct,
+                        'is_header_zone': is_header_zone,
+                        'is_footer_zone': is_footer_zone,
+                        'is_centered': abs(x0_pct + width_pct/2 - 0.5) < 0.1,
+                        'is_left_aligned': x0_pct < 0.1,
+                        'is_right_aligned': x1_pct > 0.9
+                    })
+                    
+                except Exception as e:
+                    self.logger.warning("Error processing textbox on single page: %s", e)
+                    continue
+            
+            self.logger.info("Found %d elements on single page", len(page_elements))
+            
+            # For single-page PDFs, be very strict about what constitutes headers/footers
+            header_candidates = []
+            footer_candidates = []
+            
+            # Only consider elements that are in the zones AND match header/footer patterns
+            for elem in page_elements:
+                text_lower = elem['text'].lower().strip()
+                
+                # Check if text has header/footer characteristics
+                is_likely_header_footer = self._analyze_header_footer_content(elem['text'])
+                
+                # Be stricter for single-page: must be in zone AND match pattern
+                if elem['is_header_zone'] and is_likely_header_footer:
+                    header_candidates.append(elem)
+                    self.logger.info("Single-page header candidate: y=%.3f, text='%s'", 
+                                   elem['y0_pct'], elem['text'][:40])
+                elif elem['is_footer_zone'] and is_likely_header_footer:
+                    footer_candidates.append(elem)
+                    self.logger.info("Single-page footer candidate: y=%.3f, text='%s'", 
+                                   elem['y0_pct'], elem['text'][:40])
+            
+            # Handle special "uploaded by" patterns for acts PDFs (only if in appropriate zones)
+            if pdf_type == 'acts':
+                for elem in page_elements:
+                    text_lower = elem['text'].lower().strip()
+                    if re.search(r'^uploaded\s*by\s*\S*\s*', text_lower):
+                        if elem['is_footer_zone'] or elem['y0_pct'] <= 0.5:  # Footer zone or bottom half
+                            footer_candidates.append(elem)
+                            self.logger.info("Single-page 'uploaded by' footer: y=%.3f, text='%s'", 
+                                           elem['y0_pct'], elem['text'][:40])
+                            # For single page, don't mark related textboxes to avoid false positives
+            
+            # Create simple groups for single-page elements
+            if header_candidates:
+                self.adaptive_headers = [{
+                    'elements': header_candidates,
+                    'representative_text': f"Single-page headers ({len(header_candidates)} items)",
+                    'quality_score': 0.8,
+                    'pattern_type': 'single_page_header'
+                }]
+            
+            if footer_candidates:
+                self.adaptive_footers = [{
+                    'elements': footer_candidates,
+                    'representative_text': f"Single-page footers ({len(footer_candidates)} items)",
+                    'quality_score': 0.8,
+                    'pattern_type': 'single_page_footer'
+                }]
+            
+            self.logger.info("Single-page detection complete: %d header candidates, %d footer candidates", 
+                           len(header_candidates), len(footer_candidates))
+            
+            # Apply the detected headers and footers
+            self._apply_adaptive_headers_footers()
+            
+        except Exception as e:
+            self.logger.exception("Error during single-page header/footer detection: %s", e)
+    
+    def _mark_related_header_footer_textboxes(self, uploaded_by_elem, page_elements, uploaded_by_candidates, 
+                                            header_zone_threshold, footer_zone_threshold):
+        try:
+            uploaded_by_y = uploaded_by_elem['y0_pct']
+            page_num = uploaded_by_elem['page_num']
+            
+            # Calculate threshold boundaries
+            header_zone_min_y = 1 - header_zone_threshold  # Top threshold% of page
+            footer_zone_max_y = footer_zone_threshold       # Bottom threshold% of page
+            
+            self.logger.debug("Marking related textboxes for 'uploaded by' pattern on page %d (y=%.3f)", 
+                            page_num, uploaded_by_y)
+            self.logger.debug("Header zone: y >= %.3f, Footer zone: y <= %.3f", 
+                            header_zone_min_y, footer_zone_max_y)
+            
+            for elem in page_elements:
+                # Skip if it's the same element or different page
+                if elem['textbox'] == uploaded_by_elem['textbox'] or elem['page_num'] != page_num:
+                    continue
+                
+                # Skip if already marked by uploaded_by detection (to avoid double processing)
+                if elem.get('marked_by_uploaded_by'):
+                    continue
+                
+                elem_y = elem['y0_pct']
+                
+                # Mark textboxes above the 'uploaded by' pattern as headers 
+                # BUT only if they are in the header zone area
+                if elem_y > uploaded_by_y and elem_y >= header_zone_min_y:
+                    elem['is_header_zone'] = True
+                    elem['marked_by_uploaded_by'] = True
+                    self.logger.debug("Marked textbox above 'uploaded by' as header (in header zone): page=%d, y=%.3f, text='%s'", 
+                                    page_num, elem_y, elem['text'][:30])
+                    
+                # Mark textboxes below the 'uploaded by' pattern as footers
+                # BUT only if they are in the footer zone area  
+                elif elem_y < uploaded_by_y and elem_y <= footer_zone_max_y:
+                    elem['is_footer_zone'] = True
+                    elem['marked_by_uploaded_by'] = True
+                    uploaded_by_candidates.append(elem)  # Add to uploaded_by_candidates for grouping
+                    self.logger.debug("Marked textbox below 'uploaded by' as footer (in footer zone): page=%d, y=%.3f, text='%s'", 
+                                    page_num, elem_y, elem['text'][:30])
+                
+                # Log textboxes that are above/below but outside threshold areas
+                elif elem_y > uploaded_by_y and elem_y < header_zone_min_y:
+                    self.logger.debug("Textbox above 'uploaded by' but outside header zone (y=%.3f < %.3f): '%s'", 
+                                    elem_y, header_zone_min_y, elem['text'][:30])
+                elif elem_y < uploaded_by_y and elem_y > footer_zone_max_y:
+                    self.logger.debug("Textbox below 'uploaded by' but outside footer zone (y=%.3f > %.3f): '%s'", 
+                                    elem_y, footer_zone_max_y, elem['text'][:30])
+                    
+        except Exception as e:
+            self.logger.exception("Error marking related textboxes for 'uploaded by' pattern: %s", e)
+    
+    def _group_similar_elements(self, candidates, similarity_func, threshold, total_pages, min_occurrence_rate):
+        groups = []
+        used_elements = set()
+
+        for candidate in candidates:
+            if id(candidate) in used_elements:
+                continue
+                
+            # Find all similar elements
+            similar_elements = [candidate]
+            used_elements.add(id(candidate))
+            
+            for other in candidates:
+                if id(other) in used_elements:
+                    continue
+                    
+                if similarity_func(candidate, other) >= threshold:
+                    similar_elements.append(other)
+                    used_elements.add(id(other))
+            
+            # Check if this group meets minimum occurrence criteria
+            occurrence_rate = len(similar_elements) / total_pages
+            self.logger.debug("Group with %d elements has occurrence rate %.3f (min required: %.3f)", 
+                            len(similar_elements), occurrence_rate, min_occurrence_rate)
+            if occurrence_rate >= min_occurrence_rate:
+                # Calculate representative text and position
+                texts = [elem['text'] for elem in similar_elements]
+                representative_text = max(set(texts), key=texts.count)
+                
+                avg_x0_pct = sum(elem['x0_pct'] for elem in similar_elements) / len(similar_elements)
+                avg_y0_pct = sum(elem['y0_pct'] for elem in similar_elements) / len(similar_elements)
+                
+                groups.append({
+                    'elements': similar_elements,
+                    'representative_text': representative_text,
+                    'avg_x0_pct': avg_x0_pct,
+                    'avg_y0_pct': avg_y0_pct,
+                    'occurrence_rate': occurrence_rate,
+                    'pages': [elem['page_num'] for elem in similar_elements]
+                })
+        
+        return groups
+    
+    def _extend_headers_footers_by_line(self, page_elements, line_tolerance=0.02):
+        try:
+            
+            # Group page elements by page for easier processing
+            pages_dict = {}
+            for elem in page_elements:
+                page_num = elem['page_num']
+                if page_num not in pages_dict:
+                    pages_dict[page_num] = []
+                pages_dict[page_num].append(elem)
+            
+            # Process headers
+            for header_group in self.adaptive_headers:
+                self._extend_group_by_line(header_group, pages_dict, 'header', line_tolerance)
+            
+            # Process footers  
+            for footer_group in self.adaptive_footers:
+                self._extend_group_by_line(footer_group, pages_dict, 'footer', line_tolerance)
+                
+            self.logger.info("Extended headers/footers to include same-line textboxes")
+            
+        except Exception as e:
+            self.logger.exception("Error extending headers/footers by line: %s", e)
+    
+    def _extend_group_by_line(self, group, pages_dict, group_type, line_tolerance):
+        extended_elements = []
+        
+        # For each element in the group, find other textboxes on the same line
+        for element in group['elements']:
+            page_num = element['page_num']
+            element_y = element['y0_pct']
+            
+            if page_num not in pages_dict:
+                continue
+                
+            # Find textboxes on the same line (within tolerance)
+            same_line_elements = []
+            for other_elem in pages_dict[page_num]:
+                # Skip if it's the same element
+                if other_elem['textbox'] == element['textbox']:
+                    continue
+                    
+                # Check if it's on the same line (within tolerance)
+                y_diff = abs(other_elem['y0_pct'] - element_y)
+                if y_diff <= line_tolerance:
+                    # Check if this element is not already marked as header/footer
+                    if not self._is_already_marked_as_header_footer(other_elem):
+                        same_line_elements.append(other_elem)
+                        
+            # Add same-line elements to the group
+            for same_line_elem in same_line_elements:
+                extended_elements.append(same_line_elem)
+                self.logger.debug("Extended %s on page %d: added '%s' (y=%.3f) to line with '%s' (y=%.3f)", 
+                                group_type, page_num, same_line_elem['text'][:30], 
+                                same_line_elem['y0_pct'], element['text'][:30], element_y)
+        
+        # Add extended elements to the group
+        if extended_elements:
+            group['elements'].extend(extended_elements)
+            self.logger.info("Extended %s group '%s' with %d additional same-line elements", 
+                           group_type, group.get('representative_text', '')[:40], len(extended_elements))
+    
+    def _is_already_marked_as_header_footer(self, element):
+        # Check if element is in any header group
+        for header_group in self.adaptive_headers:
+            for header_elem in header_group['elements']:
+                if header_elem['textbox'] == element['textbox'] and header_elem['page_num'] == element['page_num']:
+                    return True
+        
+        # Check if element is in any footer group  
+        for footer_group in self.adaptive_footers:
+            for footer_elem in footer_group['elements']:
+                if footer_elem['textbox'] == element['textbox'] and footer_elem['page_num'] == element['page_num']:
+                    return True
+                    
+        return False
+
+    def _apply_adaptive_headers_footers(self):
+        try:
+            # Apply headers
+            for header_group in self.adaptive_headers:
+                for element in header_group['elements']:
+                    page_num = element['page_num']
+                    textbox = element['textbox']
+                    
+                    if page_num in self.all_pgs and textbox in self.all_pgs[page_num].all_tbs:
+                        self.all_pgs[page_num].all_tbs[textbox] = "header"
+                        self.logger.debug("Applied adaptive header on page %d: '%s'", 
+                                        page_num, element['text'][:50])
+            
+            # Apply footers
+            for footer_group in self.adaptive_footers:
+                for element in footer_group['elements']:
+                    page_num = element['page_num']
+                    textbox = element['textbox']
+                    
+                    if page_num in self.all_pgs and textbox in self.all_pgs[page_num].all_tbs:
+                        self.all_pgs[page_num].all_tbs[textbox] = "footer"
+                        self.logger.debug("Applied adaptive footer on page %d: '%s'", 
+                                        page_num, element['text'][:50])
+            
+            self.logger.info("Successfully applied adaptive headers and footers to pages")
+            
+        except Exception as e:
+            self.logger.exception("Error applying adaptive headers and footers: %s", e)
     
     def get_path_cache_xml(self):
         current_file = Path(__file__).resolve()       
@@ -369,8 +1243,40 @@ class Main:
         except Exception:
             return False
 
+    @staticmethod
+    def is_url_like(value):
+        return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', str(value)))
+    
+    def set_htmlbuilder(self):
+        if self.pdf_type in set(['acts']):
+            self.html_builder = self.get_htmlBuilder(self.pdf_type, self.has_doc_end)
+        elif self.pdf_type in set(['sebi_circulars']):
+            self.html_builder = self.get_htmlBuilder(self.pdf_type)
+        else:
+            self.html_builder = self.get_htmlBuilder(self.pdf_type)
+
+    def process_scanned_copy(self, pdf_type, base_name_of_file, start_page,
+                             end_page):
+        pages = ChromeLensParserTool(self.pdf_path)\
+                            .build_xml(start_page, end_page)
+        # self.print_page_xml(pages)
+        self.set_htmlbuilder()
+        self.logger.debug("Extracting header and footer info...")
+        self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
+        self.logger.debug("Processing content from pages...")
+        if pdf_type == 'acts':
+            self.process_pages_acts(pdf_type)
+        elif pdf_type == 'sebi_circulars':
+            self.process_pages_sebi_circulars(pdf_type)
+        elif pdf_type == 'sebi':
+            self.process_pages_sebi(pdf_type)
+        else:
+            self.process_pages(pdf_type)
+        self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
+    
     # --- parse pdf using pdfminer to convert to XML ---       
-    def parsePDF(self, pdf_type):
+    def parsePDF(self, pdf_type, char_margin, word_margin, line_margin, \
+                start_page, end_page):
         try:
             if not os.path.exists(self.pdf_path):
                 self.logger.error(f"[✖] Input file not found: {self.pdf_path}")
@@ -379,13 +1285,30 @@ class Main:
             if not self.is_pdf_file(self.pdf_path):
                 self.logger.error(f"[✖] Input is not a valid PDF file: {self.pdf_path}")
                 return False
-            
+
+            if self.is_url_like(self.output_dir):
+                self.logger.error(
+                    f"[✖] -o/--output-directory ('{self.output_dir}') looks like a URL, "
+                    f"not a local filesystem path where output files get written. Did you "
+                    f"mean to pass that as -pu/--public-base-url instead? The public URL "
+                    f"used for IIIF manifest links is always supplied separately via "
+                    f"-pu/--public-base-url (or the PUBLIC_BASE_URL env var) and never "
+                    f"derived from output_dir."
+                )
+                return False
+
             base_name_of_file = os.path.splitext(os.path.basename(self.pdf_path))[0]
             self.logger.info("Starting PDF parsing for: %s", self.pdf_path)
+            if self.is_scanned_copy:
+                self.process_scanned_copy(pdf_type, base_name_of_file, start_page, 
+                                          end_page)
+                return True
+            
             cache_xml_path = self.get_path_cache_xml()
             self.xml_path =  cache_xml_path / f"{base_name_of_file}.xml"
             self.logger.debug("Converting PDF to XML...")
-            self.parserTool.convert_to_xml(self.pdf_path,self.xml_path)
+            self.parserTool.convert_to_xml(self.pdf_path,self.xml_path, self.pdf_type, \
+                                           char_margin, word_margin, line_margin)
 
             
             if not os.path.exists(self.xml_path):
@@ -393,31 +1316,174 @@ class Main:
                 return False
 
             self.logger.debug("Parsing pages from XML: %s", self.xml_path)
-            pages = self.parserTool.get_pages_from_xml(self.xml_path)
-            self.logger.debug("Extracting header and footer info...")
-            self.get_page_header_footer(pages)
-            self.logger.debug("Processing content from pages...")
-            if pdf_type == 'acts':
-                self.process_pages_acts(pdf_type)
-            elif pdf_type == 'sebi':
-                self.process_pages_sebi(pdf_type)
+            pages = self.parserTool.get_pages_from_xml(self.xml_path, start_page, end_page)
+            if pages:
+                self.set_htmlbuilder()
+                self.logger.debug("Extracting header and footer info...")
+                self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
+                self.logger.debug("Processing content from pages...")
+                if pdf_type == 'acts':
+                    self.process_pages_acts(pdf_type)
+                elif pdf_type == 'sebi_circulars':
+                    self.process_pages_sebi_circulars(pdf_type)
+                elif pdf_type == 'sebi':
+                    self.process_pages_sebi(pdf_type)
+                else:
+                    self.process_pages(pdf_type)
+                self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
             else:
-                self.process_pages(pdf_type)
-            self.print_labels(pdf_type)
-            self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
+                # if pdf_type in {'egazette'}:
+                #     self.logger.info('using chrome lens for the scanned copy')
+                #     self.html_builder = HTMLBuilderChromeLens(self.pdf_path)
+                # else:
+                    self.is_scanned_copy = True
+                    self.process_scanned_copy(pdf_type, base_name_of_file,
+                                              start_page, end_page)
+
+            if pdf_type in {'egazette', 'sebi'}:
+                self.write_manifest()
+
             return True
         except Exception as e:
             self.logger.exception("Exception occurred while parsing PDF: %s", e)
             return False
 
+    def print_page_xml(self, pages):
+        import xml.etree.ElementTree as ET
+        from xml.dom import minidom
+        for page_el in pages:
+            raw = ET.tostring(page_el, encoding="unicode")
+            pretty = minidom.parseString(raw).toprettyxml(indent="  ")
+            pretty = "\n".join(
+                line for line in pretty.split("\n") if line.strip()
+            )
+            self.logger.info(pretty)
+            
+    
+    def escape_inline_markup(self, content):
+        if not content:
+            return content
 
+        pattern = r'(?<!\\)([*_])'
+
+        return re.sub(
+            pattern,
+            r'\\\1',
+            content
+        )
     
     # --- func for writing the html content to the desired output file ---
-    def write_html(self, content):
+    def write_manifest(self):
+        if not self.unique_images:
+            self.logger.info("No images to build an IIIF manifest from; skipping manifest generation.")
+            return None
+        if self.is_url_like(self.output_dir):
+            self.logger.error(
+                f"[✖] output_dir ('{self.output_dir}') looks like a URL, not a local "
+                f"filesystem path - skipping manifest generation. Use -pu/--public-base-url "
+                f"(or PUBLIC_BASE_URL) to supply the public URL instead."
+            )
+            return None
+        if not self.public_base_url and not os.environ.get("PUBLIC_BASE_URL"):
+            self.logger.warning(
+                "[!] No -pu/--public-base-url (or PUBLIC_BASE_URL env var) supplied - "
+                "IIIF manifest and HTML manifest-link URLs will fall back to "
+                "http://localhost:8000, which is almost certainly wrong outside local "
+                "development."
+            )
+        try:
+            output_dir = Path(self.output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+            # Build manifest from finalized images collected in self.unique_images
+            manifest_builder = IIIFManifest(
+                    Path(output_dir),
+                    label=Path(self.pdf_path).stem,
+                    base_prez_uri=self.public_base_url,
+                    server_root=self.server_root,
+                    rights=self.rights,
+                    provider_id=self.provider_id,
+                    provider_name=self.provider_name,
+                    attribution=self.attribution
+                )
+
+            # Page ids come from the source XML as strings (e.g. "1", "12"), so a plain
+            # lexicographic sort would order page 12 before page 2 - sort numerically
+            # where possible, falling back to the raw value for anything non-numeric.
+            def page_sort_key(p):
+                return (0, int(p)) if str(p).isdigit() else (1, str(p))
+
+            image_entries = []
+            for meta in self.unique_images.values():
+                p = meta.get('path', None)
+                if not p:
+                    continue
+                try:
+                    pp = Path(p)
+                    if not pp.exists():
+                        continue
+                except Exception:
+                    continue
+                image_entries.append({
+                    "path": pp,
+                    # Every page this (deduplicated) image appeared on, in reading order -
+                    # carried through so the manifest can label each image by its actual
+                    # source page(s) instead of a meaningless "Image N" counter.
+                    "pages": sorted(meta.get("pages", set()), key=page_sort_key),
+                    # OCR text already extracted from the image itself (Figure.py runs a
+                    # real OCR pass to decide whether to keep the image at all) - surfaced
+                    # here as a IIIF "supplementing" annotation instead of being discarded
+                    # after that gate check, so it isn't computed and thrown away.
+                    "text": meta.get("text") or None,
+                    "language": meta.get("language"),
+                })
+
+            # Present in the order the images actually appear in the source document
+            # (first page each deduplicated image was seen on), not dict-insertion order.
+            image_entries.sort(key=lambda e: page_sort_key(e["pages"][0]) if e["pages"] else (2, ""))
+
+            # "Generated from" must never leak the local filesystem path (server
+            # username, directory layout, repo/project structure) into what's a
+            # publicly-served manifest.json - only the filename itself carries useful
+            # provenance information, so strip the directory component entirely rather
+            # than embedding self.pdf_path verbatim.
+            manifest_path = manifest_builder.create_from_images(
+                image_entries, metadata={"Generated from": Path(self.pdf_path).name}
+            )
+            if manifest_path:
+                self.logger.info("Created IIIF manifest at %s", manifest_path)
+                self.manifest_url = manifest_builder.get_manifest_uri()
+            return manifest_path
+        except Exception as e:
+            self.logger.exception("Failed to create IIIF manifest: %s", e)
+            return None
+
+    def add_manifest_link_to_html(self, content):
+        if self.pdf_type not in {'egazette', 'sebi'} or not self.manifest_url:
+            return content
+        link_html = (
+            f'<p><a href="{self.manifest_url}" target="_blank">'
+            f'click here for IIIF manifest</a></p>\n'
+        )
+        if '<body>' in content:
+            return content.replace('<body>', '<body>\n' + link_html, 1)
+        return link_html + content
+
+    def write_html(self, content, start_page, end_page):
         if not content:
-            self.logger.warning('HTML content not available to save')
+            self.logger.warning(f'HTML content not generate for pdf pdth: {self.pdf_path}')
             return
-        filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +".html"
+        content = self.add_manifest_link_to_html(content)
+        try:
+            if start_page or end_page:
+                if start_page is None:
+                    start_page = 1
+                elif end_page is None:
+                    end_page = self.total_pgs - 1 + int(start_page)
+                filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +f"pg:{start_page}_pg:{end_page}.html"
+            else:
+                filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +".html"
+        except Exception as e:
+            filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +".html"
         try:
             output_dir = Path(self.output_dir)
 
@@ -433,12 +1499,49 @@ class Main:
             with output_path.open("w", encoding="utf-8") as f:
                 f.write(content)
 
-            self.logger.info("HTML written successfully to %s", output_path)
-
+            self.logger.info("content written successfully to %s", output_path)
         except Exception as e:
             self.logger.exception("Failed to write HTML content: %s", e)
+
+    def write_bluebell(self, content, start_page, end_page):
+        content = self.escape_inline_markup(content)
+        if not content:
+            self.logger.warning('Content not available to save')
+            return
+        try:
+            if start_page or end_page:
+                if start_page is None:
+                    start_page = 1
+                elif end_page is None:
+                    end_page = self.total_pgs - 1 + int(start_page)
+                filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +f"pg:{start_page}_pg:{end_page}.bluebell"
+            else:
+                filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +".bluebell"
+        except Exception as e:
+            filename =  os.path.splitext(os.path.basename(self.pdf_path))[0] +".bluebell"
+        try:
+            output_dir = Path(self.output_dir)
+
+            # Check if the directory exists
+            if not output_dir.exists():
+                output_dir.mkdir(parents=True, exist_ok=True)
+                self.logger.info(f"Created directory: {output_dir.resolve()}")
+            else:
+                self.logger.info(f"Directory already exists: {output_dir.resolve()}")
+
+            # Write the HTML content to the specified file
+            output_path = output_dir / filename
+            with output_path.open("w", encoding="utf-8") as f:
+                f.write(content)
+
+            self.logger.info("content written successfully to %s", output_path)
+
+        except Exception as e:
+            self.logger.exception("Failed to write  content: %s", e)
     
-    def clear_cache(self):
+    def clear_xml_cache(self):
+        if self.is_scanned_copy:
+            return
         if not hasattr(self, "xml_path") or not self.xml_path:
             self.logger.warning("No xml_path attribute set for this instance")
             return
@@ -480,10 +1583,12 @@ def get_arg_parser():
     parser = argparse.ArgumentParser(description="To automate pdf Parse and Convert to structured", add_help=True)
     parser.add_argument('-i','--input-filePath',dest='input_file_path',action='store',\
                         required=True,help='mention input file path')
-    parser.add_argument('-s','--section-startPage',dest='section_start_page', action='store',\
-                        type=int,required=False,help='mention section start page if exists')
-    parser.add_argument('-e','--section-endPage',dest='section_end_page', action='store',\
-                        type=int,required=False,help='mention section end page if exists')
+    parser.add_argument('-fp','--start-page',dest='start_page', action='store',\
+                        type=int,required=False, default=None, help='mention start page')
+    parser.add_argument('-lp','--end-page',dest='end_page', action='store',\
+                        type=int,required=False, default = None, help='mention end page')
+    parser.add_argument('-s', '--sidenotes', dest = 'has_sidenotes', action = 'store_true', \
+                        required = False, default = False, help = 'mention if pdf has sidenotes')
     parser.add_argument('-a','--amendments',dest= "is_amendment_pdf",action = "store_true",\
                         required = False,default=False, help = 'mention if pdf contains amendments')
     parser.add_argument('-l', '--loglevel', dest='loglevel', action='store',\
@@ -497,6 +1602,65 @@ def get_arg_parser():
                         required = False, default = False, help = "saves the intermediate xml in cache_xml folder")
     parser.add_argument('-t','--type', dest= 'pdf_type', action = 'store', \
                         required = False, help= 'which helps to process and convert html type = (sebi | acts)' )
+    parser.add_argument('-lm', '--line-margin', dest='line_margin', action='store', \
+                        required=False, default=None, help = 'if requires, set line margin threshold for pdf miner')
+    parser.add_argument('-cm', '--char-margin', dest='char_margin', action='store', \
+                        required=False, default=None, help = 'if requires, set char margin threshold for pdf miner')
+    parser.add_argument('-wm', '--word-margin', dest='word_margin', action='store', \
+                        required=False, default=None, help = 'if requires, set word margin threshold for pdf miner')
+    parser.add_argument('-de', '--doc-end', dest = 'has_doc_end', action = 'store_true', \
+                        required = False, default = False, help = 'mention if pdf has document end symbol (---)')
+    parser.add_argument('-fnc', '--footnote-continuation', dest='is_footnote_continuation', action = 'store_true', \
+                        required = False, default = False, help = 'mention if pdf has footnote that continued across the pages')
+    parser.add_argument('-mip', '--min-img-pixels', dest = 'min_img_pixels', action = 'store', \
+                      required = False,  default = 0,  help = 'minimum pixel area threshold for initial filtering (area = dimension^2). Images are further filtered based on text content detection.')
+    parser.add_argument('-ol', '--ocr-language', dest='ocr_language', action='store', \
+                      required=False, default='eng', choices=TESSERACT_LANGUAGES,
+                      help=f'tesseract language code for OCR (default: eng). One of: {", ".join(TESSERACT_LANGUAGES)}')
+    parser.add_argument('-sc', '--scanned-copy', dest = 'scanned_copy', action = 'store_true',
+                        required = False, default = False, help = 'mention if the pdf copy is scanned')
+    parser.add_argument('-te', '--table-extract', dest = 'table_extract', action = 'store_true',
+                        required = False, default = False, help = 'mention if the pdf has borderless table or pdf is scanned copy to extract table content')
+    parser.add_argument('-ftx', '--figure-text', dest = 'figure_text', action = 'store_true',
+                        required = False, default = False,
+                        help = 'extract OCR text for figures (checked against a fasttext language-confidence '
+                               'threshold) and include it in the html output; images without confident text are '
+                               'dropped. Default: keep every figure as-is, with no OCR/confidence check. Has no '
+                               'effect for acts/sebi_circulars (bluebell output never includes figure text).')
+    parser.add_argument('-pu', '--public-base-url', dest = 'public_base_url', action = 'store',
+                        required = False, default = None,
+                        help = 'public URL that --output-directory will be served from (e.g. '
+                               'https://gazettes.servantsofknowledge.in/gzdl/html/andhra_extraordinary/2025-01-01), '
+                               'used as the base for image/canvas/manifest URIs in the IIIF manifest (egazette/sebi types only). '
+                               'Falls back to the PUBLIC_BASE_URL env var, then http://localhost:8000.')
+    parser.add_argument('-sr', '--server-root', dest = 'server_root', action = 'store',
+                        required = False, default = None,
+                        help = 'local filesystem directory that acts as the web server\'s document root '
+                               '(e.g. /var/www), used only to compute the URL path segment between '
+                               '--public-base-url and "manifest/<pdfname>/..." in the IIIF manifest '
+                               '(egazette/sebi types only) - never affects where output files are written. '
+                               'output_dir must be located within it. If not given, output_dir itself is '
+                               'assumed to be the server root (no extra path segment).')
+    parser.add_argument('-rt', '--rights', dest = 'rights', action = 'store',
+                        required = False, default = None,
+                        help = 'IIIF manifest "rights" URI (a Creative Commons or RightsStatements.org '
+                               'license URI, e.g. https://creativecommons.org/publicdomain/mark/1.0/) '
+                               '(egazette/sebi types only). Omitted entirely if not supplied - never '
+                               'defaulted to a guessed license.')
+    parser.add_argument('-pi', '--provider-id', dest = 'provider_id', action = 'store',
+                        required = False, default = None,
+                        help = 'URI identifying the organization presenting the manifest (e.g. its '
+                               'homepage), used for the IIIF "provider" field (egazette/sebi types only). '
+                               'Requires --provider-name too to be added; ignored alone.')
+    parser.add_argument('-pn', '--provider-name', dest = 'provider_name', action = 'store',
+                        required = False, default = None,
+                        help = 'Display name of the organization presenting the manifest, used for the '
+                               'IIIF "provider" field (egazette/sebi types only). Requires --provider-id '
+                               'too to be added; ignored alone.')
+    parser.add_argument('-at', '--attribution', dest = 'attribution', action = 'store',
+                        required = False, default = None,
+                        help = 'Attribution text for the IIIF manifest\'s "requiredStatement" (egazette/sebi '
+                               'types only). Omitted entirely if not supplied.')
     return parser
 
 
@@ -532,26 +1696,55 @@ def setup_logging(level, filename = None):
         initialize_stream_logging(loglevel)
 
 if __name__ == "__main__":
-    logger = logging.getLogger("parser-and-converter")
+    logger = logging.getLogger(__name__)
 
     parser = get_arg_parser()
     args = parser.parse_args()
     setup_logging(args.loglevel, filename = args.logfile)
     pdf_path = args.input_file_path
     logger.debug(f"Input PDF path attached to process-{pdf_path}")
-    start = args.section_start_page
-    logger.debug(f"Mentioned section start page-{start}")
-    end = args.section_end_page
-    logger.debug(f"Mentioned section end page-{end}")
+    start_page = None
+    if args.start_page:
+        start_page = int(args.start_page)
+    logger.debug(f"Mentioned section start page-{start_page}")
+    end_page = None
+    if args.end_page:
+        end_page = int(args.end_page)
+        logger.debug(f"Mentioned section end page-{end_page}")
     is_amendment_pdf = args.is_amendment_pdf
     logger.debug(f"Is the pdf contains amendments - {"Yes" if is_amendment_pdf else "No"}")
+    has_sidenotes = args.has_sidenotes
+    logger.debug(f"Is the pdf contains side notes - {"Yes" if has_sidenotes else "No"}")
     output_dir = args.output_dir
-    main = Main(pdf_path,start,end,is_amendment_pdf,output_dir, args.pdf_type)
-    is_success = main.parsePDF(args.pdf_type)
+    has_doc_end = args.has_doc_end
+    is_footnote_continuation = args.is_footnote_continuation
+    min_img_pixels = args.min_img_pixels
+    if min_img_pixels and isinstance(min_img_pixels, str):
+        min_img_pixels = int(min_img_pixels)
+    ocr_language = args.ocr_language
+    is_scanned_copy = args.scanned_copy
+    table_extract = args.table_extract
+    figure_text = args.figure_text
+    public_base_url = args.public_base_url
+    server_root = args.server_root
+    rights = args.rights
+    provider_id = args.provider_id
+    provider_name = args.provider_name
+    attribution = args.attribution
+    main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
+                is_footnote_continuation, min_img_pixels, ocr_language,
+                is_scanned_copy, table_extract, public_base_url, server_root,
+                rights, provider_id, provider_name, attribution,
+                figure_text)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+    # margins = compute_optimal_char_margin(pdf_path)
+    char_margin = args.char_margin # str(margins)
+    word_margin = args.word_margin # str(margins['word_margin'])
+    line_margin = args.line_margin # str(margins['line_margin'])
+    logger.info(f'char_margin : {char_margin}, word_margin: {word_margin}, line_margin: {line_margin}')
+    is_success = main.parsePDF(args.pdf_type, char_margin, word_margin, line_margin, \
+                               start_page, end_page)
     if is_success:
-        main.buildHTML(end)
+        main.buildHTML(start_page, end_page) #end)
     main.clear_cache_pdf()
     if not args.keep_xml:
-        main.clear_cache()
-  
-    
+        main.clear_xml_cache()

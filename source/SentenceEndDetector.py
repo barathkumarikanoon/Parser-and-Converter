@@ -37,6 +37,7 @@ class LegalSentenceDetector:
     def __init__(self):
         self._abbr_clean = {abbr.lower() for abbr in LEGAL_ABBREVIATIONS}
         self.same_line_tolerance = 0.25
+        self.column_bounds = None
 
     def is_real_sentence_end(self, text, next_text, at_page_end, text_tb, next_text_tb, pg_height, pg_width):
       """
@@ -77,7 +78,7 @@ class LegalSentenceDetector:
               return False
         
       # Continuation punctuation (:-, ---, ...)
-      continuation_punct = [":-", "---", "...", '—'] #'".','."',"'.",".'"]
+      continuation_punct = [":-", "---", "...", '—', '…'] #'".','."',"'.",".'"]
       for cp in continuation_punct:
           if s.endswith(cp):
               return False if at_page_end else True
@@ -302,18 +303,6 @@ class LegalSentenceDetector:
             return True
 
     def _normalize_bbox(self, box: BBox):
-        """
-        Normalize a bounding box to the form (x0, y0, x1, y1)
-        where:
-            x0 <= x1
-            y0 <= y1
-
-        Args:
-            box: A tuple (x0, y0, x1, y1) that may be unordered.
-
-        Returns:
-            Normalized BBox
-        """
         if not box or len(box) != 4:
             raise ValueError(f"Invalid BBox: {box}")
 
@@ -335,22 +324,7 @@ class LegalSentenceDetector:
         return False
 
 
-    def indent_check(self, text_tb, next_text_tb, pg_width: float) -> bool:
-            """
-            Determines whether two text boxes on different lines indicate an indent pattern.
-
-            Conditions:
-            - First box ends ≥ 30% of page width away from right margin.
-            - Second box starts ≥ 40% of page width from left margin.
-
-            Args:
-                text_tb: First textbox object.
-                next_text_tb: Second textbox object.
-                pg_width: Width of the page.
-
-            Returns:
-                bool: True if indent pattern is detected, False otherwise.
-            """
+    def indent_check(self, text_tb, next_text_tb, pg_width):
             # Attempt to get character-level bounding boxes
             box1 = getattr(text_tb, "get_last_char_coords", lambda: None)() \
                 or getattr(text_tb, "coords", None) \
@@ -360,22 +334,163 @@ class LegalSentenceDetector:
                 or getattr(next_text_tb, "coords", None) \
                 or getattr(next_text_tb, "bbox", None)
 
-            if not box1 or not box2:
+            if not box1:
                 return False
-
+            
+            if not box2:
+                text = text_tb.extract_text_from_tb().strip()
+                if text.endswith((":-", "---", "...", '—', '…','.','?','!',':',';')):
+                    return True
+                return False
+            
             x0a, _, x1a, _ = self._normalize_bbox(box1)
             x0b, _, _, _ = self._normalize_bbox(box2)
 
-            # Condition 1: First box ends ≥ 30% of page width from right margin
-            right_gap_a = pg_width - x1a
-            if right_gap_a >= 0.3 * pg_width:
+            left_a, right_a = self._column_span_for(x0a, x1a, pg_width)
+            left_b, right_b = self._column_span_for(x0b, x0b, pg_width)
+            width_a = max(right_a - left_a, 1.0)
+            width_b = max(right_b - left_b, 1.0)
+
+            # Condition 1: First box ends ≥ 20% of its column width from that column's right edge
+            right_gap_a = right_a - x1a
+            if right_gap_a >= 0.2 * width_a:
                 return True
 
-            # Condition 2: Second box starts ≥ 40% of page width from left margin
-            if x0b >= 0.35 * pg_width:
+            # Condition 2: Second box starts ≥ 35% of its column width from that column's left edge
+            left_gap_b = x0b - left_b
+            if left_gap_b >= 0.35 * width_b:
                 return True
 
             return False
 
+    def _column_span_for(self, x0, x1, pg_width):
+        if not self.column_bounds:
+            return 0.0, pg_width
+        center = (x0 + x1) / 2.0
+        for col_x0, col_x1 in self.column_bounds:
+            if col_x0 <= center <= col_x1:
+                return col_x0, col_x1
+        nearest = min(
+            self.column_bounds,
+            key=lambda col: min(abs(center - col[0]), abs(center - col[1]))
+        )
+        return nearest
 
-   
+class SentenceMaker:
+    def clean_text(self, raw_text):
+        lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+        merged = self._merge_lines(lines)
+        return [self._normalize_punctuation(line) for line in merged]
+    
+    def _is_list_marker(self, line: str) -> bool:
+        l = line.strip()
+
+        bullet_patterns = [
+            r"^[\-•●▪♦▫]{1,3}$",
+            r"^[\-•●▪♦▫]{1,3}\s+.+"
+        ]
+        for p in bullet_patterns:
+            if re.match(p, l):
+                return True
+
+        numeric_patterns = [
+            r"^\d+$",                     # 1
+            r"^\d+\.$",                   # 1.
+            r"^\d+\)$",                   # 1)
+            r"^\(\d+\)$",                 # (1)
+            r"^\d+\.\d+$",                # 1.1
+            r"^\d+(?:\.\d+){2,}$",        # 1.1.1, 2.4.10.3
+            r"^\(\d+(?:\.\d+)+\)$",       # (1.1.1)
+        ]
+        for p in numeric_patterns:
+            if re.match(p, l):
+                return True
+
+
+        alpha_patterns = [
+            r"^[A-Za-z]\.$",              # a., A.
+            r"^[A-Za-z]\)$",              # a), A)
+            r"^\([A-Za-z]\)$",            # (a), (A)
+        ]
+        for p in alpha_patterns:
+            if re.match(p, l):
+                return True
+
+        roman = r"(?:i|ii|iii|iv|v|vi|vii|viii|ix|x|xi|xii|xiii|xiv|xv|xvi|xvii|xviii|xix|xx|xl|l|c|d|m)"
+        roman_patterns = [
+            rf"^{roman}\.$",
+            rf"^{roman}\)$",
+            rf"^\({roman}\)$"
+        ]
+        for p in roman_patterns:
+            if re.match(p, l, re.IGNORECASE):
+                return True
+
+        return False
+
+    def _ends_sentence(self, line: str) -> bool:
+        return bool(re.search(r"[.!?]$", line.strip()))
+
+    def _is_title_like(self, line: str) -> bool:
+        words = line.split()
+        if not words:
+            return False
+        count = sum(1 for w in words if w[:1].isupper())
+        return count >= len(words) * 0.6
+
+    def _is_fragment(self, line: str) -> bool:
+        if len(line.split()) <= 2:
+            return True
+        if not re.search(r"[,.!?;:]", line):
+            return True
+        return False
+
+    def _should_merge(self, prev: str, curr: str) -> bool:
+        prev = prev.strip()
+        curr = curr.strip()
+
+        if self._is_list_marker(curr):
+            return False
+
+        if self._ends_sentence(prev):
+            return False
+
+        if curr[:1].islower():
+            return True
+
+        if self._is_fragment(prev):
+            return True
+
+        if self._is_title_like(prev) and self._is_title_like(curr):
+            return True
+
+        if re.search(r"[a-zA-Z]", prev) and not self._ends_sentence(prev):
+            return True
+
+        return False
+
+    def _merge_lines(self, lines):
+        merged = []
+        buffer = ""
+
+        for line in lines:
+            if not buffer:
+                buffer = line
+                continue
+
+            if self._should_merge(buffer, line):
+                buffer += " " + line
+            else:
+                merged.append(buffer)
+                buffer = line
+
+        if buffer:
+            merged.append(buffer)
+
+        return merged
+
+    def _normalize_punctuation(self, text: str) -> str:
+        text = re.sub(r"\s+", " ", text)        # collapse spaces
+        text = re.sub(r"\s+([,.;:])", r"\1", text)  # remove space before punctuation
+        text = re.sub(r",(\S)", r", \1", text)  # ensure space after commas
+        return text.strip()
