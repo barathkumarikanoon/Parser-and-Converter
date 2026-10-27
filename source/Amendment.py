@@ -4,6 +4,7 @@ import unicodedata
 
 from .SentenceEndDetector import SENTENCE_END_CHAR_CLASS, INDIC_SENTENCE_END_CHARS
 from .Utils import INDIC_WORD_CHARS, INDIC_DIGIT_CHARS, indic_annotation_alternation, is_separator_line
+from .Table import STYLE_BOLD_FONT_RE, STYLE_ITALIC_FONT_RE, UNDERLINE_BELOW_TOLERANCE, UNDERLINE_ABOVE_RATIO, UNDERLINE_X_TOLERANCE
 
 SECTION_HEADING_ENUM_RE = re.compile(r'^(?:[IVXLC]{1,5}|[A-Z' + INDIC_WORD_CHARS + r'])\.\s+\S|^Re:\s+\S')
 LIST_ITEM_RE = re.compile(
@@ -147,6 +148,10 @@ class Amendment:
         self.doc_right = None
         self.clause_tracker = ClauseTracker()
         self.bq2_pending_trigger = False
+        self.bq2_pending_title = False
+        self.bq2_soft_trigger = False
+        self.bq2_soft_quote = False
+        self.bq2_soft_text = ""
         self.bq2_mode = None
         self.bq2_list_stack = []
         self.bq2_list_parent = None
@@ -590,6 +595,7 @@ class Amendment:
         return margins
 
     BQ2_TRIGGER_RE = re.compile(r'(?:[:：]|;\s*[\-‐‑‒–—―−])[\s\-‐‑‒–—―−:：]*["“\'‘]?\s*$')
+    BQ2_SOFT_TRIGGER_RE = re.compile(r'[,;，；]\s*["“\'‘]?\s*$')
     BQ2_ITALIC_FONT_RE = re.compile(r'italic|oblique', re.IGNORECASE)
     BQ2_ITALIC_RATIO = 0.9
     BQ2_MAIN_CLAUSE_RE = re.compile(r'^\s*(\d{1,3}(?:\.\d{1,3}){0,3})([.):]?)(?=\s)')
@@ -601,6 +607,7 @@ class Amendment:
     BQ2_SCRIPT_LETTERS = {}
     BQ2_DECIMAL_MARKER_RE = re.compile(r'^\s*\(?(\d{1,3}(?:\.\d{1,3})+)\.?\)?\s+(?=\S)')
     BQ2_QUOTE_OPEN_RE = re.compile(r'^["“‘\'«„]')
+    BQ2_QUOTE_CLOSE_RE = re.compile(r'["”»][\s.,;:)\]]*$')
     BQ2_TERMINAL_RE = re.compile(r'[.?!' + INDIC_SENTENCE_END_CHARS + r'][\)\'"”’\]]*\s*$')
     BQ2_SECTION_RE = re.compile(r'^\s*([IVXLCDM]+|[ivxlcdm]+)\.?\s+(?=\S)')
     BQ2_HEADING_MARKER_RE = re.compile(r'^\s*(?:\(?[^\W_]{1,6}[.)]\s*)+')
@@ -743,6 +750,7 @@ class Amendment:
 
     def end_bq2_mode(self):
         self.bq2_mode = None
+        self.bq2_soft_quote = False
         self.bq2_quote_in_list = False
         self.bq2_list_stack = []
         self.bq2_list_parent = None
@@ -845,6 +853,80 @@ class Amendment:
                 if cls.BQ2_ITALIC_FONT_RE.search(char.attrib.get("font", "")) or 'i' in char.attrib.get("fstyle", ""):
                     italic += 1
         return total > 0 and italic / total >= cls.BQ2_ITALIC_RATIO
+
+    @classmethod
+    def textlines_italic_after_marker(cls, textlines, text):
+        match = cls.BQ2_LIST_MARKER_RE.match(text)
+        if not match:
+            return False
+        skip = len(match.group(0).strip())
+        total = 0
+        italic = 0
+        for textline in textlines:
+            for char in textline.findall("text"):
+                if not char.text or not char.text.strip():
+                    continue
+                if skip > 0:
+                    skip -= 1
+                    continue
+                total += 1
+                if cls.BQ2_ITALIC_FONT_RE.search(char.attrib.get("font", "")) or 'i' in char.attrib.get("fstyle", ""):
+                    italic += 1
+        return total > 0 and italic / total >= cls.BQ2_ITALIC_RATIO
+
+    @staticmethod
+    def page_underline_segments(page):
+        segments = []
+        try:
+            for tag in ('rect', 'line', 'curve'):
+                for el in page.page_in_xml.findall(f'.//{tag}'):
+                    try:
+                        x0, y0, x1, y1 = map(float, el.attrib['bbox'].split(','))
+                    except (KeyError, ValueError):
+                        continue
+                    if x1 - x0 <= 0 or x1 - x0 > 0.7 * page.pg_width:
+                        continue
+                    if not page.is_line_like((x0, y0, x1, y1)) or page.is_table_line((x0, y0, x1, y1)):
+                        continue
+                    segments.append((x0, max(y0, y1), x1))
+        except Exception:
+            return []
+        return segments
+
+    @classmethod
+    def row_is_title(cls, row, underlines):
+        styles = ((STYLE_BOLD_FONT_RE, 'b'), (STYLE_ITALIC_FONT_RE, 'i'))
+        all_styled = [True, True, True]
+        seen = False
+        has_upper = False
+        has_lower = False
+        for line in row["lines"]:
+            for char in line["el"].findall("text"):
+                if not char.text or not any(unicodedata.category(c)[0] in 'LNM' for c in char.text):
+                    continue
+                seen = True
+                has_upper = has_upper or any(c.isupper() for c in char.text)
+                has_lower = has_lower or any(c.islower() for c in char.text)
+                font = char.attrib.get("font", "")
+                fstyle = char.attrib.get("fstyle", "")
+                for idx, (font_re, flag) in enumerate(styles):
+                    if not (font_re.search(font) or flag in fstyle):
+                        all_styled[idx] = False
+                if all_styled[2] and 'u' not in fstyle:
+                    covered = False
+                    try:
+                        cx0, cy0, cx1, cy1 = map(float, char.attrib['bbox'].split(','))
+                    except (KeyError, ValueError):
+                        cx0 = None
+                    if cx0 is not None:
+                        mid = (cx0 + cx1) / 2
+                        low = cy0 - UNDERLINE_BELOW_TOLERANCE
+                        high = cy0 + UNDERLINE_ABOVE_RATIO * (cy1 - cy0)
+                        covered = any(low <= uy <= high and ux0 - UNDERLINE_X_TOLERANCE <= mid <= ux1 + UNDERLINE_X_TOLERANCE
+                                      for ux0, uy, ux1 in underlines)
+                    if not covered:
+                        all_styled[2] = False
+        return seen and (any(all_styled) or (has_upper and not has_lower))
 
     def collect_bq2_rows(self, page):
         pg_num = getattr(page, 'pg_num', '?')
@@ -1052,6 +1134,8 @@ class Amendment:
                 fresh = start and depth == len(self.bq2_list_stack) - 1
                 level["text"] = row["text"] if fresh else level.get("text", "") + " " + row["text"]
 
+        page_underlines = self.page_underline_segments(page)
+
         gaps = sorted(
             rows[i - 1]["y_top"] - rows[i]["y_top"] for i in range(1, len(rows))
             if 0 < rows[i - 1]["y_top"] - rows[i]["y_top"] <= 3.0 * rows[i]["height"]
@@ -1082,6 +1166,8 @@ class Amendment:
             flows_on = (prev_full or self.bq2_prev_start) and tight \
                 and any(abs(row_x0 - edge) <= indent_tol for edge in edges)
             pending = self.bq2_pending_trigger
+            pending_title = self.bq2_pending_title
+            soft_pending = self.bq2_soft_trigger
             if self.bq2_mode is not None and is_separator_line(text):
                 if self.bq2_mode == "list":
                     set_list(row, False)
@@ -1089,11 +1175,15 @@ class Amendment:
                     row["category"] = "blockquote"
                 continue
             self.bq2_pending_trigger = bool(self.BQ2_TRIGGER_RE.search(text))
+            self.bq2_soft_trigger = not self.bq2_pending_trigger and bool(self.BQ2_SOFT_TRIGGER_RE.search(text))
+            self.bq2_pending_title = self.bq2_pending_trigger and self.bq2_mode is None \
+                and self.row_is_title(row, page_underlines)
 
             if spans_between(row_idx):
                 if self.bq2_mode == "italic":
                     self.end_bq2_mode()
                 pending = False
+                soft_pending = False
 
             is_italic = self.textlines_italic([l["el"] for l in row["lines"]])
             planned = (pg_num, round(row["y_top"], 1)) in self.bq2_main_plan
@@ -1105,7 +1195,7 @@ class Amendment:
                 self.remember_bq2_row(row)
                 continue
             if self.bq2_mode == "italic":
-                if is_italic and not planned:
+                if (is_italic or self.textlines_italic_after_marker([l["el"] for l in row["lines"]], text)) and not planned:
                     row["category"] = "blockquote"
                     self.remember_bq2_row(row)
                     continue
@@ -1210,6 +1300,14 @@ class Amendment:
                     self.remember_bq2_row(row)
                     continue
 
+            if self.bq2_soft_quote:
+                if self.bq2_mode != "quote":
+                    self.bq2_soft_quote = False
+                elif not self.BQ2_QUOTE_CLOSE_RE.search(self.bq2_soft_text):
+                    self.bq2_soft_text += " " + text
+                else:
+                    self.end_bq2_mode()
+
             if self.bq2_mode == "quote":
                 if self.bq2_quote_in_list and not prev_midsentence and self.resume_bq2_list(readings, row_x0, indent_tol):
                     self.bq2_quote_in_list = False
@@ -1256,15 +1354,29 @@ class Amendment:
                     set_list(row, True)
                     row["inline"] = self.find_inline_markers(text, self.bq2_list_stack[-1])
                     self.logger.debug(f"blockquote_v2 list opened on page {pg_num}: {text[:60]}")
-                elif readings or nums is not None:
+                elif (readings or nums is not None) and not pending_title:
                     self.bq2_mode = "quote"
                     row["category"] = "blockquote"
                     self.logger.debug(f"blockquote_v2 marker quote opened on page {pg_num}: {text[:60]}")
-                elif is_indented and self.BQ2_QUOTE_OPEN_RE.match(text):
+                elif is_indented and self.BQ2_QUOTE_OPEN_RE.match(text) and not pending_title:
                     self.bq2_mode = "quote"
                     row["category"] = "blockquote"
                     self.logger.debug(f"blockquote_v2 quoted passage opened on page {pg_num}: {text[:60]}")
+            elif soft_pending and self.bq2_mode is None and is_indented and self.BQ2_QUOTE_OPEN_RE.match(text):
+                self.bq2_mode = "quote"
+                self.bq2_soft_quote = True
+                self.bq2_soft_text = text
+                row["category"] = "blockquote"
+                self.logger.debug(f"blockquote_v2 quoted passage opened after soft trigger on page {pg_num}: {text[:60]}")
             self.remember_bq2_row(row)
+
+        if self.bq2_pending_trigger or self.bq2_soft_trigger:
+            last_bottom = min(l["y_top"] - l["height"] for l in rows[-1]["lines"])
+            if any(y1 <= last_bottom + 1.0 for y0, y1 in block_spans):
+                self.logger.debug(f"blockquote_v2 trigger reset on page {pg_num}: table follows {rows[-1]['text'][:60]}")
+                self.bq2_pending_trigger = False
+                self.bq2_soft_trigger = False
+                self.bq2_pending_title = False
 
         for row in rows:
             for idx, line in enumerate(row["lines"]):

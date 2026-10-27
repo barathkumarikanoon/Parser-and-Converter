@@ -52,6 +52,10 @@ INDIC_TEXT_RE = re.compile('[' + INDIC_LETTER_CHARS + ']')
 INDIC_TERMINAL_RE = re.compile('[' + INDIC_SENTENCE_END_CHARS + r'][\)\'"”’\]›»】」』]*\s*$')
 INDIC_INDENT_RATIO = 0.6
 JUSTIFIED_BLOCK_RATIO = 0.6
+INDENT_STYLE_MIN_ROWS = 6
+INDENT_STYLE_MIN_STARTS = 2
+INDENT_STYLE_MIN_FULL_SHARE = 0.5
+INDENT_STYLE_SHARE = 0.8
 ENUM_MARKER_RE = re.compile(r'^\s*(?:\((?P<p>[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[A-Za-z]|\d{1,3})\)'
                             r'|(?P<c>[ivxlcdm]{1,8}|[a-z]|\d{1,3})\)'
                             r'|(?P<d>[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[a-z]|\d{1,3})\.(?!\d))\s*\S')
@@ -571,6 +575,41 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
                 return not (prev_indented and prev_full)
         return justified and not prev_full
 
+    def first_line_indented(self, unit, block_left):
+        if block_left is None or 'x0' not in unit:
+            return False
+        row_height = unit.get('y1', 0) - unit.get('y0', 0) or 8.0
+        return unit['x0'] - block_left >= row_height * INDIC_INDENT_RATIO
+
+    def indent_paragraph_style(self, units, block_left):
+        if block_left is None or self._block_right is None:
+            return False
+        texts = [u for u in units if u['kind'] == 'text' and 'x0' in u and 'x1' in u]
+        if len(texts) < INDENT_STYLE_MIN_ROWS:
+            return False
+        if sum(1 for u in texts if self.unit_reaches_right(u)) < len(texts) * INDENT_STYLE_MIN_FULL_SHARE:
+            return False
+        indented = 0
+        after_short = 0
+        after_full_sentence = 0
+        for prev_unit, unit in zip(texts, texts[1:]):
+            if not self.first_line_indented(unit, block_left):
+                continue
+            indented += 1
+            if not self.unit_reaches_right(prev_unit):
+                after_short += 1
+            elif self.ends_indic_sentence(prev_unit['value']):
+                after_full_sentence += 1
+        return (after_short >= INDENT_STYLE_MIN_STARTS
+                and after_short + after_full_sentence >= indented * INDENT_STYLE_SHARE)
+
+    def indent_layout_starts_paragraph(self, prev_unit, unit, block_left):
+        if 'x0' not in prev_unit or not self.first_line_indented(unit, block_left):
+            return False
+        if not self.unit_reaches_right(prev_unit):
+            return True
+        return self.ends_indic_sentence(prev_unit['value'])
+
     def roman_value(self, token):
         if not self.is_roman_numeral(token):
             return None
@@ -672,6 +711,7 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
         lefts = sorted(u['x0'] for u in units if u['kind'] == 'text' and 'x0' in u)
         block_left = lefts[int(0.1 * (len(lefts) - 1))] if len(lefts) >= 3 else None
         justified = self.block_is_justified(units)
+        indent_style = self.indent_paragraph_style(units, block_left)
         item_starts = self.enum_item_starts(units)
         local_breaks = self.local_gap_breaks(units, normal)
         tight_block = bool(local_breaks)
@@ -712,6 +752,8 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
                 elif prev_text is not None and self.style_breaks_paragraph(prev_text, unit, normal):
                     starts_para = True
                 elif prev_text is not None and self.indic_layout_starts_paragraph(prev_text, unit, block_left, justified):
+                    starts_para = True
+                elif indent_style and prev_text is not None and self.indent_layout_starts_paragraph(prev_text, unit, block_left):
                     starts_para = True
                 elif prev_text is not None and self.page_break_ends_paragraph(prev_text, unit, justified):
                     starts_para = True

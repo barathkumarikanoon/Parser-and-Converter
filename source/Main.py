@@ -2467,6 +2467,7 @@ class Main:
 
         if self.pdf_type == 'judgments':
             self.flatten_pre_header_tables()
+            self.flatten_leading_pre_header_tables()
 
         if self.pdf_type == 'sebi':
             self.detect_sebi_front_matter(pages)
@@ -4497,7 +4498,43 @@ class Main:
         # FINAL PRIORITY
         
 
-        tiers = [tier1, tier2, tier3, tier4, tier5, tier6]
+        qualified_judgment_re = re.compile(
+            rf'\n[\s_]*(?:(?-i:[A-Z][A-Z.]+)[\s_]+){{0,3}}({spaced("JUDGMENT")}|{spaced("JUDGEMENT")})'
+            rf'[\s_]*[:\-\u2013\u2014]*[\s_]*(?:\(.*)?',
+            re.I
+        )
+        tier1.append(qualified_judgment_re)
+
+        decorated_kinds = ("JUDGMENT", "JUDGEMENT", "ORDER", "AWARD")
+        decorated_qualifiers = ("", "COMMON", "FINAL", "INTERIM", "ORAL", "CAV", "EX PARTE", "DISTRIBUTION")
+        decorated_alternatives = [
+            phrase(f"{qualifier} {kind}".strip())
+            for kind in decorated_kinds
+            for qualifier in decorated_qualifiers
+        ]
+        decorated_alternatives.append(r'P[\s_]*\.?[\s_]*C[\s_]*\.?')
+        decorated_alternatives.append(phrase("PER COURT"))
+        decorated_alternatives.extend([
+            indic_qualified_alternation(),
+            indic_distribution_order_alternation(),
+            indic_common_order_alternation(),
+            indic_judgment_alternation(),
+            indic_order_alternation(),
+            indic_award_alternation(),
+        ])
+        decorated_alternatives.sort(key=len, reverse=True)
+        tier1.append(re.compile(
+            rf'\n[\s_]*(?:[:\-–—][\s_]*)+(?:{"|".join(decorated_alternatives)})'
+            rf'(?:[\s_]*[:\-–—])*[\s_]*(?:\(.+\))?[\s_]*\n?',
+            re.I
+        ))
+        tier1.append(re.compile(
+            rf'\n[\s_]*(?:{"|".join(decorated_alternatives)})'
+            rf'(?:[\s_]*[:\-–—])+[\s_]*(?:\(.+\))?[\s_]*\n?',
+            re.I
+        ))
+
+        tiers =[tier1, tier2, tier3, tier4, tier5, tier6]
 
         # COLLECT ROWS
 
@@ -4555,8 +4592,16 @@ class Main:
             height = max(row["y1"] - row["y0"], 1.0)
             return row["x1"] >= text_right - height and row["x0"] <= text_left + height
 
+        def indented_justified(row):
+            height = max(row["y1"] - row["y0"], 1.0)
+            return (
+                row["x1"] >= text_right - height
+                and (row["x1"] - row["x0"]) >= 0.5 * (text_right - text_left)
+            )
+
         def closing_match(index):
-            return not any(full_width(r) for r in rows[index + 1:])
+            following = rows[index + 1:]
+            return not any(full_width(r) for r in following) and not any(indented_justified(r) for r in following)
 
         def first_prose_paragraph():
             for k in range(len(rows) - 2):
@@ -4569,6 +4614,26 @@ class Main:
                 if full_width(nxt) and full_width(after):
                     return k
             return None
+
+        if not any(full_width(r) for r in rows):
+            page_edges = {}
+            rows_by_page = {}
+            for r in rows:
+                rows_by_page.setdefault(r["page"], []).append(r)
+            for page_no, page_rows in rows_by_page.items():
+                page_lefts = sorted(r["x0"] for r in page_rows)
+                page_rights = sorted(r["x1"] for r in page_rows)
+                page_edges[page_no] = (
+                    page_lefts[int(0.1 * (len(page_lefts) - 1))],
+                    page_rights[int(0.9 * (len(page_rights) - 1))],
+                )
+
+            def page_full_width(row):
+                height = max(row["y1"] - row["y0"], 1.0)
+                page_left, page_right = page_edges[row["page"]]
+                return row["x1"] >= page_right - height and row["x0"] <= page_left + height
+
+            full_width = page_full_width
 
 
         # SEARCH TIER BY TIER
@@ -4859,6 +4924,32 @@ class Main:
                 if any(key < top for key in pre_tops) and any(key > bottom for key in pre_tops):
                     self.flatten_table_into_pre_header(page_num, page_obj, table_id, tbs, "Judgment pre header")
 
+    def flatten_leading_pre_header_tables(self):
+        ignorable_labels = ("header", "footer", "pre_header")
+        placed = []
+        for page_num, page_obj in self.all_pgs.items():
+            for table_id, tbs in self.table_owners(page_obj).items():
+                top = min((page_num, -tb.coords[3]) for tb in tbs)
+                placed.append((top, page_num, page_obj, table_id))
+        placed.sort(key=lambda item: item[0])
+        for top, page_num, page_obj, table_id in placed:
+            tbs = self.table_owners(page_obj).get(table_id)
+            if not tbs:
+                continue
+            bottom = max((page_num, -tb.coords[1]) for tb in tbs)
+            content_above = False
+            pre_below = False
+            for other_page, other_obj in self.all_pgs.items():
+                for tb, label in other_obj.all_tbs.items():
+                    if not hasattr(tb, "coords") or tb in tbs:
+                        continue
+                    if label == "pre_header" and (other_page, -tb.coords[3]) > bottom:
+                        pre_below = True
+                    if label not in ignorable_labels and (other_page, -tb.coords[3]) < top:
+                        content_above = True
+            if pre_below and not content_above:
+                self.flatten_table_into_pre_header(page_num, page_obj, table_id, tbs, "Judgment leading pre header")
+
     def extract_toc_lines(self, tb):
         lines = []
         for textline in tb.tbox.findall('.//textline'):
@@ -5053,6 +5144,18 @@ class Main:
             i = j
         rows = merged_rows
 
+        def leader_row_ahead(start, first):
+            gap_limit = max((rows[k - 1]["y0"] - rows[k]["y0"] for k in range(first + 1, start)
+                             if rows[k - 1]["page"] == rows[k]["page"]), default=0.0)
+            for k in range(start, len(rows)):
+                if rows[k]["page"] != rows[start]["page"] or len(rows[k]["text"]) > MAX_CONTINUATION_LEN:
+                    return False
+                if k > start and rows[k - 1]["y0"] - rows[k]["y0"] > gap_limit:
+                    return False
+                if split_entries(rows[k]["text"])[0]:
+                    return True
+            return False
+
         heading_idx = None
         heading_text = None
         for idx, row in enumerate(rows):
@@ -5105,7 +5208,7 @@ class Main:
                 i += 1
                 continue
 
-            if len(text) <= MAX_CONTINUATION_LEN and miss_streak < MAX_MISS_STREAK:
+            if len(text) <= MAX_CONTINUATION_LEN and (miss_streak < MAX_MISS_STREAK or leader_row_ahead(i, heading_idx)):
                 if pending_start_x0 is None:
                     pending_start_x0 = row["x0"]
                 pending_prefix = f"{pending_prefix} {text}".strip()
