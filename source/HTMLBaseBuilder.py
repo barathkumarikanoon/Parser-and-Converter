@@ -58,7 +58,8 @@ INDENT_STYLE_MIN_FULL_SHARE = 0.5
 INDENT_STYLE_SHARE = 0.8
 ENUM_MARKER_RE = re.compile(r'^\s*(?:\((?P<p>[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[A-Za-z]|\d{1,3})\)'
                             r'|(?P<c>[ivxlcdm]{1,8}|[a-z]|\d{1,3})\)'
-                            r'|(?P<d>[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[a-z]|\d{1,3})\.(?!\d))\s*\S')
+                            r'|(?P<d>[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[a-z]|\d{1,3})\.(?!\d)'
+                            r'|(?P<b>[ivxlcdm]{1,8}|[IVXLCDM]{1,8}|[A-Za-z]|\d{1,3})\])\s*\S')
 ROMAN_VALUES = {'i': 1, 'v': 5, 'x': 10, 'l': 50, 'c': 100, 'd': 500, 'm': 1000}
 ENUM_ALIGN_RATIO = 0.5
 TRIGGER_END_RE = re.compile(r'[:：][\s\-‐‑‒–—―−:：]*$')
@@ -74,6 +75,130 @@ WIDE_SPACE_RE = re.compile(r'[ \t]{2,}')
 STYLE_TOKEN_RE = re.compile(r'<(/?)([biu])>')
 
 FOOTNOTE_MARKER_RE = re.compile(r'\{\{\^\{\{FOOTNOTE\s+(\d+)\}\}\}\}')
+FOOTNOTE_SECTION_MARK = '<section class="footnotes">'
+FOOTNOTE_POPUP_ASSETS = """<style>
+  .footnote-popup {
+    display: none;
+    position: absolute;
+    z-index: 10;
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(34rem, 85vw);
+    padding: 0.5em 0.75em;
+    background: #fffef5;
+    color: #222;
+    border: 1px solid #999;
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    font-size: 0.9rem;
+    line-height: 1.5;
+    text-align: left;
+    white-space: normal;
+  }
+
+  .footnote-popup.visible {
+    display: block;
+  }
+</style>
+<script>
+(function () {
+  var popup = null;
+  var timer = null;
+
+  function cancelHide() {
+    clearTimeout(timer);
+  }
+
+  function hide() {
+    if (popup) {
+      popup.className = 'footnote-popup';
+    }
+  }
+
+  function scheduleHide() {
+    cancelHide();
+    timer = setTimeout(hide, 200);
+  }
+
+  function ensurePopup() {
+    if (!popup) {
+      popup = document.createElement('div');
+      popup.className = 'footnote-popup';
+      popup.addEventListener('mouseenter', cancelHide);
+      popup.addEventListener('mouseleave', scheduleHide);
+      document.body.appendChild(popup);
+    }
+    return popup;
+  }
+
+  function markerOf(node) {
+    return node && node.closest ? node.closest('sup[id^="fnref-"] a[href^="#fn-"]') : null;
+  }
+
+  function place(box, link) {
+    var rect = link.getBoundingClientRect();
+    var scrollX = window.pageXOffset;
+    var scrollY = window.pageYOffset;
+    var viewWidth = document.documentElement.clientWidth;
+    var width = box.offsetWidth;
+    var height = box.offsetHeight;
+    var room = viewWidth - width - 8;
+    var left = Math.max(8, Math.min(rect.left, room));
+    var below = window.innerHeight - rect.bottom;
+    var flip = height + 8 > below && rect.top >= height + 8;
+    var top = flip ? rect.top - height - 4 : rect.bottom + 4;
+    box.style.left = (left + scrollX) + 'px';
+    box.style.top = (top + scrollY) + 'px';
+  }
+
+  function show(link) {
+    var note = document.getElementById(link.getAttribute('href').slice(1));
+    if (!note) {
+      return;
+    }
+    cancelHide();
+    var box = ensurePopup();
+    box.textContent = '';
+    Array.prototype.forEach.call(note.childNodes, function (child) {
+      box.appendChild(child.cloneNode(true));
+    });
+    Array.prototype.forEach.call(box.querySelectorAll('a[href^="#fnref-"]'), function (back) {
+      back.parentNode.removeChild(back);
+    });
+    box.className = 'footnote-popup visible';
+    place(box, link);
+  }
+
+  document.addEventListener('mouseover', function (event) {
+    var link = markerOf(event.target);
+    if (link) {
+      show(link);
+    }
+  });
+  document.addEventListener('mouseout', function (event) {
+    if (markerOf(event.target)) {
+      scheduleHide();
+    }
+  });
+  document.addEventListener('focusin', function (event) {
+    var link = markerOf(event.target);
+    if (link) {
+      show(link);
+    }
+  });
+  document.addEventListener('focusout', function (event) {
+    if (markerOf(event.target)) {
+      scheduleHide();
+    }
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key === 'Escape') {
+      hide();
+    }
+  });
+})();
+</script>
+"""
 FOOTNOTE_ABBREVIATION_RE = re.compile(
     r'(?:\b[a-z]\.){2,}$|\b(?:no|ref)\.$',
     re.IGNORECASE
@@ -214,6 +339,7 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
                     'styled': self.join_styled_parts([l.get('styled', l['text']) for l in current_row]),
                     'list_depth': current_row[0].get('list_depth', 0),
                     'list_start': current_row[0].get('bq2_start') == '1',
+                    'list_quote': current_row[0].get('bq2_quote') == '1',
                     'list_inline': [token for l in current_row if l.get('bq2_inline')
                                     for token in l['bq2_inline'].split('|')],
                 })
@@ -626,7 +752,7 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
         match = ENUM_MARKER_RE.match(STYLE_TOKEN_RE.sub('', text))
         if not match:
             return None
-        style = next(name for name in ('p', 'c', 'd') if match.group(name))
+        style = next(name for name in ('p', 'c', 'd', 'b') if match.group(name))
         token = match.group(style)
         readings = set()
         if token.isdigit():
@@ -1177,15 +1303,17 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
             if not text:
                 continue
             depth = unit.get('list_depth', 0)
+            quoted = bool(unit.get('list_quote'))
             pieces = self.split_at_inline_markers(text, unit.get('list_inline', []))
             separator = self.is_separator_text(unit['value'])
-            if not items or depth != items[-1][0] or unit.get('list_start') or separator or after_separator:
-                items.append([depth, leading_raw + pieces[0]])
+            if not items or depth != items[-1][0] or quoted != items[-1][2] or unit.get('list_start') \
+                    or separator or after_separator:
+                items.append([depth, leading_raw + pieces[0], quoted])
                 leading_raw = ''
             else:
                 items[-1][1] = self.join_styled(items[-1][1], ' ' + pieces[0])
             for piece in pieces[1:]:
-                items.append([depth, piece])
+                items.append([depth, piece, quoted])
             after_separator = separator
         if not items:
             if leading_raw:
@@ -1193,8 +1321,12 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
             return
         html = ''
         depths = []
-        for depth, text in items:
-            if not depths:
+        for depth, text, quoted in items:
+            if quoted:
+                html += "</li>\n</ul>\n" * len(depths)
+                depths = []
+                html += f"<blockquote>{text}</blockquote>\n"
+            elif not depths:
                 html += "<ul>\n<li>" + text
                 depths.append(depth)
             elif depth > depths[-1]:
@@ -1534,5 +1666,12 @@ class HTMLBaseBuilder(TableCellArranger, TableBuilder):
         self.render_footnote_section()
         html = self.close_html()
         if html:
+            html = self.add_footnote_popup_assets(html)
             html = self.finalize_toc(html)
         return html
+
+    @staticmethod
+    def add_footnote_popup_assets(html):
+        if FOOTNOTE_SECTION_MARK not in html:
+            return html
+        return html.replace('</head>', FOOTNOTE_POPUP_ASSETS + '</head>', 1)

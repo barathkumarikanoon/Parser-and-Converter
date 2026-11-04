@@ -1130,6 +1130,7 @@ class Amendment:
         def set_list(row, start):
             row["category"] = f"list:{max(len(self.bq2_list_stack) - 1, 0)}"
             row["start"] = start
+            row["in_quote"] = self.bq2_list_parent == "quote"
             for depth, level in enumerate(self.bq2_list_stack):
                 fresh = start and depth == len(self.bq2_list_stack) - 1
                 level["text"] = row["text"] if fresh else level.get("text", "") + " " + row["text"]
@@ -1383,6 +1384,8 @@ class Amendment:
                 line["el"].set("bq2", row["category"])
                 if row["start"] and idx == 0:
                     line["el"].set("bq2_start", "1")
+                if row.get("in_quote"):
+                    line["el"].set("bq2_quote", "1")
                 if row["inline"] and idx == len(row["lines"]) - 1:
                     line["el"].set("bq2_inline", "|".join(row["inline"]))
         for tb, own in tb_lines.items():

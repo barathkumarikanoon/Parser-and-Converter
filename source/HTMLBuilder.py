@@ -2658,6 +2658,7 @@ class HtmlBuilderV2(GlyphBulletLists, HTMLBaseBuilder):
         self.render_footnote_section()
         html = self.close_html()
         if html:
+            html = self.add_footnote_popup_assets(html)
             if self.show_fonts:
                 html = self.render_font_runs(html)
             html = self.finalize_toc(html)
