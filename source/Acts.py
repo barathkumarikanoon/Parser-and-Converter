@@ -11,6 +11,7 @@ from sklearn.cluster import DBSCAN
 from .Table import TableBuilder
 from .NormalizeText import NormalizeText
 from .SentenceEndDetector import SentenceMaker
+from .Utils import INDIC_DIGIT_CHARS, INDIC_NONZERO_DIGIT_CHARS, INDIC_LETTER_CHARS
 
 COMBINED_RE = re.compile(
                 r"""
@@ -28,10 +29,13 @@ COMBINED_RE = re.compile(
             )
 
 class Acts(TableBuilder, SentenceMaker):
-    def __init__(self, sentence_completion_punctuation = tuple(), pdf_type = None, docend_symbol = False):
+    def __init__(self, all_footnote_text, sentence_completion_punctuation = tuple(), pdf_type = None, docend_symbol = False):
         TableBuilder.__init__(self)
         self.logger = logging.getLogger(__name__)
         self.pdf_type = pdf_type
+        self.all_footnote_text = all_footnote_text
+        self.current_page_num = None
+        self.footnote_to_add = None
         self.sentence_completion_punctuation = sentence_completion_punctuation
         self.stack_for_section = []
         self.hierarchy = []
@@ -546,7 +550,7 @@ class Acts(TableBuilder, SentenceMaker):
         #     re.IGNORECASE
         # )
         group_re = re.compile(
-                r'^\s*(\(\s*(?:[1-9]\d{0,2}|[A-Z]{1,3}|(?:CM|CD|D?C{0,3})?'
+                r'^\s*(\(\s*(?:[1-9' + INDIC_NONZERO_DIGIT_CHARS + r']\d{0,2}|[A-Z' + INDIC_LETTER_CHARS + r']{1,3}|(?:CM|CD|D?C{0,3})?'
                 r'(?:XC|XL|L?X{0,3})?(?:IX|IV|V?I{0,3}))\s*\))\s*(.*)',
                 re.IGNORECASE
             )
@@ -562,7 +566,7 @@ class Acts(TableBuilder, SentenceMaker):
     def find_value_and_text(self,text):
         group_re = re.compile(
                 r'^\s*('
-                r'(?:\d+[A-Z]*(?:-[A-Z]+)?\s*\.)'   # section: 1. , 2A. , 3A-B.
+                r'(?:\d+[A-Z' + INDIC_LETTER_CHARS + r']*(?:-[A-Z' + INDIC_LETTER_CHARS + r']+)?\s*\.)'   # section: 1. , 2A. , 3A-B.
                 r'|'
                 r'(?:\(\s*[^\s\)]+\s*\))'           # group: (A), (1), (B1)
                 r')\s*(.*)$',                       # group 2 = remaining text
@@ -599,7 +603,7 @@ class Acts(TableBuilder, SentenceMaker):
             side_note_text = self.find_closest_side_note(tb.coords, side_note_datas,page_height)
             self.logger.debug("Side note matched for section text [%s] : %s",text, side_note_text)
             if not has_side_notes:
-                match = re.match(r'^(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\.\s*)(.*)', text.strip())
+                match = re.match(r'^(\s*\d{1,3}[A-Z' + INDIC_LETTER_CHARS + r']*(?:-[A-Z' + INDIC_LETTER_CHARS + r']+)?\.\s*)(.*)', text.strip())
                 prefix = match.group(1)
                 rest_text = match.group(2).strip()
                 rest_text_type, value, remain_text = self.findType(rest_text)
@@ -618,7 +622,7 @@ class Acts(TableBuilder, SentenceMaker):
                         self.previous_sentence_end_status = True
                 return
             if side_note_text:
-                match = re.match(r'^(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\.\s*)(.*)', text.strip())
+                match = re.match(r'^(\s*\d{1,3}[A-Z' + INDIC_LETTER_CHARS + r']*(?:-[A-Z' + INDIC_LETTER_CHARS + r']+)?\.\s*)(.*)', text.strip())
                 if match:
                     prefix = match.group(1)
                     short_title = self.normalize_text((side_note_text or "").strip()) or ""
@@ -650,7 +654,7 @@ class Acts(TableBuilder, SentenceMaker):
 
                 check_re = re.compile(
                         r'^'
-                        r'(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\.\s*)'   # Group 1: Number/marker like '13.'
+                        r'(\s*\d{1,3}[A-Z' + INDIC_LETTER_CHARS + r']*(?:-[A-Z' + INDIC_LETTER_CHARS + r']+)?\.\s*)'   # Group 1: Number/marker like '13.'
                         r'(?!\s*\([^)]+\))'                       # Negative lookahead: fail if second group starts with anything in parentheses
                         r'(.*?(?:\.\s*(?:-|—)?|:\s*(?:-|—)?))'   # Group 2: Text up to first . or : optionally followed by -/—
                         r'(.*)$',                                 # Group 3: Rest of text
@@ -672,7 +676,7 @@ class Acts(TableBuilder, SentenceMaker):
                         self.builder  += "\n" + ("\t" * (self.curr_tab_level+1))+f"{remain_text}"
                     return
                 
-                # match = re.match(r'^(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\.\s*)(.*)', text.strip())
+                # match = re.match(r'^(\s*\d{1,3}[A-Z' + INDIC_LETTER_CHARS + r']*(?:-[A-Z' + INDIC_LETTER_CHARS + r']+)?\.\s*)(.*)', text.strip())
                 # if match:
                 #     prefix = match.group(1)
                 #     short_title = match.group(2).strip()
@@ -684,7 +688,7 @@ class Acts(TableBuilder, SentenceMaker):
                 #         self.section_shorttitle_notend_status = True
 
                 match = re.match(
-                                r'^(\s*\d{1,3}[A-Z]*(?:-[A-Z]+)?\.\s*)(.*)',
+                                r'^(\s*\d{1,3}[A-Z' + INDIC_LETTER_CHARS + r']*(?:-[A-Z' + INDIC_LETTER_CHARS + r']+)?\.\s*)(.*)',
                                 text.strip()
                             )
 
@@ -955,7 +959,7 @@ class Acts(TableBuilder, SentenceMaker):
                 else:
                     self.builder += "\n" + ("\t" * (cell_tab))+f"TC"
                 value = row[col]
-                value = str(value)
+                value = "" if pd.isna(value) or str(value).strip().lower() == "nan" else str(value)
                 text = self.normalize_text(value)
                 text = self.clean_text(text)
                 value_tab = cell_tab + 1
@@ -966,6 +970,10 @@ class Acts(TableBuilder, SentenceMaker):
 
         except Exception as e:
             self.logger.exception("Error while adding table in html - %s .\nTable preview\n %s",e, table.head().to_string(index=False))
+
+        if self.footnote_to_add:
+            self.add_footnote(footnotes = self.footnote_to_add)
+            self.footnote_to_add = None
 
     def addAmendment(self, label, tb, side_note_datas, page_height):
         try:
@@ -1018,14 +1026,15 @@ class Acts(TableBuilder, SentenceMaker):
             self.logger.warning("Exception while adding section amendment [%s]: %s",text, e)
     
     def is_section_amended(self, text):
-        match = re.match(
-                r'''^\s*['"]?              # optional leading ' or "
-                    (\d{1,3}[A-Z]*(?:-[A-Z]+)?\.\s*)   # your numbering token
+        section_letter_class = 'A-Z' + INDIC_LETTER_CHARS
+        pattern = (
+            r'''^\s*['"]?              # optional leading ' or "'''
+            rf'''
+                    (\d{{1,3}}[{section_letter_class}]*(?:-[{section_letter_class}]+)?\.\s*)   # your numbering token
                     (.*)                   # rest of the text
-                ''',
-                text.strip(),
-                re.VERBOSE
-            )
+                '''
+        )
+        match = re.match(pattern, text.strip(), re.VERBOSE)
         return match
 
     def remove_unwanted_sidenotes(self, side_note_datas):
@@ -1038,15 +1047,74 @@ class Acts(TableBuilder, SentenceMaker):
                 except Exception as e:
                     self.logger.warning("Exception while removing unwanted side notes: %s", e)
 
+    def contains_footnote(self, text):
+        pattern = re.compile(
+            r'\{\{\^\{\{FOOTNOTE\s+(\d+)\}\}\}\}'
+        )
+
+        matches = pattern.findall(text)
+
+        return matches if matches else []
+
+    def add_footnote(self, footnotes):
+        footnote_abbreviation_pattern = re.compile(
+                    r'(?:\b[a-z]\.){2,}$|\b(?:no|ref)\.$',
+                    re.IGNORECASE
+                )
+        if not footnotes:
+            return
+
+        if isinstance(footnotes, str):
+            footnotes = [footnotes]
+
+        page_footnote_text = self.all_footnote_text.get(self.current_page_num, {})
+
+        for footnote in footnotes:
+            if footnote not in page_footnote_text:
+                continue
+
+            rawlines = page_footnote_text[footnote].split('\n')
+            if not rawlines:
+                continue
+            arranged_text = []
+            current_sentence = ""
+
+            for line in rawlines:
+                if current_sentence:
+                    current_sentence += " " + line
+                else:
+                    current_sentence = line
+
+                is_sentence_completed =( current_sentence.endswith(
+                                        self.sentence_completion_punctuation)
+
+                                        and
+                                        not footnote_abbreviation_pattern.search(current_sentence)
+                                        )
+
+                if is_sentence_completed:
+                    arranged_text.append(current_sentence.strip())
+                    current_sentence = ""
+
+            if current_sentence:
+                arranged_text.append(current_sentence.strip())
+
+            self.builder  += "\n" + ("\t" * (self.curr_tab_level+1))+f"FOOTNOTE {footnote}"
+            for textline in arranged_text:
+                self.builder  += "\n" + ("\t" * (self.curr_tab_level+2))+f"{textline}"
+
     def build(self, page, has_side_notes) :
+        self.current_page_num = int(page.pg_num)
         self.remove_unwanted_sidenotes(page.side_notes_datas)
         visited_for_table = set()
-       
+
         all_items = list(page.all_tbs.items())
         for idx, (tb, label) in enumerate(all_items):
             if self.is_act_ended and self.docend_symbol:
                 break
-            if label == "header" or label == "footer" :
+            if label == "header" or label == "footer" or label == "footnote" or label == "toc":
+               continue
+            if isinstance(label, tuple) and label[0] in ("table_boilerplate", "borderless_table_boilerplate"):
                continue
             if not ((isinstance(label, tuple) and (label[0] == "table" or \
                                                    label[0] == "borderless_table"))):
@@ -1057,6 +1125,15 @@ class Acts(TableBuilder, SentenceMaker):
             text = ''
             if label not in ('figure',):
                 text = self.normalize_text(tb.extract_text_from_tb())
+
+            is_table_label = isinstance(label, tuple) and label[0] in ("table", "borderless_table")
+            if not is_table_label and label != "figure":
+                self.is_footnote_detected = self.contains_footnote(text)
+                if self.is_footnote_detected:
+                    if not self.footnote_to_add:
+                        self.footnote_to_add = self.is_footnote_detected
+                    else:
+                        self.footnote_to_add.extend(self.is_footnote_detected)
 
             if isinstance(label, tuple) and label[0] == "table":
                 table_id = label[1]
@@ -1130,7 +1207,11 @@ class Acts(TableBuilder, SentenceMaker):
             elif label is None:
                 if not self.is_pg_num(tb,page.pg_width):
                     self.addUnlabelled(text)
-    
+
+            if self.previous_sentence_end_status and self.footnote_to_add:
+                self.add_footnote(footnotes = self.footnote_to_add)
+                self.footnote_to_add = None
+
     def flushTables(self):
         if self.pending_table is not None and len(self.pending_table) <= 2:
             self.addTable(self.pending_table[0])
@@ -1155,7 +1236,7 @@ class Acts(TableBuilder, SentenceMaker):
       cleaned = raw.lower()
 
       # --- Reject common bullet forms: 'i.', 'ii)', '1.' followed by text ---
-      if re.match(r"^\(?[ivxlcdm0-9]+\)?[.)]\s+\w+", cleaned, re.IGNORECASE):
+      if re.match(r"^\(?[ivxlcdm0-9" + INDIC_DIGIT_CHARS + r"]+\)?[.)]\s+\w+", cleaned, re.IGNORECASE):
           return False
 
       # Remove enclosing brackets/parentheses/braces only if whole thing is wrapped

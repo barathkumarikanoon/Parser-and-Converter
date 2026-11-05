@@ -1,14 +1,107 @@
 import os
+import sys
 import unittest
 import tempfile
 import shutil
 import argparse
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import difflib
+import fnmatch
 import logging
 import csv
 
-from source.Main import Main
+# so that this file works when run as a script too, and not just through
+# 'python -m unittest' from the project root
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from source.Main import Main, install_cleanup_signal_handlers
+
+
+def process_case(job):
+    """Convert a single PDF, in a worker process of its own.
+
+    Nothing is shared with the parent process here, so the output filename that
+    Main settles on (it depends on the page count, which is only known once the
+    PDF has been parsed) is returned rather than written back into the test case.
+    """
+    source_path = Path(job['pdf_path'])
+    output_dir = Path(job['output_dir'])
+    pdf_path_for_main = job['pdf_path']
+
+    renamed_copy = None
+    if job['pdf_name'] != source_path.stem:
+        renamed_copy = output_dir / f"{job['pdf_name']}{source_path.suffix}"
+        shutil.copy2(source_path, renamed_copy)
+        pdf_path_for_main = str(renamed_copy)
+
+    result = {'pdf_name': job['pdf_name'], 'success': False,
+              'filename': None, 'error': None}
+
+    main = None
+    try:
+        main = Main(
+            pdfPath=pdf_path_for_main,
+            is_amendment_pdf=job['is_amendment'],
+            output_dir=str(output_dir),
+            pdf_type=job['pdf_type'],
+            has_side_notes=job['has_sidenotes'],
+            has_doc_end=job['has_doc_end'],
+            is_footnote_continuation=job['is_footnote_continuation'],
+            min_img_pixels=job['min_img_pixels'],
+            ocr_language=job['ocr_language'],
+            ocr_engine_image_text=job['ocr_engine'],
+            ocr_engine_pdf_parser=job['ocr_engine_pdf_parser'],
+            is_scanned_copy=job['scanned_copy'],
+            table_extract=job['table_extract'],
+            figure_text=job['figure_text'],
+            public_base_url=job['public_base_url'],
+            server_root=job['server_root'],
+            rights=job['rights'],
+            provider_id=job['provider_id'],
+            provider_name=job['provider_name'],
+            attribution=job['attribution'],
+            font_conv_map=job['font_conv'],
+            font_lang=job['font_lang'],
+            font_detect=job['font_detect'],
+            show_fonts=job['font_names']
+        )
+
+        # Parse PDF
+        parse_success = main.parsePDF(job['pdf_type'], job['char_margin'],
+                                      job['word_margin'], job['line_margin'],
+                                      job['start_page'], job['end_page'])
+        if not parse_success:
+            result['error'] = 'parsePDF() reported a failure'
+            return result
+
+        # Build HTML
+        main.buildHTML(job['start_page'], job['end_page'])
+
+        result['filename'] = TestPdfToHtmlDiff._compute_output_filename(
+            job['pdf_name'], job['start_page'], job['end_page'],
+            main.total_pgs, job['suffix']
+        )
+
+        result['success'] = True
+        return result
+
+    except Exception as e:
+        logging.error(f"Error processing PDF {job['pdf_name']}: {e}")
+        result['error'] = str(e)
+        return result
+
+    finally:
+        if main is not None:
+            main.cleanup_run()
+        else:
+            try:
+                from source.TableExtraction import cleanup_camelot_temp_dirs
+                cleanup_camelot_temp_dirs()
+            except Exception:
+                pass
+        if renamed_copy and renamed_copy.exists():
+            renamed_copy.unlink()
 
 
 class TestPdfToHtmlDiff(unittest.TestCase):
@@ -17,11 +110,14 @@ class TestPdfToHtmlDiff(unittest.TestCase):
     Compares generated HTML against expected baseline files or detects changes.
     """
 
+    selected_csvs = None
+
     @classmethod
     def setUpClass(cls):
         """Set up test environment and locate test PDFs."""
         cls.test_dir = Path(__file__).parent
         cls.test_pdfs_dir = cls.test_dir / "test_pdfs"
+        cls.test_judgment_pdfs_dir = cls.test_dir / "test_judgment_pdfs"
         cls.expected_output_dir = cls.test_dir / "expected_html"
         cls.actual_output_dir = cls.test_dir / "actual_html"
         cls.diff_output_dir = cls.test_dir / "diff_results"
@@ -33,11 +129,23 @@ class TestPdfToHtmlDiff(unittest.TestCase):
         # Set up logging for tests
         logging.basicConfig(level=logging.WARNING)  # Reduce noise during tests
 
-        cls.test_cases = []
         cls.csv_file = cls.test_dir / "test_cases.csv"
+        cls.judgment_csv_file = cls.test_dir / "test_judgment_cases.csv"
+        cls.csv_registry = {
+            cls.csv_file.name: (cls.csv_file, cls.test_pdfs_dir),
+            cls.judgment_csv_file.name: (cls.judgment_csv_file, cls.test_judgment_pdfs_dir),
+        }
 
-        # Read test cases from CSV file
-        cls._load_test_cases_from_csv()
+        cls.test_cases = []
+        selected = cls.selected_csvs or list(cls.csv_registry.keys())
+        for name in selected:
+            name = Path(name).name
+            if name not in cls.csv_registry:
+                print(f"Warning: unknown --csv selection '{name}' (known: "
+                      f"{', '.join(cls.csv_registry)}) - skipping")
+                continue
+            csv_path, pdfs_dir = cls.csv_registry[name]
+            cls._load_test_cases_from_csv(csv_path, pdfs_dir)
 
     def setUp(self):
         """Set up for each test case."""
@@ -49,42 +157,29 @@ class TestPdfToHtmlDiff(unittest.TestCase):
     def test_pdf_to_html_conversion(self):
         """Test PDF to HTML conversion for all PDFs defined in CSV."""
         if not self.test_cases:
+            selected = self.get_selected_cases()
+
+            if selected:
+                self.skipTest(
+                    f"No test case in test_cases.csv matched: {', '.join(selected)}"
+                )
+
             self.skipTest("No PDF test cases found in test_cases.csv")
 
         results = []
 
-        for i, test_case in enumerate(self.test_cases):
+        # every PDF is converted first, several at a time, and only then compared
+        case_results = self._process_all_pdfs()
+
+        for test_case, case_result in zip(self.test_cases, case_results):
             print ('TESTCASE: ',test_case)
             with self.subTest(pdf=test_case['pdf_name'], pdf_type=test_case.get('pdf_type', 'default')):
-                # Process PDF with configured parameters
-                success = self._process_pdf(
-                    test_case,
-                    pdf_type=test_case.get('pdf_type'),
-                    # start_page=test_case.get('start_page'),
-                    # end_page=test_case.get('end_page'),
-                    has_sidenotes = test_case.get('has_sidenotes'),
-                    char_margin = test_case.get('char_margin',None),
-                    word_margin = test_case.get('word_margin', None),
-                    line_margin = test_case.get('line_margin',None),
-                    start_page  = test_case.get('start_page', None),
-                    end_page = test_case.get('end_page', None),
-                    # output_dir = test_case.get('output_dir',''),
-                    is_amendment=test_case.get('is_amendment', False),
-                    scanned_copy=test_case.get('scanned_copy', False),
-                    table_extract=test_case.get('table_extract', False),
-                    figure_text=test_case.get('figure_text', False),
-                    has_doc_end=test_case.get('has_doc_end', False),
-                    is_footnote_continuation=test_case.get('is_footnote_continuation', False),
-                    ocr_language=test_case.get('ocr_language', 'eng'),
-                    min_img_pixels=test_case.get('min_img_pixels', 0),
-                    server_root=test_case.get('server_root'),
-                    public_base_url=test_case.get('public_base_url'),
-                    rights=test_case.get('rights'),
-                    provider_id=test_case.get('provider_id'),
-                    provider_name=test_case.get('provider_name'),
-                    attribution=test_case.get('attribution')
+                success = self._apply_case_result(test_case, case_result)
+                self.assertTrue(
+                    success,
+                    f"Failed to process PDF: {test_case['pdf_name']} "
+                    f"({case_result.get('error')})"
                 )
-                self.assertTrue(success, f"Failed to process PDF: {test_case['pdf_name']}")
 
                 # Verify HTML was generated
                 self.assertTrue(
@@ -110,8 +205,134 @@ class TestPdfToHtmlDiff(unittest.TestCase):
         self._generate_test_report(results)
 
     @staticmethod
-    def _parse_bool(value):
-        return value.strip().lower() in ['true', 'yes', '1']
+    def _parse_bool(value, default=False):
+        value = value.strip().lower()
+
+        # a blank cell is the column's default, which is not always False:
+        # font detection is on in the pipeline itself, so a row only ever
+        # names it to turn it off
+        if not value:
+            return default
+
+        return value in ['true', 'yes', '1']
+
+    @staticmethod
+    def get_selected_cases():
+        """The cases asked for on DIFF_TEST_CASES, empty when the whole csv runs."""
+        configured = os.environ.get('DIFF_TEST_CASES', '').strip()
+
+        return [name.strip() for name in configured.split(',') if name.strip()]
+
+    @classmethod
+    def is_case_selected(cls, selected, filename, pdf_name):
+        """Whether a csv row was asked for, by file name, stem or case name.
+
+        'sebi1.pdf', 'sebi1' and 'sebi*' all pick the sebi1 case, and the name a
+        case is reported under ('changeofnames_scanned') works too, which is the
+        only way to pick one of the two cases a single pdf can produce.
+        """
+        if not selected:
+            return True
+
+        names = {filename.lower(), Path(filename).stem.lower(), pdf_name.lower()}
+
+        for wanted in selected:
+            wanted = wanted.lower()
+
+            if any(fnmatch.fnmatchcase(name, wanted) for name in names):
+                return True
+
+        return False
+
+    @staticmethod
+    def get_worker_count(no_of_jobs):
+        """Number of PDFs to convert at the same time."""
+        configured = os.environ.get('DIFF_TEST_WORKERS', '').strip()
+
+        if configured.isdigit() and int(configured) > 0:
+            workers = int(configured)
+        else:
+            # the OCR paths load a model of their own in every process, so this
+            # stays well below the core count to keep the memory use sane
+            workers = min(4, os.cpu_count() or 1)
+
+        return max(1, min(workers, no_of_jobs))
+
+    def _build_job(self, test_case, params):
+        """Everything a worker process needs to convert one PDF, as plain data."""
+        job = {
+            'pdf_path': test_case['pdf_path'],
+            'pdf_name': test_case['pdf_name'],
+            'output_dir': str(self.actual_output_dir),
+            'suffix': test_case['actual_html'].suffix,
+            'ocr_language': params.get('ocr_language') or 'eng',
+            'ocr_engine': params.get('ocr_engine') or 'tesseract',
+            'ocr_engine_pdf_parser': params.get('ocr_engine_pdf_parser') or None,
+            'min_img_pixels': params.get('min_img_pixels') or 0,
+            # on unless a row turns it off, which is the pipeline's own default
+            'font_detect': params.get('font_detect', True)
+        }
+
+        for key in ('pdf_type', 'char_margin', 'word_margin', 'line_margin',
+                    'start_page', 'end_page', 'server_root', 'public_base_url',
+                    'rights', 'provider_id', 'provider_name', 'attribution',
+                    'font_conv', 'font_lang'):
+            job[key] = params.get(key)
+
+        for key in ('is_amendment', 'has_sidenotes', 'scanned_copy', 'table_extract',
+                    'figure_text', 'has_doc_end', 'is_footnote_continuation',
+                    'font_names'):
+            job[key] = bool(params.get(key))
+
+        return job
+
+    def _apply_case_result(self, test_case, case_result):
+        """Point the test case at the file the worker actually wrote."""
+        if case_result.get('filename'):
+            test_case['actual_html'] = self.actual_output_dir / case_result['filename']
+            test_case['expected_html'] = self.expected_output_dir / case_result['filename']
+
+        return case_result['success']
+
+    def _process_all_pdfs(self):
+        """Convert every PDF, several at a time, keeping the results in case order."""
+        jobs = [self._build_job(test_case, test_case) for test_case in self.test_cases]
+
+        workers = self.get_worker_count(len(jobs))
+
+        if workers == 1:
+            return [process_case(job) for job in jobs]
+
+        print(f"Converting {len(jobs)} PDF(s) using {workers} worker processes...")
+
+        results = [None] * len(jobs)
+        done = 0
+
+        with ProcessPoolExecutor(max_workers=workers,
+                                 initializer=install_cleanup_signal_handlers) as executor:
+            futures = {
+                executor.submit(process_case, job): idx
+                for idx, job in enumerate(jobs)
+            }
+
+            for future in as_completed(futures):
+                idx = futures[future]
+
+                try:
+                    results[idx] = future.result()
+                except Exception as e:
+                    # the worker died outright, e.g. it was killed for using too
+                    # much memory - report it as a failure of that one PDF
+                    results[idx] = {
+                        'pdf_name': jobs[idx]['pdf_name'], 'success': False,
+                        'filename': None, 'error': f"worker process failed: {e}"
+                    }
+
+                done += 1
+                print(f"  [{done}/{len(jobs)}] {results[idx]['pdf_name']}: "
+                      f"{'OK' if results[idx]['success'] else 'FAILED'}")
+
+        return results
 
     @staticmethod
     def _compute_output_filename(base_stem, start_page, end_page, total_pgs, suffix):
@@ -124,16 +345,44 @@ class TestPdfToHtmlDiff(unittest.TestCase):
         return f"{base_stem}{suffix}"
 
     @classmethod
-    def _load_test_cases_from_csv(cls):
+    def _resolve_server_root(cls, server_root_raw):
+        """The server_root column of the csv, as a path on this machine.
+
+        The manifest urls a case is compared on carry the path from the server
+        root down to the output directory, so the two have to stand in the same
+        relation on every machine the test runs on. A relative value is what
+        gives that: it is resolved against the repository itself (which always
+        holds the output directory, test/actual_html), so '.' means the repo is
+        the server root and the urls carry 'test/actual_html'. An absolute path
+        is taken as given, and only works where the repo really sits under it.
+        """
+        server_root_raw = server_root_raw.strip()
+
+        if not server_root_raw:
+            return None
+
+        server_root = Path(server_root_raw).expanduser()
+
+        if not server_root.is_absolute():
+            server_root = cls.test_dir.parent / server_root
+
+        return str(server_root.resolve())
+
+    @classmethod
+    def _load_test_cases_from_csv(cls, csv_file, pdfs_dir):
+        selected = cls.get_selected_cases()
+        skipped = []
+        added_before = len(cls.test_cases)
+
         try:
-            with open(cls.csv_file, 'r', encoding='utf-8') as f:
+            with open(csv_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     filename = row['filename'].strip()
                     if not filename:
                         continue
 
-                    pdf_path = cls.test_pdfs_dir / filename
+                    pdf_path = pdfs_dir / filename
                     if not pdf_path.exists():
                         print(f"Warning: PDF file not found: {pdf_path}")
                         continue
@@ -153,19 +402,34 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                     has_doc_end = cls._parse_bool(row.get('has_doc_end', ''))
                     is_footnote_continuation = cls._parse_bool(row.get('is_footnote_continuation', ''))
                     ocr_language = row.get('ocr_language', '').strip() or 'eng'
+                    ocr_engine = row.get('ocr_engine', '').strip() or 'tesseract'
+                    ocr_engine_pdf_parser = row.get('ocr_engine_pdf_parser', '').strip() or None
                     min_img_pixels_raw = row.get('min_img_pixels', '').strip()
                     min_img_pixels = int(min_img_pixels_raw) if min_img_pixels_raw.isdigit() else 0
-                    server_root_raw = row.get('server_root', '').strip()
-                    server_root = str(Path(server_root_raw).expanduser()) if server_root_raw else None
+                    server_root = cls._resolve_server_root(row.get('server_root', ''))
                     public_base_url = row.get('public_base_url', '').strip() or None
                     rights = row.get('rights', '').strip() or None
                     provider_id = row.get('provider_id', '').strip() or None
                     provider_name = row.get('provider_name', '').strip() or None
                     attribution = row.get('attribution', '').strip() or None
+                    font_conv = row.get('font_conv', '').strip() or None
+                    font_lang = row.get('font_lang', '').strip() or None
+                    font_detect = cls._parse_bool(row.get('font_detect', ''),
+                                                  default=True)
+                    font_names = cls._parse_bool(row.get('font_names', ''))
 
                     base_name = pdf_path.stem
                     if scanned_copy:
                         base_name += '_scanned'
+                    if ocr_engine_pdf_parser:
+                        base_name += f'_op-{ocr_engine_pdf_parser}'
+
+                    # base_name is only known here, so the row is filtered now
+                    # rather than as soon as its filename was read
+                    if not cls.is_case_selected(selected, filename, base_name):
+                        skipped.append(base_name)
+                        continue
+
                     if pdf_type in {'acts', 'sebi_circulars'}:
                         expected_file = 'bluebell'
                     else:
@@ -185,6 +449,8 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                         'has_doc_end': has_doc_end,
                         'is_footnote_continuation': is_footnote_continuation,
                         'ocr_language': ocr_language,
+                        'ocr_engine': ocr_engine,
+                        'ocr_engine_pdf_parser': ocr_engine_pdf_parser,
                         'min_img_pixels': min_img_pixels,
                         'server_root': server_root,
                         'public_base_url': public_base_url,
@@ -192,82 +458,56 @@ class TestPdfToHtmlDiff(unittest.TestCase):
                         'provider_id': provider_id,
                         'provider_name': provider_name,
                         'attribution': attribution,
+                        'font_conv': font_conv,
+                        'font_lang': font_lang,
+                        'font_detect': font_detect,
+                        'font_names': font_names,
                         'expected_html': cls.expected_output_dir / f"{base_name}.{expected_file}",
                         'actual_html': cls.actual_output_dir / f"{base_name}.{expected_file}"
                     })
         except Exception as e:
-            print(f"Error reading CSV file {cls.csv_file}: {e}")
+            print(f"Error reading CSV file {csv_file}: {e}")
+
+        added = cls.test_cases[added_before:]
+        if selected:
+            print(f"Selected {len(added)} of {len(added) + len(skipped)} "
+                  f"case(s) in {csv_file.name}: "
+                  f"{', '.join(tc['pdf_name'] for tc in added) or 'none'}")
+
+            if not added and skipped:
+                print(f"Available cases are: {', '.join(skipped)}")
 
     def _process_pdf(self, test_case, pdf_type=None, is_amendment=False, has_sidenotes = False,
                      char_margin = None, word_margin = None, line_margin = None,
                      start_page = None, end_page = None, scanned_copy = False, table_extract = False,
                      figure_text = False,
                      has_doc_end = False, is_footnote_continuation = False, ocr_language = 'eng',
+                     ocr_engine = 'tesseract', ocr_engine_pdf_parser = None,
                      min_img_pixels = 0, server_root = None, public_base_url = None,
-                     rights = None, provider_id = None, provider_name = None, attribution = None):
-        """Process a single PDF file and generate HTML output."""
-        source_path = Path(test_case['pdf_path'])
-        pdf_path_for_main = test_case['pdf_path']
-        renamed_copy = None
-        if test_case['pdf_name'] != source_path.stem:
-            renamed_copy = self.actual_output_dir / f"{test_case['pdf_name']}{source_path.suffix}"
-            shutil.copy2(source_path, renamed_copy)
-            pdf_path_for_main = str(renamed_copy)
+                     rights = None, provider_id = None, provider_name = None, attribution = None,
+                     font_conv = None, font_lang = None, font_detect = True,
+                     font_names = False):
+        """Process a single PDF file and generate HTML output, in this process."""
+        job = self._build_job(test_case, {
+            'pdf_type': pdf_type, 'is_amendment': is_amendment,
+            'has_sidenotes': has_sidenotes, 'char_margin': char_margin,
+            'word_margin': word_margin, 'line_margin': line_margin,
+            'start_page': start_page, 'end_page': end_page,
+            'scanned_copy': scanned_copy, 'table_extract': table_extract,
+            'figure_text': figure_text, 'has_doc_end': has_doc_end,
+            'is_footnote_continuation': is_footnote_continuation,
+            'ocr_language': ocr_language, 'ocr_engine': ocr_engine,
+            'ocr_engine_pdf_parser': ocr_engine_pdf_parser,
+            'min_img_pixels': min_img_pixels,
+            'server_root': server_root, 'public_base_url': public_base_url,
+            'rights': rights, 'provider_id': provider_id,
+            'provider_name': provider_name, 'attribution': attribution,
+            'font_conv': font_conv, 'font_lang': font_lang,
+            'font_detect': font_detect,
+            'font_names': font_names
+        })
 
-        try:
-            # Create Main instance
-            main = Main(
-                pdfPath=pdf_path_for_main,
-                # start=start_page,
-                # end=end_page,
-                is_amendment_pdf=is_amendment,
-                output_dir=str(self.actual_output_dir),
-                pdf_type=pdf_type,
-                has_side_notes = has_sidenotes,
-                has_doc_end = has_doc_end,
-                is_footnote_continuation = is_footnote_continuation,
-                min_img_pixels = min_img_pixels,
-                ocr_language = ocr_language,
-                is_scanned_copy = scanned_copy,
-                table_extract = table_extract,
-                figure_text = figure_text,
-                public_base_url = public_base_url,
-                server_root = server_root,
-                rights = rights,
-                provider_id = provider_id,
-                provider_name = provider_name,
-                attribution = attribution
-            )
-
-            # Parse PDF
-            parse_success = main.parsePDF(pdf_type, char_margin, word_margin, line_margin,\
-                                          start_page, end_page)
-            if not parse_success:
-                return False
-
-            # Build HTML
-            main.buildHTML(start_page, end_page)
-
-            suffix = test_case['actual_html'].suffix
-            filename = self._compute_output_filename(
-                test_case['pdf_name'], start_page, end_page, main.total_pgs, suffix
-            )
-            test_case['actual_html'] = self.actual_output_dir / filename
-            test_case['expected_html'] = self.expected_output_dir / filename
-
-            # Clean up cache
-            main.clear_cache_pdf()
-            main.clear_xml_cache()
-
-            return True
-
-        except Exception as e:
-            logging.error(f"Error processing PDF {test_case['pdf_name']}: {e}")
-            return False
-
-        finally:
-            if renamed_copy and renamed_copy.exists():
-                renamed_copy.unlink()
+        return self._apply_case_result(test_case, process_case(job))
 
     def _compare_html_output(self, test_case):
         """Compare actual HTML output with expected baseline."""
@@ -391,9 +631,26 @@ def update_golden_files(actual_dir, expected_dir):
             copied_files += 1
             print(f"[UPDATED] {target_file}")
         elif actual_file.is_dir():
-            shutil.copytree(actual_file, target_file, dirs_exist_ok=True)
-            copied_files += 1
-            print(f"[UPDATED] {target_file}/")
+            # mirror each immediate child (e.g. manifest/<pdfname>) individually
+            # rather than one merge-copytree over the whole directory, so a
+            # child's stale files/subfolders (renamed or dropped images, a
+            # pdf that no longer produces a manifest) are actually removed
+            # instead of accumulating forever; untouched siblings under
+            # target_file are left alone, so a partial --cases run only
+            # updates the goldens for the cases it actually regenerated
+            target_file.mkdir(parents=True, exist_ok=True)
+            for child in actual_file.iterdir():
+                target_child = target_file / child.name
+                if target_child.is_dir():
+                    shutil.rmtree(target_child)
+                elif target_child.exists():
+                    target_child.unlink()
+                if child.is_dir():
+                    shutil.copytree(child, target_child)
+                else:
+                    shutil.copy2(child, target_child)
+                copied_files += 1
+                print(f"[UPDATED] {target_child}")
 
     print(f"\n✅ Updated {copied_files} golden file(s) in {expected_dir}")
 
@@ -428,10 +685,50 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, overwrites expected_html files with actual_html outputs."
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="How many PDFs to convert at the same time (1 disables parallelism). "
+             "Defaults to the DIFF_TEST_WORKERS env var, then to 4."
+    )
+    parser.add_argument(
+        "--cases",
+        nargs='+',
+        default=None,
+        metavar="CASE",
+        help="Run only these cases from test_cases.csv instead of all of them. "
+             "A case can be given as a file name (sebi1.pdf), a stem (sebi1), the "
+             "name it is reported under (changeofnames_scanned) or a glob (sebi*). "
+             "Defaults to the DIFF_TEST_CASES env var."
+    )
+    parser.add_argument(
+        "--csv",
+        dest="csv_files",
+        action="append",
+        default=None,
+        help="Which test-cases CSV to run (by filename, e.g. test_cases.csv or "
+             "test_judgment_cases.csv). Repeatable. Default: run every registered CSV. "
+             "Output always goes to actual_html/ (and expected_html/, diff_results/) "
+             "regardless of which CSV(s) are selected."
+    )
     args, remaining = parser.parse_known_args()
+
+    if args.csv_files:
+        TestPdfToHtmlDiff.selected_csvs = args.csv_files
+
+    if args.workers:
+        # picked up by TestPdfToHtmlDiff.get_worker_count()
+        os.environ['DIFF_TEST_WORKERS'] = str(args.workers)
+
+    if args.cases:
+        # picked up by TestPdfToHtmlDiff.get_selected_cases()
+        os.environ['DIFF_TEST_CASES'] = ','.join(args.cases)
 
     # If update flag is passed → update golden files directly
     if args.update_golden:
         update_golden_files(actual_html_dir, expected_html_dir)
     else:
+        # unittest reads sys.argv itself, so keep only what it understands
+        sys.argv = [sys.argv[0]] + remaining
         unittest.main()

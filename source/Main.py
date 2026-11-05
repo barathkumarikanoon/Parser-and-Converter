@@ -7,8 +7,14 @@ import re
 import codecs
 import logging
 import shutil
-from .ParserTool import ParserTool, ChromeLensParserTool
+import uuid
+import signal
+import atexit
+import weakref
+import pymupdf
+from .ParserTool import ParserTool, ChromeLensParserTool, TesseractParserTool
 from .Page import Page, SectionState
+from .Judgment import JudgmentBuilder
 from .HTMLBuilder import HTMLBuilder, HTMLBuilderChromeLens
 from .Acts import Acts
 from .SebiCirculars import SebiCirculars
@@ -16,15 +22,511 @@ from .Amendment import Amendment
 from .Utils import *
 from .FontMapper import DynamicFontMapper
 from .Manifest import IIIFManifest
+from .Figure import PageImages
 from .TableExtraction import HeaderRowClassifier, RegionMergeClassifier, ContinuationClassifier
+from .Table import table_dataframe_cell_match_ratio
+from .SentenceEndDetector import INDIC_SENTENCE_END_CHARS, INDIC_SEMICOLON_CHARS
+
+from contextlib import contextmanager
+
+try:
+    from indic2unicode.fontconv import FontConv
+    INDIC2UNICODE_AVAILABLE = True
+except ImportError:
+    INDIC2UNICODE_AVAILABLE = False
+
+try:
+    from indic2unicode.tools.fix_tounicode import ToUnicodeFixer, get_font_converter
+    TOUNICODE_FIX_AVAILABLE = True
+except ImportError:
+    TOUNICODE_FIX_AVAILABLE = False
+
+try:
+    from camelot import handlers as camelot_handlers
+    from camelot.utils import get_image_char_and_text_objects
+    # camelot offers no hook of its own, so the conversion is installed by
+    # wrapping the one function all of its layouts come from
+    CAMELOT_LAYOUT_AVAILABLE = hasattr(camelot_handlers, "get_page_layout")
+except ImportError:
+    CAMELOT_LAYOUT_AVAILABLE = False
+
+
+# --- accessors that let one conversion run over both kinds of char it has to
+# --- handle: the <text> elements of the xml, and camelot's own LTChar objects
+
+def get_xml_text_font(text):
+    return text.attrib.get("font")
+
+
+def get_xml_text_text(text):
+    return text.text
+
+
+def set_xml_text_text(text, value):
+    text.text = value
+
+
+def get_lt_char_font(char):
+    # LTAnno, the spaces and newlines pdfminer inserts itself, carries no font
+    return getattr(char, "fontname", None)
+
+
+def get_lt_char_text(char):
+    return char.get_text()
+
+
+def set_lt_char_text(char, value):
+    char._text = value
+
+
+XML_TEXT_ACCESSORS = (get_xml_text_font, get_xml_text_text, set_xml_text_text)
+LT_CHAR_ACCESSORS = (get_lt_char_font, get_lt_char_text, set_lt_char_text)
+
+# --- names a legacy indic font is known by in a pdf, when they are not the
+# --- name of its indic2unicode converter: Kruti Dev is written with a space
+# --- (and usually a face number after it, 'Kruti Dev 010'), so the converter
+# --- key 'krutidev' never matches the name the pdf carries. Vivek and DevLys
+# --- are the same encoding under other names, and the pdf font is named for
+# --- its face rather than its encoding ('Vivek-BoldA', 'DevLys 010'), which a
+# --- face number ('DevLys 020') or a style word can follow. indic2unicode
+# --- points its own 'vivek'/'devlys' keys at the very same converter object,
+# --- so naming them here only makes the equivalence hold on a build that
+# --- predates those keys
+# --- 'tamelango' is the whole TAM_ELANGO family, whose faces a pdf names with
+# --- and without the separators ('TAM_ELANGO_Panchali', 'B067TAMElangoPanchali'
+# --- and 'B068TAMElangoPanchaliBol' are all in one document of the Tamil Nadu
+# --- gazette) and whose display faces (Kapilan) draw the same TAM layout the
+# --- text face does. It matches no other family of that corpus: the TAU faces
+# --- ('TAUElangoPanchali') are the unicode fonts of the same foundry and need
+# --- no decoder, and 'tam' alone would sweep in TAMVANAVILAvvaiyar, a font
+# --- this converter was never read against
+INDIC_FONT_NAME_ALIASES = {
+    'krutidev': [r'kruti[\s_-]*dev', r'vivek', r'dev[\s_-]*lys'],
+    # --- the TAM layout is a layout and not a typeface, so a font of any
+    # --- family can be cut in it and names itself with the layout in front of
+    # --- the face: the Vanavil typing package's own faces are carried in the
+    # --- Tamil Nadu gazette both as themselves (VANAVILAvvaiyar, which
+    # --- fonts/tamil/vanavil.py reads) and in this one, as
+    # --- TAMVANAVILAvvaiyar, TAM-VANAVIL-Avvaiyar, TAMVanavilAvvaiyar,
+    # --- TAMVanavilPandian and TAMVANAVILKanchiNormal - one alias for all
+    # --- five, the separators spelled the way the elango one spells them
+    'tamelango': [r'tam[\s_-]*elango', r'tam[\s_-]*vanavil'],
+    # --- the tamil TM-Chanakya of the Kerala gazette, which indic2unicode keys
+    # --- by its three faces and by the unseparated 'tmchanakya' - so a face it
+    # --- does not list ('TM-Chanakya-BoldItalic', 'TM-Chanakya,Bold') or a
+    # --- separator it does not spell ('TM Chanakya') still reaches it, rather
+    # --- than being matched by nothing tamil and falling to 'chanakya' below
+    'tmchanakya': [r'tm[\s_-]*chanakya'],
+}
+
+# --- the converter keys whose name is not the pattern to look for in a pdf
+# --- font name. 'nudi' is the legacy 8 bit Nudi, whose text is the keys the
+# --- typist pressed, and NudiUni is the unicode font of the same family,
+# --- whose text is real kannada - but '.*nudi.*' matches 'NudiUni01e' too and
+# --- takes it first, since no longer key matches that name at all. Handing
+# --- real kannada to a decoder that reads latin is the one outcome worth
+# --- guarding against, so the key is held to a name that is not NudiUni.
+# --- The unicode font needs its glyphs reordered rather than decoded and has
+# --- a converter of its own, nudiuni_glyphs, which is reached through
+# --- get_repaired_font_res() and never by name - like every *_glyphs
+# --- converter it is for the text of a pdf that has already been repaired.
+# --- ---
+# --- 'vanavil' is the same guard, and the thing it guards against is the same
+# --- one thing: handing text to a decoder that reads a different layout. The
+# --- Vanavil typing package's faces are carried in the Tamil Nadu gazette in
+# --- three layouts, and a font of one of the other two says so by putting
+# --- that layout in front of the face - TAMVANAVILAvvaiyar and
+# --- TAM-VANAVIL-Avvaiyar are the TAM layout, which fonts/tamil/tamelango.py
+# --- reads, and TABVanavilAvvaiyar is the TAB one, which nothing here reads
+# --- at all. Only a name that *starts* with the family is this converter's,
+# --- so the key is held to one with no letter in front of it and none in
+# --- front of the separator a name spells that prefix with
+# --- ---
+# --- 'chanakya' is the devanagari Chanakya of the Kruti Dev family, and
+# --- TM-Chanakya is a tamil font of the Kerala gazette that shares nothing with
+# --- it but the name - its text is the tamil of fonts/tamil/tmchanakya.py, and
+# --- the devanagari decoder would turn it into devanagari rubbish. Keys are
+# --- tried longest first, so 'tmchanakya' and its faces win today anyway; the
+# --- guard is what keeps it that way for a spelling no longer key matches
+# --- ---
+# --- 'revathi' is the same guard for the same reason, one family over:
+# --- ML-Revathi-Normal is the Type 1 build of the font, whose glyphs the pdf
+# --- names by mac roman, and ML-TTRevathi is the TrueType build, whose text
+# --- is the windows 1252 characters of the same bytes - so the one byte comes
+# --- out of the two as two different characters (ര്‍ is ¿ in one and À in the
+# --- other) and each build has a converter of its own. Every spelling of the
+# --- TT build goes to 'ttrevathi', and 'revathi' is held to a name with no TT
+# --- in front of it
+# --- ---
+# --- 'notoserif' and its pdf font name 'NotoSerifMalayalam' are for the one
+# --- font, Noto Serif Malayalam, and not for every Noto Serif: matched
+# --- anywhere, 'notoserif' reaches the latin NotoSerif-Regular and every other
+# --- script's NotoSerif<Script>, none of which that decoder reads. So the name
+# --- has to start with the family - at the start or behind the six letter
+# --- subset prefix - in either spelling a pdf carries it in ('NotoSerifMalayalam',
+# --- 'Noto Serif Malayalam'), in any of its weights. Its Regular face is the one
+# --- exception: in the Kerala gazette that name is carried by other producers
+# --- than the one the converter was read off, with sound text
+# --- ('NotoSerifMalayalam-Regular', 'പരസ്യം നമ്പർ ... താലൂക്കിൽ') or
+# --- unembedded and garbled a different way ('NotoSerifMalayalam-Regul'), and
+# --- decoding sound text is the one outcome worth guarding against
+NOTO_SERIF_MALAYALAM_PATTERN = \
+    r'(?:^|\+)noto[\s_-]*serif[\s_-]*malayalam(?![\s,_-]*regul)'
+
+INDIC_FONT_NAME_PATTERNS = {
+    'nudi': r'nudi(?![\s_-]*uni)',
+    'vanavil': r'(?<![a-z])(?<![a-z][\s_-])vanavil',
+    'chanakya': r'(?<!tm)(?<!tm[\s_-])chanakya',
+    'revathi': r'(?<!tt)(?<!tt[\s_-])revathi',
+    'ttrevathi': r'tt[\s_-]*revathi',
+    'notoserif': NOTO_SERIF_MALAYALAM_PATTERN,
+    'NotoSerifMalayalam': NOTO_SERIF_MALAYALAM_PATTERN,
+}
+
+# --- what pdfminer writes for a glyph its font's ToUnicode map has no entry
+# --- for: the literal string '(cid:315)', the cid being the glyph's id in the
+# --- font. The whole of a glyph's <text> element has to be the placeholder for
+# --- it to be one, and not text of the document that reads like one
+CID_PLACEHOLDER_RE = re.compile(r'^\(cid:(\d+)\)$')
+
+# --- and the converters that read such a glyph as chr(cid), which is what an
+# --- extractor that falls back on the cid rather than dropping the glyph (e.g.
+# --- pymupdf) hands out. Tunga draws a consonant and the matra i or o of it as
+# --- one glyph and the maps of these pdfs leave nine of those ligatures out,
+# --- which is 209 glyphs in test/test_pdfs/kannada-tunga.pdf - one in the
+# --- middle of every other word, each breaking the syllable the converter
+# --- reads around it - so fonts/kannada/tunga.py carries a LIG_ token for each
+# --- of them at exactly that character, the cids of a Tunga pdf being the
+# --- glyph ids of Tunga itself.
+# ---
+# --- No other converter is in here, and this is not a list waiting to be
+# --- widened: chr(cid) is a reading of a glyph only where the font's cids are
+# --- the codepoints a converter has tokens at. In an ordinary subset font the
+# --- cid is an arbitrary glyph id, so chr(cid) is a control character carrying
+# --- nothing - and handing one to a converter is worse than leaving the
+# --- placeholder alone, since the converter drops the character it cannot read
+# --- and the placeholder was at least visible in the output as the glyph that
+# --- could not be recovered. Measured: on test/test_judgment_pdfs/judgment59.pdf
+# --- (Nirmala UI, cids 3/18/24/27) doing this to every converter turned
+# --- 'माग(cid:18), मुकनराि' into 'माग, मुकनराि', quietly losing the reph. Which
+# --- side a font falls on is the same asymmetry the font detection is tuned
+# --- around - a glyph left as it is loses an improvement, a glyph read wrongly
+# --- destroys text - so a converter earns its place here by having tokens at
+# --- these characters, not by being likely to
+CID_FALLBACK_FONT_KEYS = {'tunga'}
+
+# --- the model machinelearning/training.py writes, which says what a font is
+# --- drawing from the text extracted from it, see detect_unknown_fonts()
+FONT_MODEL_DIR = PROJECT_ROOT / 'model'
+
+# --- one model per language of the text a font draws: a class is a way of
+# --- encoding a script, so a model trained on the devanagari fonts knows
+# --- nothing of the kannada ones and calling either from the other's classes
+# --- is exactly the wrong-decoder-on-correct-text failure detection is tuned
+# --- to avoid. -fl/--font-lang picks between them, -fm/--font-model names a
+# --- model outright and wins over it
+FONT_LANG_MODELS = {
+    'hin': 'eng_hin_fonts.pkl',
+    'tam': 'eng_tam_fonts.pkl',
+    'kan': 'eng_kan_fonts.pkl',
+    'mar': 'eng_mar_fonts.pkl',
+    'mal': 'eng_mal_fonts.pkl',
+    'tel': 'eng_tel_fonts.pkl',
+    'ori': 'eng_ori_fonts.pkl',
+    'pan': 'eng_pan_fonts.pkl',
+    'guj': 'eng_guj_fonts.pkl',
+}
+DEFAULT_FONT_LANG = 'hin'
+FONT_MODEL_PATH = FONT_MODEL_DIR / FONT_LANG_MODELS[DEFAULT_FONT_LANG]
+
+
+def get_font_model_path(font_lang=None):
+    """the model -fl/--font-lang names, the devanagari one when it names none"""
+    return FONT_MODEL_DIR / FONT_LANG_MODELS[font_lang or DEFAULT_FONT_LANG]
+
+# the types whose output is bluebell rather than html (see buildHTML)
+BLUEBELL_PDF_TYPES = frozenset(['acts', 'sebi_circulars'])
+
+# --- the classes that model is trained on, mapped to the converter the text of
+# --- such a font needs. A class already named after its converter needs no
+# --- entry here, these are only the ones the two spell differently
+FONT_CLASS_CONVERTERS = {
+    'nirmala': 'nirmalaui',
+}
+
+# --- the class of the fonts that need no decoder at all: their text is already
+# --- unicode and is taken as it is
+FONT_CLASS_NOT_REQUIRED = 'not_required'
+
+# --- classes that do identify the font but have no converter to point it at. A
+# --- Type3 font's text is put right by repair_tounicode() before anything is
+# --- extracted from the pdf, so by the time it can be classified at all there
+# --- is nothing left to do to it. Mangal is here for both halves of the same
+# --- reason: repair_tounicode() puts its text right too, and a Mangal that
+# --- reaches detection at all is one the repair could not place - whose text
+# --- is therefore still missing the characters of every glyph the shaper made,
+# --- since that map hands them <0000> rather than the wrong character. Those
+# --- characters are simply not in the text and no decoder can put back what
+# --- was never extracted, so the only correct thing to do with such a font is
+# --- to leave it alone. mangal_glyphs is a reordering pass for text the repair
+# --- did place, and is reached through get_repaired_font_res(), never here.
+# ---
+# --- The rest of the set is every other class of that kind, one per font whose
+# --- converter in indic2unicode is a *_glyphs pass registered under no bare
+# --- font name: nudiuni, tauelango, ilasundaram, marutham, meera, freeserif
+# --- and nats. Each of those is a real unicode font that repair_tounicode()
+# --- puts right and whose converter only reorders the text the repair wrote,
+# --- so a font of one of them that reaches detection at all is - exactly as
+# --- with Mangal - one the repair could not place, whose text is not merely
+# --- out of order: NudiUni's shaped glyphs and Meera's reordered ones are
+# --- missing from it outright, FreeSerif's clusters and syllables are missing
+# --- from it too (mPDF hands each of those a private use codepoint rather
+# --- than a character), and TAU Elango Panchali's and Uni-Ila.Sundaram's
+# --- carry the wrong characters, so reordering it would only move wrong text
+# --- about. The model naming one of these is therefore right and still says
+# --- nothing that can be acted on. meera, freeserif and nats are named here
+# --- before any model is trained on their scripts, for the reason the comment
+# --- on FONT_CLASSES_INDIC_TEXT gives: this table is a statement about which
+# --- converters exist under which name, not about which classes a model
+# --- happens to have today
+FONT_CLASSES_WITHOUT_CONVERTER = {
+    'type3', 'mangal', 'nudiuni', 'tauelango', 'ilasundaram', 'marutham',
+    'meera', 'freeserif', 'nats',
+}
+
+# --- the fonts whose name already places them in one of the two classes above, and
+# --- which are therefore never handed to the model either: whatever it answers
+# --- about such a font, the only thing that can be done with its text is to
+# --- take it as it is, so classifying it can add nothing and can only get it
+# --- wrong. This is the name-based half of FONT_CLASSES_WITHOUT_CONVERTER; the
+# --- type3 half of it is not a name at all and is read off the pdf instead,
+# --- see get_type3_font_names(). Matched anywhere in the name, case
+# --- insensitively, exactly as FONT_DETECT_SKIP_RE and the -fc names are - bar
+# --- nats, which is spelt with a lookbehind for the reason the vanavil pattern in
+# --- INDIC_FONT_NAME_PATTERNS is: four letters match inside too many words to
+# --- be taken anywhere in a name, so a font is this one only where the name
+# --- starts with it or a separator does
+FONT_DETECT_NO_CONVERTER_RE = re.compile(
+    r'mangal|nudi[\s_-]*uni|tau[\s_-]*elango|ila[\s._-]*sundaram'
+    r'|marutham|meera|free[\s_-]*serif|(?<![a-z])nats',
+    re.IGNORECASE
+)
+
+# --- how much text drawn in one font is enough to say what it is. The model is
+# --- trained on samples of 50 words and its confidence falls apart well below
+# --- that: the chanakya of union_hindi.pdf scores 1.00 on the 1000 words it
+# --- draws, 0.6 to 0.8 on the first 20 of them, 0.3 on the first 5, and a font
+# --- that draws two words gets nothing but the model's prior. A font drawing
+# --- less than this is left alone rather than decoded on a coin toss
+FONT_DETECT_MIN_WORDS = 20
+
+# --- and how sure the model has to be before its answer is acted on
+FONT_DETECT_MIN_PROB = 0.5
+
+# --- the fonts whose name does say what they are drawing, and says that it is
+# --- plain latin unicode: the standard text faces, the ones the corpus's
+# --- not_required class is built out of (see FontSurvey's -nf). A font named
+# --- like one of these is never handed to the model at all - there is nothing
+# --- for detection to add, since the answer is already known, and a false
+# --- positive on one of them would decode text that is perfectly readable as
+# --- it is. This is the name-based half of the same guard get_detected_font_key()
+# --- applies to the model's answers. Written with an optional separator inside
+# --- the multi word names because a pdf spells them both ways (Book Antiqua and
+# --- BookAntiqua, Yu Gothic and YuGothic), and matched anywhere in the name,
+# --- case insensitively, exactly as the -fc and the built in font names are -
+# --- so a subset prefix or a style suffix (ABCDEF+TimesNewRoman,Bold) matches too.
+# --- The one exception is TeX's Computer Modern (CMR10, CMMI10, CMSY10, CMBX12,
+# --- CMTT10, CMEX10, CMCSC10, CMBXTI10, ...), named as a few letters and a design
+# --- size: two letters are far too short to match anywhere, so it is held to the
+# --- start of the name or to just behind the subset prefix. The model called the
+# --- CMR10 of test/test_pdfs/multicolumn.pdf krutidev at 0.69 and decoded it
+FONT_DETECT_SKIP_RE = re.compile(
+    r'times|arial|calibri|cambria|courier|helvetica|verdana|tahoma|garamond'
+    r'|book[\s_-]*antiqua|bookman|liberation|nimbus|myriad[\s_-]*pro'
+    r'|minion[\s_-]*pro|segoe|malgun|yu[\s_-]*gothic'
+    r'|(?:^|\+)cm[a-z]{1,6}\d+',
+    re.IGNORECASE
+)
+
+# --- the one name the list above catches that must still be classified: Arial
+# --- Unicode MS is not a plain latin face, it is a devanagari font shipping a
+# --- ToUnicode map that was built wrong, so its text extracts as the wrong
+# --- devanagari and does need a decoder (see get_repaired_font_res). Normally
+# --- repair_tounicode() places it long before detection is reached, and the
+# --- whitelist is never consulted for it; this exception is for the build where
+# --- that does not happen - indic2unicode without ToUnicodeFixer - where the
+# --- model naming it arialuni is the only thing left that can place it. Spelt
+# --- with the same optional separator as the names above, since a pdf embeds it
+# --- both as Arial Unicode MS and as ArialUnicodeMS
+FONT_DETECT_SKIP_EXCEPT_RE = re.compile(r'arial[\s_-]*unicode', re.IGNORECASE)
+
+# --- evidence saturates long before a whole document is read (100 words of the
+# --- gazette's chanakya already score 1.00), while the features are every 1 to
+# --- 5 word phrase of the text, so there is nothing to gain from featurizing
+# --- the 300,000 words a long gazette draws in one font
+FONT_DETECT_MAX_WORDS = 20000
+
+# --- the classes whose text is already drawn in an indic script by the time it
+# --- is extracted: a font whose ToUnicode map is broken draws real devanagari,
+# --- it is just the wrong devanagari ('निर्माण' as 'जिमावण'), and type3 text was
+# --- put right by repair_tounicode() before anything read the pdf. tunga is
+# --- here for a third reason - it is a real unicode font whose map is sound, so
+# --- its text extracts as correct kannada characters and what is wrong is only
+# --- the order they are in ('ಪರ್ಸಾತ್ವನೆ' for 'ಪ್ರಸ್ತಾವನೆ'), the converter
+# --- reordering rather than decoding, and the seven classes on the second and
+# --- third lines below are here for that same third reason: nudiuni,
+# --- tauelango, ilasundaram, marutham, meera, freeserif and nats are all real
+# --- unicode fonts drawing
+# --- real kannada, tamil, malayalam and telugu, whose maps are broken in ways
+# --- repair_tounicode() is what answers (see FONT_CLASSES_WITHOUT_CONVERTER,
+# --- which names them all again for the second half of the same fact - none of
+# --- them has a converter to point at either). Every other class is a legacy
+# --- 8-bit encoding that overloads the latin codepoints, so its text extracts
+# --- as latin and cannot contain an indic character at all - which is what
+# --- makes the check in get_detected_font_key() possible, and what makes
+# --- assuming it of a class not named here the safe default. A class is named
+# --- here as soon as its font is known, not as soon as a model is trained on
+# --- it: the wrong half of this table is the half that names too few classes,
+# --- since that is the half that rejects a true verdict as an impossible one.
+# --- krishnauni and chitrauni are the unicode gujarati of the Gujarat gazette
+# --- (KrishnaUni, and ChitraUni/SuchitraUni), whose maps were built by the same
+# --- pairing slip Arial Unicode MS's was, so they draw real gujarati that is
+# --- merely the wrong gujarati - here for the first reason, like arialuni.
+# --- chitrauni has no converter yet, so a verdict naming it is left alone.
+# --- raavi is the unicode gurmukhi of Windows as Microsoft Print To PDF embeds
+# --- it in the Punjab gazette, whose map has no entry for the glyphs the shaper
+# --- made and leaves matra i in the order it is drawn ('ਿਨਯਮ' for 'ਨਿਯਮ'), so
+# --- it draws real gurmukhi and its converter reorders - here for the third
+# --- reason, like tunga
+FONT_CLASSES_INDIC_TEXT = {
+    'arialuni', 'nirmala', 'nirmalaui', 'type3', 'mangal', 'tunga',
+    'nudiuni', 'tauelango', 'ilasundaram', 'marutham', 'meera', 'freeserif',
+    'nats', 'krishnauni', 'chitrauni', 'raavi',
+    FONT_CLASS_NOT_REQUIRED,
+}
+
+# --- the indic scripts, from devanagari through sinhala plus the devanagari
+# --- extended block, used to tell text that is already decoded from the latin
+# --- a legacy encoding draws
+INDIC_SCRIPT_RE = re.compile(r'[\u0900-\u0DFF\uA8E0-\uA8FF]')
+
+# --- devanagari alone, the block and its extension
+DEVANAGARI_SCRIPT_RE = re.compile(r'[\u0900-\u097F\uA8E0-\uA8FF]')
+
+# --- the converters that read the text of one indic script only, as (the name
+# --- of the script, a regexp matching a char of it). A pdf font is matched to
+# --- a converter by its name, and a name says which font it is but not which
+# --- script it is drawing: Nirmala UI draws every indic script there is, and
+# --- the gazettes of Karnataka, Kerala, Andhra Pradesh and Odisha are set in it
+# --- as well as the Gazette of India. What reads the text of a Nirmala UI whose
+# --- map was repaired is nirmalaui_glyphs, which splits the text on its script
+# --- and hands each script to a pass of its own; but a Nirmala UI the repair
+# --- did not place is matched by name to 'nirmalaui', which is the lossy
+# --- decoder of the Gazette of India's devanagari and has no token for any
+# --- other script at all - '\u0D24\u0D3F\u0D30\u0D41\u0D24\u0D4D\u0D24\u0D7D \u0D2A\u0D30\u0D38\u0D4D\u0D2F\u0D02' comes out of it as spaces, and so
+# --- does every word of kannada and telugu. There is no converter of any
+# --- other script for such a font (its passes of those are for repaired text,
+# --- and reordering unrepaired text, whose map may be sound, would destroy
+# --- it), so the glyphs of another script are never handed to it and are left
+# --- as the pdf draws them, see convert_indic_font_runs(); and a font the
+# --- model calls 'nirmala' is only pointed at it when its text is devanagari,
+# --- see get_detected_font_key(). Every key of the same converter is held to
+# --- the same script, see get_converter_scripts()
+CONVERTER_SCRIPTS = {
+    'nirmalaui': ('devanagari', DEVANAGARI_SCRIPT_RE),
+}
+
+# --- and the share of a font's sampled characters that has to be in one of
+# --- those scripts before the model saying it is a legacy latin encoding is
+# --- read as the impossibility it is, see get_detected_font_key(). A little
+# --- indic text does turn up inside an otherwise latin font (a stray glyph, a
+# --- symbol picked out of another block), so this is not zero; it is nowhere
+# --- near 0.05 either way in practice - the mixed hindi/english CIDFont+F1 of
+# --- test/test_pdfs/lsdebate.pdf sits at 0.32, and the chanakya of
+# --- union_hindi.pdf and the vivek of act1.pdf at 0.00
+FONT_DETECT_MAX_INDIC_RATIO = 0.05
+
+# --- how much of a space's own width has to sit inside the glyph next to it
+# --- before it counts as painted over rather than as a real word break, see
+# --- Main.drop_overlapping_spaces(). A space that is genuinely there does
+# --- overlap its neighbour a little - kerning pulls a letter back over the
+# --- space before it, most of a space's width for a '.' followed by a capital
+# --- - so nothing short of the whole of it being covered says anything. That
+# --- is what an overprinted space looks like anyway: it sits entirely within
+# --- the glyph drawn over it, having advanced the pen by nothing at all
+SPACE_OVERLAP_RATIO = 0.95
+
+# --- when the two glyphs on either side of a space overlap each other by this
+# --- much of their own width, the text itself is drawn overlapping - rotated
+# --- watermarks come out of pdfminer with every char's bbox covering the next
+# --- one's - and no conclusion can be drawn from a space overlapping too
+NEIGHBOUR_OVERLAP_RATIO = 0.1
+
+
+_active_runs = {}
+
+
+def _register_run(main, keep_xml):
+    run_id = main.run_id
+
+    def _on_dead(ref, rid=run_id):
+        _active_runs.pop(rid, None)
+
+    _active_runs[run_id] = (weakref.ref(main, _on_dead), keep_xml)
+
+
+def _unregister_run(run_id):
+    _active_runs.pop(run_id, None)
+
+
+def cleanup_active_runs():
+    for run_id, (ref, keep_xml) in list(_active_runs.items()):
+        main = ref()
+        if main is not None:
+            try:
+                main.cleanup_run(keep_xml=keep_xml)
+            except Exception:
+                pass
+        _active_runs.pop(run_id, None)
+
+
+def install_cleanup_signal_handlers(signals=None):
+    if signals is None:
+        signals = (signal.SIGTERM,)
+
+    def handler(signum, frame):
+        logging.getLogger('source.Main').warning(
+            "Interrupt (%s) received - clearing cache and stopping",
+            signal.Signals(signum).name)
+        cleanup_active_runs()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in signals:
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            pass
+
+
+atexit.register(cleanup_active_runs)
+
 
 class Main:
     def __init__(self,pdfPath,is_amendment_pdf,output_dir, pdf_type, has_side_notes, has_doc_end,
                  is_footnote_continuation, min_img_pixels, ocr_language, is_scanned_copy,
                  table_extract, public_base_url=None, server_root=None,
-                 rights=None, provider_id=None, provider_name=None, attribution=None,
-                 figure_text=False): #start,end,is_amendment_pdf,output_dir, pdf_type):
+                 rights=None, provider_id=None, provider_name=None, 
+                 attribution=None, figure_text=False, font_conv_map=None,
+                 ocr_engine_image_text="tesseract", font_model=None, font_lang=None,
+                 font_detect=True, show_fonts=False, ocr_engine_pdf_parser=None,
+                 keep_xml=False): #start,end,is_amendment_pdf,output_dir, pdf_type):
         self.logger = logging.getLogger('source.Main')
+        # names this run's files in the shared cache directories, see
+        # get_run_cache_pdf()
+        self.run_id = uuid.uuid4().hex[:12]
+        self.keep_xml = keep_xml
+        _register_run(self, self.keep_xml)
         if self.is_url_like(output_dir):
             raise ValueError(
                 f"output_dir ('{output_dir}') looks like a URL, not a local filesystem "
@@ -61,6 +563,43 @@ class Main:
                 f"[!] provider_id ('{provider_id}') doesn't look like a URI - ignoring it."
             )
             provider_id = None
+        invalid_langs = [l for l in ocr_language.split('+') if l not in TESSERACT_LANGUAGES]
+        if invalid_langs:
+            raise ValueError(
+                f"ocr_language ('{ocr_language}') contains unknown language code(s) "
+                f"{invalid_langs}. Each '+'-separated code must be one of: "
+                f"{', '.join(TESSERACT_LANGUAGES)}."
+            )
+        ocr_language_image_text = ocr_language
+        if ocr_engine_image_text == "paddleocr" and ocr_language not in TESSERACT_TO_PADDLE_LANG:
+            supported = [l for l in ocr_language.split('+') if l in TESSERACT_TO_PADDLE_LANG]
+            non_english_supported = [l for l in supported if l != "eng"]
+            if non_english_supported:
+                self.logger.warning(
+                    f"[!] paddleocr doesn't support the multi-language code "
+                    f"'{ocr_language}'; using '{non_english_supported[0]}', the "
+                    f"first paddleocr-supported non-English language in it."
+                )
+                ocr_language_image_text = non_english_supported[0]
+            elif supported:
+                self.logger.warning(
+                    f"[!] paddleocr doesn't support the multi-language code "
+                    f"'{ocr_language}'; using '{supported[0]}', the only "
+                    f"paddleocr-supported language in it."
+                )
+                ocr_language_image_text = supported[0]
+            else:
+                self.logger.warning(
+                    f"[!] ocr_language ('{ocr_language}') has no paddleocr equivalent. "
+                    f"Languages supported for ocr_engine_image_text='paddleocr': "
+                    f"{', '.join(sorted(TESSERACT_TO_PADDLE_LANG))}. Falling back to 'eng'."
+                )
+                ocr_language_image_text = "eng"
+        if ocr_engine_pdf_parser is not None and ocr_engine_pdf_parser not in OCR_PDF_PARSERS_AVAILABLE:
+            raise ValueError(
+                f"ocr_engine_pdf_parser ('{ocr_engine_pdf_parser}') must be one of "
+                f"{OCR_PDF_PARSERS_AVAILABLE} or None."
+            )
 
         self.pdf_path = pdfPath
         self.output_dir = output_dir
@@ -89,6 +628,9 @@ class Main:
         self.html_builder = None
         self.min_img_pixels = min_img_pixels
         self.ocr_language = ocr_language
+        self.ocr_language_image_text = ocr_language_image_text
+        self.ocr_engine_image_text = ocr_engine_image_text
+        self.ocr_engine_pdf_parser = ocr_engine_pdf_parser
         self.is_scanned_copy = is_scanned_copy
         self.table_extract = table_extract
         self.figure_text = figure_text
@@ -102,19 +644,1136 @@ class Main:
         # bottom of one page can be picked up at the top of the next (set per page in the
         # processing loops, reset here so it never leaks across documents/runs).
         self.pending_continuation = None
+        # Legacy (non unicode) indic font handling, see convert_indic_fonts()
+        self.font_conv = self.get_font_conv()
+        # the keys of the converters that read a glyph with no ToUnicode entry
+        # as the character of its cid, see get_indic_char_text()
+        self.cid_fallback_font_keys = self.get_cid_fallback_font_keys()
+        # the keys of the converters that read one script only, see
+        # CONVERTER_SCRIPTS
+        self.converter_scripts = self.get_converter_scripts()
+        # mappings given by the caller come first, so that a font can be pointed at
+        # a converter its name does not name, or at a different one than it does
+        self.font_conv_map_res = self.get_font_conv_map_res(font_conv_map)
+        self.indic_font_res = self.font_conv_map_res + self.get_indic_font_res()
+        # pdf font name -> font key in FontConv.converters (None if not a legacy font)
+        self.indic_font_keys = {}
+        # (font key, text drawn in that font) -> converted unicode text
+        self.indic_text_cache = {}
+        # The fonts none of the above can place are identified from the text they
+        # draw instead, with the model of machinelearning/, see detect_unknown_fonts()
+        self.font_detect = font_detect
+        # a model named outright says which model to use; a language only says
+        # which of the ones shipped here to pick, so -fm wins over -fl
+        if font_lang and font_lang not in FONT_LANG_MODELS:
+            raise ValueError(
+                f"font_lang ('{font_lang}') names no font model. The languages a "
+                f"model is shipped for are: {', '.join(sorted(FONT_LANG_MODELS))}. "
+                f"Name a model of your own with font_model/-fm instead."
+            )
+        if font_model and font_lang:
+            self.logger.warning(
+                'both a font model (%s) and a font language (%s) were given, '
+                'going with the model', font_model, font_lang
+            )
+        self.font_model = font_model or get_font_model_path(font_lang)
+        # loaded when a document first has a font that needs it: None means not
+        # tried yet, False means tried and failed (so it is reported just once)
+        self.font_classifier = None
+        # the names pdfminer gives the type3 fonts of the document, read off the
+        # pdf when detection first needs them, see get_type3_font_names()
+        self.type3_font_names = None
+        # {pdf font name: what the model called it}, for every font detection was
+        # actually run on, whether or not the answer was acted on. Reported in the
+        # html as data-detected-font when -fn/--font-names is given
+        self.detected_font_classes = {}
+        # -fn/--font-names: name the pdf font of every run of text in the output,
+        # as <span data-font="...">. It is markup of the html output itself, so
+        # it means nothing for the types that are written as bluebell instead
+        self.show_fonts = show_fonts
+        if show_fonts and pdf_type in BLUEBELL_PDF_TYPES:
+            self.logger.warning(
+                f"[!] font names (-fn) are html markup and the '{pdf_type}' type "
+                f"is written as bluebell, not html - ignoring the option."
+            )
+            self.show_fonts = False
         # self.fontmapper.extract_fonts()
+
+    # --- func to get the indic2unicode font convertor, None if unavailable ---
+    def get_font_conv(self):
+        if not INDIC2UNICODE_AVAILABLE:
+            self.logger.info(
+                "indic2unicode is not installed, conversion of text in legacy "
+                "indic fonts is disabled"
+            )
+            return None
+
+        try:
+            return FontConv()
+        except Exception as e:
+            self.logger.warning(
+                "Could not initialize indic2unicode FontConv, conversion of "
+                "text in legacy indic fonts is disabled: %s", e
+            )
+            return None
+
+    # --- func to get the regexps for the font mappings the caller supplied ---
+    def get_font_conv_map_res(self, font_conv_map):
+        """Turn -fc/--font-conv 'FONT=CONVERTER' mappings into matching regexps.
+
+        Legacy indic fonts are usually recognisable by name, but a subsetted pdf
+        can name one anything at all (a gazette in the chanakya encoding whose
+        font is called 'TT572t00', with no ToUnicode map and latin glyph names,
+        is indistinguishable from a genuine latin font), so the caller gets to
+        say which converter such a font needs.
+        """
+        if not font_conv_map:
+            return []
+
+        if isinstance(font_conv_map, str):
+            font_conv_map = [font_conv_map]
+
+        if self.font_conv is None:
+            self.logger.warning(
+                "[!] indic2unicode is not installed, ignoring the font conversion "
+                "mapping(s): %s", ', '.join(font_conv_map)
+            )
+            return []
+
+        supported = sorted(self.font_conv.converters)
+        font_res = []
+
+        for mapping in font_conv_map:
+            # a single option can carry several comma separated mappings
+            for entry in mapping.split(','):
+                entry = entry.strip()
+
+                if not entry:
+                    continue
+
+                font_name, separator, font_key = entry.partition('=')
+                font_name = font_name.strip()
+                font_key = font_key.strip().lower()
+
+                if not separator or not font_name or not font_key:
+                    raise ValueError(
+                        f"font conversion mapping '{entry}' is not of the form "
+                        f"FONT=CONVERTER (e.g. TT572t00=chanakya)"
+                    )
+
+                if font_key not in self.font_conv.converters:
+                    raise ValueError(
+                        f"font conversion mapping '{entry}' asks for the converter "
+                        f"'{font_key}', which does not exist. The supported ones are: "
+                        f"{', '.join(supported)}"
+                    )
+
+                self.logger.info(
+                    "Text in font %s will be converted to unicode using %s, as asked for",
+                    font_name, font_key
+                )
+
+                font_res.append(
+                    (re.compile('.*%s.*' % re.escape(font_name), re.IGNORECASE), font_key)
+                )
+
+        return font_res
+
+    # --- func to repair the broken ToUnicode maps a pdf's fonts may carry ---
+    def repair_tounicode(self):
+        """Rewrites the broken ToUnicode maps of the pdf into a repaired copy.
+
+        A gazette set in Arial Unicode MS or in Nirmala UI carries a ToUnicode
+        map that was built by pairing the glyphs of a run with the characters
+        of that run one by one, which devanagari shaping makes slip: निर्माण
+        is extracted as जिमावण. The glyphs are drawn correctly, so only the
+        extraction is wrong and the map can be built again from what the font
+        says about its own glyphs - the characters its cmap draws, the names
+        it keeps for them and the rules its GSUB shapes them with - see
+        indic2unicode/tools/fix_tounicode.py.
+
+        The repair is done before anything reads the pdf, and only for the
+        fonts that are known to carry a broken map, so pdfminer and camelot
+        both get the characters that are really there. What they get is still
+        in the order in which the glyphs are drawn, so the text of a repaired
+        font is pointed at the converter that only reorders it rather than at
+        the one named after the font, which is for an unrepaired pdf.
+        """
+        if not TOUNICODE_FIX_AVAILABLE:
+            self.logger.debug(
+                "indic2unicode's ToUnicodeFixer is not available, the ToUnicode "
+                "maps of %s are left as they are", self.pdf_path
+            )
+            return
+
+        if not os.path.exists(self.pdf_path) or not self.is_pdf_file(self.pdf_path):
+            return
+
+        try:
+            fixer = ToUnicodeFixer()
+            doc = pymupdf.open(self.pdf_path)
+            num = fixer.fix_document(doc)
+
+            if not num:
+                doc.close()
+                return
+
+            # the repaired copy keeps the name of the document, everything
+            # that is written out is named after it
+            fixed_dir = os.path.join(self.get_run_cache_pdf(), 'tounicode')
+            os.makedirs(fixed_dir, exist_ok = True)
+            fixed_path = os.path.join(fixed_dir, os.path.basename(self.pdf_path))
+            doc.save(fixed_path)
+            doc.close()
+        except Exception as e:
+            self.logger.warning(
+                "[!] Could not repair the ToUnicode maps of %s, its text is "
+                "extracted as it is: %s", self.pdf_path, e
+            )
+            return
+
+        self.logger.info(
+            "Repaired %d glyphs of the ToUnicode maps of the font(s) %s, "
+            "parsing %s instead", num, ', '.join(sorted(fixer.fixed_fonts)),
+            fixed_path
+        )
+
+        self.pdf_path = fixed_path
+        # the fonts of the repaired pdf are read from the repaired copy too
+        if self.fontmapper is not None:
+            self.fontmapper.pdf_path = fixed_path
+
+        # the name a font was repaired *as* is not always the name the pdf
+        # carries for it - a producer that writes no font name at all is
+        # looked up under the name the font program gives itself - and it is
+        # the pdf's own name that pdfminer will report, so the two are kept
+        # apart. An indic2unicode that predates fixed_font_names knows of no
+        # such font and the two names are always one
+        fixed_font_names = getattr(fixer, 'fixed_font_names', None) or \
+                           {name: name for name in fixer.fixed_fonts}
+
+        self.indic_font_res = self.font_conv_map_res + \
+                              self.get_repaired_font_res(fixed_font_names) + \
+                              self.get_indic_font_res()
+        # a font may already have been looked up while the map was broken
+        self.indic_font_keys = {}
+        self.indic_text_cache = {}
+
+    # --- func to get the regexps for the fonts whose map was repaired ---
+    def get_repaired_font_res(self, fixed_font_names):
+        """The reordering converters for the fonts repair_tounicode() repaired.
+
+        fixed_font_names is {the name the pdf carries: the name the font was
+        repaired as}. The two are the same for every font a pdf names itself,
+        and differ where the pdf named the font nothing at all and
+        ToUnicodeFixer read its name out of the embedded font program instead
+        (recover_font_names()). Which one is wanted differs by line: the
+        converter is looked up by the name the font really is, and the regexp
+        is built on the name the pdf carries, since that is the one pdfminer
+        will report and so the one this has to match.
+        """
+        if self.font_conv is None:
+            return []
+
+        font_res = []
+
+        for pdf_name, font_name in sorted(fixed_font_names.items()):
+            # the name is the one the pdf carries, which is not always the
+            # spelling the converter is listed under: Arial Unicode MS is
+            # embedded as ArialUnicodeMS too and Nirmala UI carries its bold
+            # as a font of its own named Nirmala UI,Bold, so the lookup is by
+            # a spelling that the separators, the style and the case do not
+            # change
+            font_key = get_font_converter(font_name)
+
+            if font_key is None or font_key not in self.font_conv.converters:
+                self.logger.warning(
+                    "[!] The ToUnicode map of %s was repaired but there is no "
+                    "converter to put its text in the order unicode wants, so "
+                    "it stays in the order the glyphs are drawn in", font_name
+                )
+                continue
+
+            if pdf_name == font_name:
+                self.logger.info(
+                    "Text in the repaired font %s will be reordered using %s",
+                    font_name, font_key
+                )
+            else:
+                self.logger.info(
+                    "Text in the repaired font %s, which this pdf carries as "
+                    "%s, will be reordered using %s", font_name, pdf_name,
+                    font_key
+                )
+
+            # the *whole* name, unlike the name-based regexps of
+            # get_indic_font_res, which match anywhere: this one says "this
+            # font, in this document, was really repaired", and a font whose
+            # name merely contains it was not. A .* here would reorder the
+            # text of a font that is already in the order unicode wants and
+            # so destroy it - the Tamil Nadu gazette carries
+            # TAUElangoPanchali-SC700 beside TAUElangoPanchali, only the
+            # second of which is repaired (font_lookup_key keeps them apart),
+            # and reordering the first turns செய்ய into சய்ெய. Everything
+            # around the name is what a pdf adds to it and fixed_font_names
+            # has already dropped: the six letter subset prefix, which
+            # ToUnicodeFixer.base_font strips the same way
+            font_res.append(
+                (re.compile('^(?:.{6}\\+)?%s$' % re.escape(pdf_name),
+                            re.IGNORECASE), font_key)
+            )
+
+        return font_res
+
+    # --- func to get the converter keys whose glyphs are read as chr(cid) ---
+    def get_cid_fallback_font_keys(self):
+        """CID_FALLBACK_FONT_KEYS, widened to every key of the same converter.
+
+        indic2unicode lists one converter under several keys - the bare font
+        name and the spellings a pdf carries it under ('tunga', 'Tunga',
+        'Tunga-Bold') - and which of them a font name is matched by is a matter
+        of how the pdf happens to name it, so the fallback has to follow the
+        converter object rather than the one spelling of it named above.
+        """
+        return self.get_same_converter_keys(CID_FALLBACK_FONT_KEYS)
+
+    # --- func to get the keys of the converters that read one script only ---
+    def get_converter_scripts(self):
+        """{converter key: (script name, script regexp)}, see CONVERTER_SCRIPTS.
+
+        Widened to every key of the same converter, for the reason
+        get_cid_fallback_font_keys() is: 'Nirmala UI' is the same decoder as
+        'nirmalaui', and a font is matched by whichever of the two its name
+        happens to spell.
+        """
+        return {
+            key: script
+            for font_key, script in CONVERTER_SCRIPTS.items()
+            for key in self.get_same_converter_keys([font_key])
+        }
+
+    # --- func to widen converter keys to every key of the same converter ---
+    def get_same_converter_keys(self, font_keys):
+        """Every key in FontConv.converters naming one of font_keys' converters."""
+        if self.font_conv is None:
+            return set(font_keys)
+
+        converters = self.font_conv.converters
+        wanted_convs = [converters[key] for key in font_keys if key in converters]
+
+        return {
+            key for key, converter in converters.items()
+            if any(converter is wanted for wanted in wanted_convs)
+        }
+
+    # --- func to tell whether a converter reads the text of a glyph ---
+    def is_converter_script(self, font_key, text):
+        """False when text is in an indic script the font_key converter does not read.
+
+        Text in no indic script at all - latin, digits, punctuation, a (cid:N)
+        placeholder - is the converter's to pass through, as it always was.
+        """
+        script = self.converter_scripts.get(font_key)
+
+        if script is None or not text:
+            return True
+
+        _, script_re = script
+
+        return all(script_re.match(char) for char in INDIC_SCRIPT_RE.findall(text))
+
+    # --- func to get the share of a text in an indic script a converter does not read ---
+    def get_other_script_ratio(self, text, script_re):
+        """How much of text is in an indic script other than script_re's, ignoring whitespace."""
+        chars = ''.join(text.split())
+
+        if not chars:
+            return 0.0
+
+        others = [c for c in INDIC_SCRIPT_RE.findall(chars) if not script_re.match(c)]
+
+        return len(others) / len(chars)
+
+    # --- func to get the regexps that match a pdf font to a legacy indic font ---
+    def get_indic_font_res(self):
+        if self.font_conv is None:
+            return []
+
+        font_res = []
+
+        # the first regexp that matches wins, so the keys are tried longest
+        # first: a converter keyed by a whole pdf font name has to beat the
+        # family key that is a prefix of it. Nudi is the case that needs this -
+        # 'Nudi01k,Bold' draws the kannada digits and 'nudi' the roman ones, and
+        # '.*nudi.*' matches both names, so with the keys taken in the order
+        # indic2unicode happens to list them the masthead of a Karnataka gazette
+        # comes out as 'ಸಂಪುಟ 149' instead of 'ಸಂಪುಟ ೧೪೯'. Where a shorter key
+        # wins today it is because the longer ones cannot match that name at
+        # all (Tunga/Tunga-Bold, both the same converter object anyway), so
+        # nothing else moves
+        for font_key in sorted(self.font_conv.converters, key=len, reverse=True):
+            # a key that must not be looked for as itself (nudi, which
+            # would swallow NudiUni), and failing that the key itself
+            patterns = [INDIC_FONT_NAME_PATTERNS.get(font_key)
+                        or re.escape(font_key)]
+            # a font whose pdf name is not its converter's name (Kruti Dev)
+            patterns.extend(INDIC_FONT_NAME_ALIASES.get(font_key, []))
+
+            font_res.extend(
+                (re.compile('.*%s.*' % pattern, re.IGNORECASE), font_key)
+                for pattern in patterns
+            )
+
+        return font_res
+
+    # --- func to get the legacy indic font a pdf font name corresponds to ---
+    def get_indic_font_key(self, font_name):
+        if font_name in self.indic_font_keys:
+            return self.indic_font_keys[font_name]
+
+        font_key = None
+
+        for font_re, key in self.indic_font_res:
+            if font_re.search(font_name):
+                font_key = key
+                break
+
+        self.indic_font_keys[font_name] = font_key
+
+        if font_key:
+            self.logger.info(
+                "Text in font %s will be converted to unicode using %s",
+                font_name, font_key
+            )
+
+        return font_key
+
+    # --- func to load the classifier that says what a font is drawing ---
+    def get_font_classifier(self):
+        """The trained model, loaded the first time a document needs it.
+
+        Orange takes a second to import and the model only matters for a pdf
+        that has a font nothing else can place, so neither is paid for until
+        one turns up.
+        """
+        if self.font_classifier is not None:
+            # False is a load that has already failed and been reported, which
+            # is not worth trying again
+            return self.font_classifier or None
+
+        try:
+            from machinelearning.predict import FontClassifier
+
+            self.font_classifier = FontClassifier(str(self.font_model))
+        except Exception as e:
+            self.logger.warning(
+                "[!] Could not load the font detection model %s, the fonts whose "
+                "name does not say what they are drawing are left as they are: %s",
+                self.font_model, e
+            )
+            self.font_classifier = False
+            return None
+
+        self.logger.info("Loaded the font detection model %s", self.font_model)
+
+        return self.font_classifier
+
+    # --- func to point the fonts that name no encoding at the right decoder ---
+    def detect_unknown_fonts(self, pages):
+        """Identifies the legacy indic fonts that nothing else can identify.
+
+        A font's name usually says which encoding its text is in, and when it
+        does not the caller can say so with -fc/--font-conv. Neither is any
+        help for a subsetted gazette that names its fonts TT572t00 and TT447t00
+        and carries no ToUnicode map: nothing about such a font says whether it
+        draws latin or devanagari, which is the very thing that has to be known
+        before its text can be read.
+
+        What does say it is the text itself - chanakya extracts as latin
+        gibberish with a vocabulary of its own ('fnYyh', 'ds', 'ls') - so every
+        font left unplaced is classified by the model machinelearning/ trains
+        on that text (see machinelearning/README.md). A font the model calls
+        not_required is drawing unicode already and is taken as it is; any
+        other class is registered like a -fc mapping would be, so that the
+        conversion which follows picks it up without knowing where the answer
+        came from.
+
+        This runs on the parsed xml before convert_indic_fonts(), i.e. on the
+        text as the pdf drew it, since converted text is exactly what the model
+        is not trained on.
+        """
+        if not self.font_detect or self.font_conv is None or not pages:
+            return
+
+        if not os.path.exists(self.font_model):
+            self.logger.debug(
+                "There is no font detection model at %s, the fonts whose name "
+                "does not say what they are drawing are left as they are",
+                self.font_model
+            )
+            return
+
+        try:
+            font_texts = self.get_unknown_font_texts(pages)
+        except Exception as e:
+            self.logger.warning(
+                "[!] Could not collect the text of the unidentified fonts of %s, "
+                "they are left as they are: %s", self.pdf_path, e
+            )
+            return
+
+        if not font_texts:
+            return
+
+        classifier = self.get_font_classifier()
+
+        if classifier is None:
+            return
+
+        font_names = sorted(font_texts)
+
+        try:
+            # every font of the document in one go, the model featurizes a
+            # batch as cheaply as it does a single text
+            results = classifier.classify_all([font_texts[n] for n in font_names])
+        except Exception as e:
+            self.logger.warning(
+                "[!] Could not detect what the unidentified fonts of %s are "
+                "drawing, they are left as they are: %s", self.pdf_path, e
+            )
+            return
+
+        font_res = []
+
+        for font_name, (label, probability) in zip(font_names, results):
+            # what the model said, kept whether or not it is acted on below: a
+            # verdict that was rejected (too unsure, or impossible for the text
+            # it was reached on) is exactly what someone reading the html to see
+            # how detection went needs to be told, see get_detected_font_key()
+            self.detected_font_classes[font_name] = label
+            font_key = self.get_detected_font_key(
+                font_name, label, probability, font_texts[font_name]
+            )
+
+            if font_key:
+                font_res.append(
+                    (re.compile('.*%s.*' % re.escape(font_name), re.IGNORECASE), font_key)
+                )
+
+        if not font_res:
+            return
+
+        # a detected font is one that matches nothing else, so where these go
+        # decides nothing; they go first for the same reason -fc's do, that an
+        # answer about this document beats a general rule about names
+        self.indic_font_res = font_res + self.indic_font_res
+        # collecting the text looked every font of the document up, so the ones
+        # that are placed now were cached as unplaced then; the ones that were
+        # already placed keep their answer, which has not changed
+        self.indic_font_keys = {
+            font_name: font_key
+            for font_name, font_key in self.indic_font_keys.items() if font_key
+        }
+
+    # --- func to get the names pdfminer gives the type3 fonts of the document ---
+    def get_type3_font_names(self):
+        """The names the type3 fonts of the document are known by here.
+
+        type3 is one of FONT_CLASSES_WITHOUT_CONVERTER: repair_tounicode() is
+        what puts a type3 font's text right, before anything reads the pdf, and
+        no converter of indic2unicode's decodes such a font. So the one answer
+        the model can give about one that is true - type3 - is also the one
+        answer that changes nothing, while every other answer runs a decoder
+        over text that is already correct. There is nothing to gain by
+        classifying a type3 font and a document to lose, so they are left out of
+        detection altogether rather than classified and then discarded.
+
+        A type3 font carries no BaseFont, so pdfminer names it after the
+        FontName of its FontDescriptor and calls it 'unknown' when it has none.
+        ToUnicodeFixer gives every type3 font it repairs a descriptor naming the
+        font whose glyphs it read, which is what points that font at a
+        reordering converter, so this is read off the same repaired copy the
+        rest of the run reads: the ones it named are placed by
+        get_repaired_font_res() long before detection and never reach it, and
+        what is left to be skipped here are the type3 fonts it found nothing to
+        repair - whose maps were already sound, and whose text is therefore
+        already correct. Five of the eight type3 fonts of
+        test/test_pdfs/union_hindi5.pdf are exactly those, and the model calls
+        the clean devanagari they draw arialuni at a probability of 1.00.
+        """
+        if self.type3_font_names is not None:
+            return self.type3_font_names
+
+        self.type3_font_names = set()
+
+        if not os.path.exists(self.pdf_path) or not self.is_pdf_file(self.pdf_path):
+            return self.type3_font_names
+
+        try:
+            doc = pymupdf.open(self.pdf_path)
+
+            try:
+                for pagenum in range(doc.page_count):
+                    for font in doc[pagenum].get_fonts(full = True):
+                        xref, ftype = font[0], font[2]
+
+                        if ftype != 'Type3':
+                            continue
+
+                        # pymupdf resolves the path and writes the name out as
+                        # the characters it stands for, '/Arial#20Unicode#20MS'
+                        # coming back as '/Arial Unicode MS', which is the
+                        # spelling pdfminer reports too
+                        key, name = doc.xref_get_key(xref, 'FontDescriptor/FontName')
+                        self.type3_font_names.add(
+                            name.lstrip('/') if key == 'name' else 'unknown'
+                        )
+            finally:
+                doc.close()
+        except Exception as e:
+            self.logger.warning(
+                "[!] Could not read the type3 fonts of %s, so they are classified "
+                "like any other font: %s", self.pdf_path, e
+            )
+
+        return self.type3_font_names
+
+    # --- func to get the text drawn in each font that nothing else identifies ---
+    def get_unknown_font_texts(self, pages):
+        """{font name: the text the pdf draws in it}, for the unplaced fonts.
+
+        A font is unplaced here when neither its name, nor a -fc mapping, nor a
+        ToUnicode repair has said what its text is - which is exactly the case
+        the classifier is for. The fonts that are already placed are left out:
+        their answer is known and a worse one must not overrule it. So are the
+        standard latin faces of FONT_DETECT_SKIP_RE, for the same reason read
+        the other way round: their name places them as needing no decoder at
+        all, and the model cannot improve on that, only get it wrong. Arial
+        Unicode MS is named like one of them but is not one of them
+        (FONT_DETECT_SKIP_EXCEPT_RE), so it is classified like anything else.
+
+        Left out too are the fonts of FONT_CLASSES_WITHOUT_CONVERTER that can be
+        recognised without asking the model - the type3 fonts of the document
+        (get_type3_font_names()) and the ones named in FONT_DETECT_NO_CONVERTER_RE.
+        This tool corrects those itself, in repair_tounicode(), and no converter
+        decodes them, so the true answer about one of them is the answer that
+        changes nothing and every other answer corrupts text that is already
+        correct - which makes classifying them all risk and no gain.
+
+        The text of a font is collected as the runs of consecutive chars drawn
+        in it joined with a space, and not as one string of every char it draws:
+        the spaces between words are <text> elements of their own carrying no
+        font at all, so concatenating a font's own chars would run its words
+        into each other and hand the model text split into words quite
+        differently from the corpus it was trained on.
+        """
+        font_runs = defaultdict(list)
+
+        for page in pages:
+            for element in page.iter():
+                # a <text> element has no children, so every one of them sits
+                # under exactly one parent and is read exactly once
+                run = []
+                run_font = None
+
+                for child in element:
+                    if child.tag != 'text':
+                        continue
+
+                    font_name = child.attrib.get('font')
+
+                    if font_name != run_font:
+                        if run:
+                            font_runs[run_font].append(''.join(run))
+                        run = []
+                        run_font = font_name
+
+                    if font_name:
+                        run.append(child.text or '')
+
+                if run:
+                    font_runs[run_font].append(''.join(run))
+
+        font_texts = {}
+
+        for font_name, runs in font_runs.items():
+            if self.get_indic_font_key(font_name):
+                continue
+
+            if FONT_DETECT_SKIP_RE.search(font_name) and \
+                    not FONT_DETECT_SKIP_EXCEPT_RE.search(font_name):
+                self.logger.debug(
+                    "Font %s is one of the standard latin faces, whose text needs "
+                    "no decoder, so it is not classified at all", font_name
+                )
+                continue
+
+            if font_name in self.get_type3_font_names():
+                self.logger.debug(
+                    "Font %s is a type3 font, whose text repair_tounicode() is "
+                    "what puts right and which no converter decodes, so it is "
+                    "not classified at all", font_name
+                )
+                continue
+
+            if FONT_DETECT_NO_CONVERTER_RE.search(font_name):
+                self.logger.debug(
+                    "Font %s is named as one of the fonts that have no converter "
+                    "to point their text at, so it is not classified at all",
+                    font_name
+                )
+                continue
+
+            words = ' '.join(runs).split()
+
+            if len(words) < FONT_DETECT_MIN_WORDS:
+                self.logger.debug(
+                    "Font %s draws %d word(s), too few to tell what it is, so its "
+                    "text is left as it is", font_name, len(words)
+                )
+                continue
+
+            font_texts[font_name] = ' '.join(words[:FONT_DETECT_MAX_WORDS])
+
+        return font_texts
+
+    # --- func to get the converter the model's answer about a font means ---
+    def get_detected_font_key(self, font_name, label, probability, text):
+        if probability < FONT_DETECT_MIN_PROB:
+            self.logger.info(
+                "The text in font %s looks like %s but only with a probability of "
+                "%.2f, which is too little to act on, so it is left as it is",
+                font_name, label, probability
+            )
+            return None
+
+        if label == FONT_CLASS_NOT_REQUIRED:
+            self.logger.info(
+                "Text in font %s needs no decoder (%.2f), it is taken as it is",
+                font_name, probability
+            )
+            return None
+
+        if label in FONT_CLASSES_WITHOUT_CONVERTER:
+            self.logger.info(
+                "Text in font %s was detected as %s (%.2f), which has no converter "
+                "of its own, so it is taken as it is", font_name, label, probability
+            )
+            return None
+
+        # a class not named as drawing indic text is a legacy 8-bit encoding,
+        # whose text extracts as latin. Text that is already in an indic script
+        # cannot have come out of one, whatever the model says, and running it
+        # through that decoder would turn readable text into rubbish - which is
+        # the one outcome worth guarding against, since leaving a font alone
+        # only costs the improvement detection was there to make
+        if label not in FONT_CLASSES_INDIC_TEXT:
+            indic_ratio = self.get_indic_char_ratio(text)
+
+            if indic_ratio > FONT_DETECT_MAX_INDIC_RATIO:
+                self.logger.warning(
+                    "[!] Text in font %s was detected as %s (%.2f), but %.0f%% of it "
+                    "is already in an indic script and %s decodes latin, so the "
+                    "detection is wrong and the text is left as it is",
+                    font_name, label, probability, indic_ratio * 100, label
+                )
+                return None
+
+        font_key = FONT_CLASS_CONVERTERS.get(label, label)
+
+        if font_key not in self.font_conv.converters:
+            self.logger.warning(
+                "[!] Text in font %s was detected as %s, which no indic2unicode "
+                "converter goes by, so it is left as it is. The model was trained "
+                "on a class this build of indic2unicode does not have a decoder for",
+                font_name, label
+            )
+            return None
+
+        # a class can be the same font drawing more than one script (nirmala is
+        # Nirmala UI whichever gazette it sets) while its converter reads just
+        # one of them - so the text decides, not the class, see CONVERTER_SCRIPTS
+        script = self.converter_scripts.get(font_key)
+
+        if script is not None:
+            script_name, script_re = script
+            other_ratio = self.get_other_script_ratio(text, script_re)
+
+            if other_ratio > FONT_DETECT_MAX_INDIC_RATIO:
+                self.logger.warning(
+                    "[!] Text in font %s was detected as %s (%.2f), but %.0f%% of "
+                    "it is in an indic script other than %s, the only one %s "
+                    "reads, and there is no converter of that script for an "
+                    "unrepaired %s, so the text is left as it is",
+                    font_name, label, probability, other_ratio * 100,
+                    script_name, font_key, label
+                )
+                return None
+
+        self.logger.info(
+            "Text in font %s will be converted to unicode using %s, detected from "
+            "the text it draws with a probability of %.2f",
+            font_name, font_key, probability
+        )
+
+        return font_key
+
+    # --- func to get the share of a text already drawn in an indic script ---
+    def get_indic_char_ratio(self, text):
+        """How much of text is in an indic script, ignoring whitespace.
+
+        Whitespace is left out because it belongs to no script and a text's
+        share of it says nothing about what drew it: the same words with the
+        runs joined differently would otherwise score differently.
+        """
+        chars = ''.join(text.split())
+
+        if not chars:
+            return 0.0
+
+        return len(INDIC_SCRIPT_RE.findall(chars)) / len(chars)
+
+    # --- func to convert text drawn in a legacy indic font into unicode ---
+    def indic_to_unicode(self, font_key, text):
+        cache_key = (font_key, text)
+
+        if cache_key in self.indic_text_cache:
+            return self.indic_text_cache[cache_key]
+
+        try:
+            converted = self.font_conv.to_unicode(font_key, text)
+        except Exception as e:
+            self.logger.warning(
+                "Failed to convert text [%s] in font %s to unicode: %s",
+                text, font_key, e
+            )
+            converted = text
+
+        if not isinstance(converted, str):
+            converted = text
+
+        self.indic_text_cache[cache_key] = converted
+
+        return converted
+
+    def drop_overlapping_spaces(self, pages):
+        """Removes spaces that the glyph next to them is drawn on top of.
+
+        A pdf can paint a space that never advances the pen, the following
+        glyph then being drawn back over it. That happens on devanagari text
+        in particular, where a conjunct is two glyphs and the space lands
+        between them. pdfminer has no way of telling such a space from a real
+        one and reports it as an ordinary space, which splits one word into
+        two everywhere downstream ('िभन् न' for 'िभन्न'). They are recognised
+        here by their coordinates - the space sits inside its neighbour's
+        bbox instead of beside it - and dropped from the xml before the indic
+        font conversion (which would otherwise convert a broken up conjunct)
+        and before any layout analysis, so that all the downstream consumers
+        of the xml see the text without knowing about overprinted spaces.
+        """
+        if not pages:
+            return
+
+        for page in pages:
+            try:
+                self.drop_overlapping_spaces_in_page(page)
+            except Exception as e:
+                self.logger.error(
+                    "Failed removal of overprinted spaces on page %s: %s",
+                    page.get("id"), e
+                )
+
+    def drop_overlapping_spaces_in_page(self, page):
+        for element in page.iter():
+            # a <text> element never has children of its own, so every one of
+            # them is grouped under exactly one parent and looked at just once
+            chars = [child for child in element if child.tag == 'text']
+
+            for char in self.get_overprinted_spaces(chars):
+                element.remove(char)
+
+    # --- func to pick out the spaces drawn over by a neighbouring glyph ---
+    def get_overprinted_spaces(self, chars):
+        overprinted = []
+
+        for idx, char in enumerate(chars):
+            if not self.is_space_char(char):
+                continue
+
+            space = self.get_char_x_range(char)
+
+            # the newlines pdfminer inserts itself carry no bbox, and a space
+            # of no width cannot be overlapped by anything in the first place
+            if space is None:
+                continue
+
+            # the nearest real glyph on either side, not simply the adjacent
+            # elements: a combining matra is emitted with a zero width bbox
+            # sitting on its base consonant and says nothing about spacing
+            previous = self.get_neighbour_x_range(chars, range(idx - 1, -1, -1))
+            following = self.get_neighbour_x_range(chars, range(idx + 1, len(chars)))
+
+            if self.is_overprinted_space(space, previous, following):
+                overprinted.append(char)
+
+        return overprinted
+
+    # --- func to tell a space painted over by its neighbour from a real one ---
+    def is_overprinted_space(self, space, previous, following):
+        if previous and following:
+            drawn_over = self.get_x_overlap(previous, following)
+
+            narrowest = min(
+                previous[1] - previous[0],
+                following[1] - following[0]
+            )
+
+            if drawn_over > NEIGHBOUR_OVERLAP_RATIO * narrowest:
+                return False
+
+        overlap = max(
+            self.get_x_overlap(space, previous),
+            self.get_x_overlap(space, following)
+        )
+
+        return overlap > SPACE_OVERLAP_RATIO * (space[1] - space[0])
+
+    # --- func to walk to the nearest glyph a space can be compared against ---
+    def get_neighbour_x_range(self, chars, indices):
+        for idx in indices:
+            char = chars[idx]
+
+            if self.is_space_char(char):
+                continue
+
+            x_range = self.get_char_x_range(char)
+
+            if x_range is not None:
+                return x_range
+
+        return None
+
+    @staticmethod
+    def is_space_char(char):
+        return bool(char.text) and not char.text.strip()
+
+    @staticmethod
+    def get_char_x_range(char):
+        bbox = char.attrib.get("bbox")
+
+        if not bbox:
+            return None
+
+        try:
+            x0, _, x1, _ = map(float, bbox.split(","))
+        except (ValueError, TypeError):
+            return None
+
+        return (x0, x1) if x1 > x0 else None
+
+    @staticmethod
+    def get_x_overlap(x_range, other):
+        if x_range is None or other is None:
+            return 0.0
+
+        return max(0.0, min(x_range[1], other[1]) - max(x_range[0], other[0]))
+
+    def convert_indic_fonts(self, pages):
+        """Rewrites text drawn in legacy indic fonts into unicode, in place.
+
+        Legacy fonts like Chanakya/Kruti Dev (the Gazette of India) or
+        Aryan2/Divya/Surekh (LokSabha) overload ascii codepoints with
+        devanagari glyphs, so what pdfminer extracts for them is not readable
+        text at all. Every <text> element whose 'font' attribute matches one of
+        the fonts supported by indic2unicode is replaced with its unicode
+        equivalent here, i.e. before any layout analysis runs, so that all the
+        downstream consumers of the xml (Page, TextBox, HTMLBuilder,
+        TableExtraction, ...) see unicode without knowing about fonts.
+        """
+        if self.font_conv is None or not pages:
+            return
+
+        for page in pages:
+            try:
+                self.convert_indic_fonts_in_page(page)
+            except Exception as e:
+                self.logger.error(
+                    "Failed conversion of legacy indic fonts on page %s: %s",
+                    page.get("id"), e
+                )
+
+    def convert_indic_fonts_in_page(self, page):
+        for element in page.iter():
+            # a <text> element never has children of its own, so every one of
+            # them is grouped under exactly one parent and converted just once
+            texts = [child for child in element if child.tag == 'text']
+
+            if texts:
+                self.convert_indic_font_runs(texts, XML_TEXT_ACCESSORS)
+
+    # --- func to convert chars sitting side by side, one font run at a time ---
+    def convert_indic_font_runs(self, chars, accessors):
+        # conversion is contextual - matras get reordered and glyph pairs get
+        # composed - so it is applied to the longest run of consecutive chars
+        # sharing the same font instead of one char at a time
+        get_font, get_text, _ = accessors
+
+        run = []
+        run_font_key = None
+
+        for char in chars:
+            # chars without a font (the spaces and newlines pdfminer inserts
+            # itself) end the current run
+            font_name = get_font(char)
+
+            font_key = self.get_indic_font_key(font_name) if font_name else None
+
+            # and so does a glyph of a script its font's converter does not
+            # read, which is left as the pdf draws it (see CONVERTER_SCRIPTS)
+            if font_key and not self.is_converter_script(font_key, get_text(char)):
+                font_key = None
+
+            if font_key != run_font_key:
+                self.convert_indic_font_run(run, run_font_key, accessors)
+                run = []
+                run_font_key = font_key
+
+            if font_key:
+                run.append(char)
+
+        self.convert_indic_font_run(run, run_font_key, accessors)
+
+    # --- func to convert one run of chars sharing the same legacy indic font ---
+    def convert_indic_font_run(self, run, font_key, accessors):
+        _, get_text, set_text = accessors
+
+        if not run or not font_key:
+            return
+
+        original = ''.join(
+            self.get_indic_char_text(get_text(char), font_key) for char in run
+        )
+
+        if not original.strip():
+            return
+
+        converted = self.indic_to_unicode(font_key, original)
+
+        if converted == original:
+            return
+
+        # conversion is not one char in, one char out - a single legacy glyph
+        # can become a consonant + halant + matra sequence, and a pair of them
+        # can collapse into one char - so the converted text is spread
+        # proportionally over the chars it came from. That keeps it in reading
+        # order and keeps every char's own coordinates, which the layout code
+        # (first/last char coords, per char gaps within a textline) relies on.
+        no_of_chars = len(run)
+        length = len(converted)
+
+        for idx, char in enumerate(run):
+            start = (idx * length) // no_of_chars
+            end = ((idx + 1) * length) // no_of_chars
+
+            set_text(char, converted[start:end])
+
+    # --- func to read a glyph the pdf's ToUnicode map has no string for ---
+    def get_indic_char_text(self, text, font_key):
+        """The text of one glyph, as this font's converter expects to read it.
+
+        pdfminer writes a glyph its map has no entry for as '(cid:315)'. A
+        converter written against the cid fallback (see CID_FALLBACK_FONT_KEYS)
+        reads that glyph as the character of its cid, so the placeholder is
+        turned back into that character for it. For every other converter the
+        cid says nothing about what the glyph draws and the placeholder is left
+        exactly as it is, which also keeps it visible in the output as the
+        glyph that could not be recovered.
+        """
+        if not text or font_key not in self.cid_fallback_font_keys:
+            return text or ''
+
+        match = CID_PLACEHOLDER_RE.match(text)
+
+        if match is None:
+            return text
+
+        try:
+            return chr(int(match.group(1)))
+        except ValueError:
+            # a cid past the last codepoint, which no font has and nothing can
+            # be read out of - left as it is rather than dropped, so it stays
+            # visible in the output as the unconverted glyph it is
+            return text
+
+    @contextmanager
+    def camelot_font_conversion(self):
+        """Make camelot's own text extraction see the same unicode the xml does.
+
+        camelot re-reads the pdf itself - it has to, the lattice flavour finds
+        cells by looking for lines in a rendered image of the page - so the
+        conversion done on the xml never reaches the text in a table's cells.
+        It does build the same kind of layout though, and its chars carry a
+        font name and a text that can be set, so the conversion is applied
+        there too, at the single function every one of its layouts comes from.
+        """
+        if self.font_conv is None or not self.indic_font_res:
+            yield
+            return
+
+        if not CAMELOT_LAYOUT_AVAILABLE:
+            self.logger.warning(
+                "[!] camelot has no get_page_layout() to convert legacy indic "
+                "fonts in, text extracted from bordered tables will stay in the "
+                "font's own encoding"
+            )
+            yield
+            return
+
+        original_get_page_layout = camelot_handlers.get_page_layout
+
+        def get_page_layout(page, **kwargs):
+            layout, dimensions = original_get_page_layout(page, **kwargs)
+
+            try:
+                self.convert_indic_fonts_in_layout(layout)
+            except Exception as e:
+                self.logger.error(
+                    "Failed conversion of legacy indic fonts in a camelot layout: %s", e
+                )
+
+            return layout, dimensions
+
+        camelot_handlers.get_page_layout = get_page_layout
+
+        try:
+            yield
+        finally:
+            camelot_handlers.get_page_layout = original_get_page_layout
+
+    def convert_indic_fonts_in_layout(self, layout):
+        images, chars, horizontal_text, vertical_text = \
+            get_image_char_and_text_objects(layout)
+
+        # one textline at a time and never across two of them: a run spanning
+        # two cells would move text from one into the other once its converted
+        # form is spread back over the chars it came from
+        for textline in list(horizontal_text) + list(vertical_text):
+            self.convert_indic_font_runs(list(textline), LT_CHAR_ACCESSORS)
 
     def get_all_footnote_text(self):
 
-        FOOTNOTE_START_RE = re.compile(
-            r'^\{\{\^\{\{FOOTNOTE\s*(.+?)\}\}\}\}'
+        FOOTNOTE_MARKER_RE = re.compile(
+            r'\{\{\^\{\{FOOTNOTE\s*(.+?)\}\}\}\}'
         )
 
         active_footnote_num = None
+        active_footnote_page = None
 
         for pg_num in sorted(self.all_pgs.keys()):
 
             page = self.all_pgs[pg_num]
+
+            page_footnote_text = self.all_footnote_text.setdefault(pg_num, {})
 
             for tb in page.all_tbs.keys():
 
@@ -199,49 +1858,58 @@ class Main:
                     if not text:
                         continue
 
-                    start_match = FOOTNOTE_START_RE.match(text)
+                    segments = FOOTNOTE_MARKER_RE.split(text)
 
-                    if start_match:
+                    leading_text = segments[0].strip()
 
-                        footnote_num = (
-                            start_match.group(1).strip()
+                    if leading_text:
+
+                        if active_footnote_num and active_footnote_page is not None:
+
+                            self.all_footnote_text[
+                                active_footnote_page
+                            ][
+                                active_footnote_num
+                            ] += "\n" + leading_text
+
+                    for i in range(1, len(segments), 2):
+
+                        footnote_num = segments[i].strip()
+
+                        cleaned_text = (
+                            segments[i + 1].strip()
+                            if i + 1 < len(segments)
+                            else ""
+                        )
+
+                        cleaned_text = re.sub(
+                            r'^[.\):\]]\s*',
+                            '',
+                            cleaned_text
                         )
 
                         active_footnote_num = footnote_num
-
-                        cleaned_text = FOOTNOTE_START_RE.sub(
-                            '',
-                            text,
-                            count=1
-                        ).strip()
+                        active_footnote_page = pg_num
 
                         if (
                             footnote_num
-                            not in self.all_footnote_text
+                            not in page_footnote_text
                         ):
 
-                            self.all_footnote_text[
+                            page_footnote_text[
                                 footnote_num
                             ] = cleaned_text
 
                         else:
 
-                            self.all_footnote_text[
+                            page_footnote_text[
                                 footnote_num
                             ] += "\n" + cleaned_text
-
-                    else:
-
-                        if not active_footnote_num:
-                            continue
-
-                        self.all_footnote_text[
-                            active_footnote_num
-                        ] += "\n" + text
 
             if not self.is_footnote_continuation:
 
                 active_footnote_num = None
+                active_footnote_page = None
 
     def finalize_unique_images(self):
 
@@ -264,7 +1932,7 @@ class Main:
                         )
 
                         self.remove_empty_parent_dir(img_path)
-                    
+
                     except Exception as e:
 
                         self.logger.warning(
@@ -320,27 +1988,45 @@ class Main:
                 f"Failed removing directory for: {file_path}"
             )
     
+    def warn_font_names_unsupported(self, what):
+        if not self.show_fonts:
+            return
+
+        self.logger.warning(
+            f"[!] font names (-fn) are not carried through {what} - "
+            f"the output has no data-font markup in it."
+        )
+
     def get_htmlBuilder(self, pdf_type, docend_symbol = False):
         if pdf_type == 'sebi':
-            sentence_completion_punctutation = ("'.",'".',".'", '."', "';", ";'", ';"','";') #( ".", ":", "?",  ".'", '."', ";", ";'", ';"')
-            return HTMLBuilder(self.unique_images, sentence_completion_punctutation, pdf_type)
+            sentence_completion_punctutation = ("'.",'".',".'", '."', "';", ";'", ';"','";') \
+                + tuple(INDIC_SENTENCE_END_CHARS) + tuple(INDIC_SEMICOLON_CHARS)
+            return HTMLBuilder(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type)
+            # return JudgmentBuilder(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type)
         elif pdf_type in set(['acts']):
             sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
                                                 ': or', '; and', ': and', ':––', ';––',\
                                                 '––', '."', '.\'', ';"', ';\'' , \
-                                                '.”', '.’', ';”' , ';’', ':-')
-            return Acts(sentence_completion_punctutation, pdf_type, docend_symbol)
+                                                '.”', '.’', ';”' , ';’', ':-') \
+                                                + tuple(INDIC_SENTENCE_END_CHARS) + tuple(INDIC_SEMICOLON_CHARS)
+            return Acts(self.all_footnote_text, sentence_completion_punctutation, pdf_type, docend_symbol)
         elif pdf_type in set(['sebi_circulars']):
             sentence_completion_punctutation = ('.', ';', ':', '—', ':—', '; or',\
                                                 ': or', '; and', ': and', ':––', ';––',\
                                                 '––', '."', '.\'', ';"', ';\'' , \
                                                 '.”', '.’', ';”' , ';’', ':-', '.]',
-                                                ',-', ':-', ';-', '--')
+                                                ',-', ':-', ';-', '--') \
+                                                + tuple(INDIC_SENTENCE_END_CHARS) + tuple(INDIC_SEMICOLON_CHARS)
             return SebiCirculars(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type, docend_symbol)
 
+        elif pdf_type == 'judgments':
+            sentence_completion_punctutation = ("'.",'".',".'", '."', "';", ";'", ';"','";') \
+                + tuple(INDIC_SENTENCE_END_CHARS) + tuple(INDIC_SEMICOLON_CHARS)
+            return JudgmentBuilder(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type)
         else:
-            sentence_completion_punctutation = ('.', ':')
-            return HTMLBuilder(self.unique_images, sentence_completion_punctutation, pdf_type)
+            sentence_completion_punctutation = ('.', ':') + tuple(INDIC_SENTENCE_END_CHARS) + tuple(INDIC_SEMICOLON_CHARS)
+            return HTMLBuilder(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type)
+            # return JudgmentBuilder(self.unique_images, self.all_footnote_text, sentence_completion_punctutation, pdf_type)
         
     # --- func to build HTML after text classification ---
     def buildHTML(self, start_page, end_page): #, section_page_end):
@@ -366,27 +2052,14 @@ class Main:
 
     # --- classify the page texboxes sidenotes, section, para, titles(headings) ---
     def process_pages_acts(self, pdf_type):
-        self.pending_continuation = None
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
             # page.print_tbs()
-            page.get_width_ofTB_moreThan_Half_of_pg()
-            page.get_body_width_by_binning()
             # page.is_single_column_page = page.is_single_column_page()
-            page.find_sidenote_leftend_rightstart_coords()
-            page.get_side_notes() #self.section_start_page,self.section_end_page)
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
             if self.is_amendment_pdf:
                 self.amendment.check_for_amendment_acts(page)#,self.section_start_page,self.section_end_page)
-            if self.table_extract:
-                page.reclaim_header_footer_for_continuation(self.pending_continuation)
-                self.pending_continuation = page.get_borderless_table(
-                    pdf_type, self.header_classifier, self.region_merge_classifier,
-                    continuation_template=self.pending_continuation,
-                    continuation_classifier=self.continuation_classifier,
-                )
-                page.label_borderless_table_tbs()
             page.get_article(self.article_state, self)
             page.get_section_para(self.section_state, self)#, self.section_start_page,self.section_end_page)
             page.get_titles(pdf_type)
@@ -401,24 +2074,14 @@ class Main:
                                                 ': or', '; and', ': and', ':––', ';––',\
                                                 '––', '."', '.\'', ';"', ';\'' , \
                                                 '.”', '.’', ';”' , ';’', ':-', '.]',
-                                                ',-', ':-', ';-', '--')
+                                                ',-', ':-', ';-', '--') \
+                                                + tuple(INDIC_SENTENCE_END_CHARS) + tuple(INDIC_SEMICOLON_CHARS)
 
-        self.pending_continuation = None
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
-            page.get_width_ofTB_moreThan_Half_of_pg()
-            page.get_body_width_by_binning()
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
-            if self.table_extract:
-                page.reclaim_header_footer_for_continuation(self.pending_continuation)
-                self.pending_continuation = page.get_borderless_table(
-                    pdf_type, self.header_classifier, self.region_merge_classifier,
-                    continuation_template=self.pending_continuation,
-                    continuation_classifier=self.continuation_classifier,
-                )
-                page.label_borderless_table_tbs()
             page.get_bulletins_sebi_circulars(self.section_state)
             page.get_titles(pdf_type)
             prev_sent_end_status = page.get_title_hierarchy(self.title_state, prev_sent_end_status, sentence_completion_punctutation)   
@@ -433,24 +2096,17 @@ class Main:
     def process_pages_sebi(self, pdf_type):
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
-            page.get_width_ofTB_moreThan_Half_of_pg()
-            page.get_body_width_by_binning()
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
-            page.get_italic_blockquotes(pdf_type)
-            self.amendment.check_for_blockquotes(page)
-            if self.table_extract:
-                page.reclaim_header_footer_for_continuation(self.pending_continuation)
-                self.pending_continuation = page.get_borderless_table(
-                    pdf_type, self.header_classifier, self.region_merge_classifier,
-                    continuation_template=self.pending_continuation,
-                    continuation_classifier=self.continuation_classifier,
-                )
-                page.label_borderless_table_tbs()
+            # page.get_italic_blockquotes(pdf_type)
+            # self.amendment.check_for_blockquotes(page)
+            self.amendment.check_for_blockquotes_judgments(page, judgments_mode=True)
+            page.detect_sparse_pre()
             # page.get_titles(pdf_type)
             page.get_bulletins(self.section_state)
             page.get_titles(pdf_type)
+            page.get_underlined_titles(pdf_type)
             page.sort_all_boxes()
             # page.print_blockquote()
             # page.print_headers()
@@ -458,23 +2114,75 @@ class Main:
             # page.print_levels()
             page.print_all()
             # page.print_tbs()
-            
-    def process_pages(self, pdf_type):
+
+    def process_pages_judgments(self, pdf_type):
         for page in self.all_pgs.values():
             self.logger.info(f"Processing page num-{page.pg_num}")
-            page.get_width_ofTB_moreThan_Half_of_pg()
-            page.get_body_width_by_binning()
             # page.is_single_column_page = page.is_single_column_page()
             # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
             # print(page.is_single_column_page)
-            if self.table_extract:
-                page.reclaim_header_footer_for_continuation(self.pending_continuation)
-                self.pending_continuation = page.get_borderless_table(
-                    pdf_type, self.header_classifier, self.region_merge_classifier,
-                    continuation_template=self.pending_continuation,
-                    continuation_classifier=self.continuation_classifier,
-                )
-                page.label_borderless_table_tbs()
+            # page.get_italic_blockquotes(pdf_type)
+            self.amendment.check_for_blockquotes_judgments(page, judgments_mode=True)
+            page.detect_sparse_pre()
+            # page.detect_pre()
+
+            # page.get_titles(pdf_type)
+            page.get_underlined_titles(pdf_type)
+            # page.get_bulletins(self.section_state)
+            page.sort_all_boxes()
+            # page.print_headers()
+            # page.print_footers()
+            page.print_all()
+        self.html_builder.doc_line_gap = self.compute_doc_line_gap()
+        self.html_builder.doc_max_line_width = self.compute_doc_max_line_width()
+
+    def compute_doc_max_line_width(self):
+        entries = []
+        for page in self.all_pgs.values():
+            for tb, label in page.all_tbs.items():
+                if label in ("header", "footer", "footnote", "title", "toc", "figure"):
+                    continue
+                if isinstance(label, (tuple, list)):
+                    continue
+                for line in self.extract_toc_lines(tb):
+                    width = line['x1'] - line['x0']
+                    if width > 0:
+                        entries.append((line['x0'], width))
+        if not entries:
+            return None
+        entries.sort(key=lambda e: e[0])
+        return entries
+
+    def compute_doc_line_gap(self):
+        gaps = []
+        for page in self.all_pgs.values():
+            ys = []
+            for tb, label in page.all_tbs.items():
+                if label in ("header", "footer", "footnote", "title", "toc", "figure"):
+                    continue
+                if isinstance(label, (tuple, list)):
+                    continue
+                for line in self.extract_toc_lines(tb):
+                    ys.append(line["y0"])
+            ys.sort(reverse=True)
+            for a, b in zip(ys, ys[1:]):
+                gap = a - b
+                if gap > 0:
+                    gaps.append(gap)
+        if not gaps:
+            return None
+        gaps.sort()
+        mid = len(gaps) // 2
+        if len(gaps) % 2:
+            return gaps[mid]
+        return (gaps[mid - 1] + gaps[mid]) / 2.0
+
+    def process_pages(self, pdf_type):
+        for page in self.all_pgs.values():
+            self.logger.info(f"Processing page num-{page.pg_num}")
+            # page.is_single_column_page = page.is_single_column_page()
+            # page.is_single_column_page = page.is_single_column_page_kmeans_elbow()
+            # print(page.is_single_column_page)
             page.get_titles(pdf_type)
             # page.get_bulletins(self.section_state)
             page.sort_all_boxes()
@@ -496,59 +2204,209 @@ class Main:
             # self.bq_layout.print_sections()
         pass
 
+    def get_image_page_nums(self, pages):
+        """The page numbers of the parsed xml that draw an image.
+
+        pdf2txt writes an <image> element for every image pdfminer lays out, so
+        a page carrying none of them has nothing for Figure.get_images to find
+        and need never be extracted from the pdf at all.
+        """
+        nums = []
+
+        for pg in pages:
+            if pg.find(".//image") is None:
+                continue
+
+            try:
+                nums.append(int(pg.attrib["id"]))
+            except (KeyError, ValueError):
+                self.logger.warning(
+                    "Page with no usable id in the xml, its images will be "
+                    "extracted on their own: %s", pg.attrib
+                )
+
+        return nums
+
     # --- NEW ADAPTIVE HEADER/FOOTER DETECTION ---
     def get_page_header_footer(self, pages, base_name_of_file, output_dir):
+        image_page_nums = self.get_image_page_nums(pages)
+        page_images = None
+
         # Initialize page objects first
         for pg in pages:
-            pdf_dir = self.get_path_cache_pdf()
             if not self.pdf_path.lower().endswith(".pdf"):
+                pdf_dir = self.get_run_cache_pdf()
                 base_name = os.path.basename(self.pdf_path) + ".pdf"
                 new_pdf_path = os.path.join(pdf_dir, base_name)
                 shutil.copy(self.pdf_path, new_pdf_path)
                 self.logger.debug(f"Copied input file to cache dir as: {new_pdf_path}")
                 self.pdf_path = new_pdf_path
 
+            if page_images is None:
+                # built here rather than before the loop so it is anchored on
+                # the path the copy above may just have moved the pdf to
+                page_images = PageImages(self.pdf_path, image_page_nums)
+
             page = Page(pg, self.pdf_path, base_name_of_file, output_dir,
                         self.pdf_type, self.has_side_notes, self.is_amendment_pdf,
                         self.fontmapper, self.unique_images, self.min_img_pixels,
-                        self.ocr_language,
-                        self.is_scanned_copy, self.figure_text)
+                        self.ocr_language_image_text,
+                        self.is_scanned_copy, self.figure_text, self.ocr_engine_image_text,
+                        page_images=page_images)
             self.total_pgs += 1
             self.all_pgs[self.total_pgs] = page
             page.process_textboxes()#pg)
             page.get_figures()#pg)
+            page.reconcile_figure_names()
             page.label_table_tbs()
 
             # page.line_based_header_footer_detection()
-        # Run adaptive header/footer detection
+
         self.logger.info("Starting adaptive header/footer detection...")
+        self.adaptive_headers = []
+        self.adaptive_footers = []
         if not self.is_scanned_copy:
             self.adaptive_header_footer_detection(pages, self.pdf_type)
+
+        protected_tbs_by_page = defaultdict(set)
+        for group in self.adaptive_headers + self.adaptive_footers:
+            for elem in group['elements']:
+                protected_tbs_by_page[elem['page_num']].add(elem['textbox'])
+
+        previous_page_footnote_font_size  = None
+        seen_footnote = set()
+        for page_num, page in self.all_pgs.items():
+            protected_tbs = protected_tbs_by_page.get(page_num, set())
+            page.mark_standalone_footnote_markers(protected_tbs)
+            if self.is_footnote_continuation:
+                previous_page_footnote_font_size, seen_footnote = (
+                    page.get_footnotes(
+                        seen_footnote,
+                        previous_page_footnote_font_size,
+                        protected_tbs
+                    )
+                )
+            else:
+                page.get_footnotes(protected_tbs=protected_tbs)
+            page.detect_footnote_blocks_by_style(protected_tbs)
+
+        if not self.is_scanned_copy:
+            self.finalize_adaptive_header_footer_detection()
+
+        for page in self.all_pgs.values():
+            page.get_width_ofTB_moreThan_Half_of_pg()
+            page.get_body_width_by_binning()
+            if self.has_side_notes:
+                page.find_sidenote_leftend_rightstart_coords()
+                page.get_side_notes()
 
         self.logger.info("Detecting multicolumn page layouts...")
         for page in self.all_pgs.values():
             page.detect_multicolumn_layout()
+
+        if self.table_extract and self.pdf_type != 'judgments':
+            self.logger.info("Detecting borderless tables...")
+            self.pending_continuation = None
+            protected_running_hf = self.get_protected_running_headers_footers()
+            for page in self.all_pgs.values():
+                page.reclaim_header_footer_for_continuation(
+                    self.pending_continuation, protected_boxes=protected_running_hf)
+                self.pending_continuation = page.get_borderless_table(
+                    self.pdf_type, self.header_classifier, self.region_merge_classifier,
+                    continuation_template=self.pending_continuation,
+                    continuation_classifier=self.continuation_classifier,
+                )
+                page.label_borderless_table_tbs()
+
+        for page in self.all_pgs.values():
             page.apply_column_reading_order()
 
-        if self.pdf_type in {'sebi_circulars'} :
-            previous_page_footnote_font_size  = None
-            seen_footnote = set()
-            for page in self.all_pgs.values():
-                if self.is_footnote_continuation:
-                    previous_page_footnote_font_size, seen_footnote = (
-                        page.get_footnotes(
-                            seen_footnote,
-                            previous_page_footnote_font_size
-                        )
-                    )
-                else:
-                    page.get_footnotes()
+        self.detect_repeating_tables()
+
+        if self.pdf_type in {'judgments'}:
+            self.detect_header_pre(pages)
+        # elif self.pdf_type in {'sebi'}:
+        #     self.detect_sebi_header_pre(pages)
+
+        self.detect_toc(pages)
 
         self.finalize_unique_images()
         if not self.unique_images:
             self.remove_empty_manifest_dir(base_name_of_file, output_dir)
         self.get_all_footnote_text()
         self.logger.info(self.all_footnote_text)
+
+    def detect_repeating_tables(self):
+        total_pages = len(self.all_pgs)
+        if total_pages < 3:
+            return
+
+        CELL_MATCH_THRESHOLD = 0.95
+        POSITION_TOLERANCE = 0.05
+        MIN_OCCURRENCE_RATE = 0.85
+
+        entries = []
+        for page_num, page in self.all_pgs.items():
+            if not page.pg_height:
+                continue
+            sources = [("table", page.tabular_datas.tables, page.tabular_datas.table_bbox)]
+            if page.borderless_tabular_datas is not None:
+                sources.append((
+                    "borderless_table",
+                    getattr(page.borderless_tabular_datas, "tables", {}) or {},
+                    getattr(page.borderless_tabular_datas, "table_bbox", {}) or {},
+                ))
+            for source, tables, table_bbox in sources:
+                for idx, df in tables.items():
+                    bbox = table_bbox.get(idx)
+                    if bbox is None or df is None or df.empty:
+                        continue
+                    entries.append({
+                        'page_num': page_num,
+                        'idx': idx,
+                        'source': source,
+                        'df': df,
+                        'y0_pct': bbox[1] / page.pg_height,
+                    })
+
+        if not entries:
+            return
+
+        used = [False] * len(entries)
+        for i, entry in enumerate(entries):
+            if used[i]:
+                continue
+            group = [entry]
+            used[i] = True
+            for j in range(i + 1, len(entries)):
+                if used[j] or entries[j]['source'] != entry['source']:
+                    continue
+                other = entries[j]
+                if abs(entry['y0_pct'] - other['y0_pct']) > POSITION_TOLERANCE:
+                    continue
+                if table_dataframe_cell_match_ratio(entry['df'], other['df']) >= CELL_MATCH_THRESHOLD:
+                    group.append(other)
+                    used[j] = True
+
+            # a genuine running boilerplate table repeats on nearly every page -
+            # a table that recurs only occasionally is a template (same
+            # row/column labels) filled in with different data each time,
+            # which must never be flattened away like real boilerplate
+            covered_pages = {member['page_num'] for member in group}
+            if len(covered_pages) / total_pages < MIN_OCCURRENCE_RATE:
+                continue
+
+            avg_y0_pct = sum(member['y0_pct'] for member in group) / len(group)
+            position = "header" if avg_y0_pct >= 0.5 else "footer"
+
+            for member in group:
+                page_obj = self.all_pgs.get(member['page_num'])
+                if page_obj is not None:
+                    page_obj.mark_table_boilerplate(member['idx'], member['source'], position)
+                    self.logger.debug(
+                        "Page %s: table %s (%s) marked as repeating %s boilerplate",
+                        member['page_num'], member['idx'], member['source'], position
+                    )
 
     def remove_empty_manifest_dir(self, base_name_of_file, output_dir, image_base_dir="manifest"):
         manifest_pdf_dir = os.path.join(output_dir, image_base_dir, base_name_of_file)
@@ -782,24 +2640,45 @@ class Main:
             uploaded_by_groups = self._group_uploaded_by_patterns(uploaded_by_candidates, total_pages)
             footer_groups.extend(uploaded_by_groups)
             
-            self.logger.info("Grouped into %d header groups and %d footer groups", 
+            self.logger.info("Grouped into %d header groups and %d footer groups",
                            len(header_groups), len(footer_groups))
-            
+
             # Step 5: Simple validation - just use the groups as they are
             self.adaptive_headers = header_groups
             self.adaptive_footers = footer_groups
-            
-            self.logger.info("Adaptive detection complete: %d header groups, %d footer groups", 
+
+            self.logger.info("Adaptive detection complete: %d header groups, %d footer groups",
                            len(self.adaptive_headers), len(self.adaptive_footers))
-            
-            # Step 6: Extend headers/footers to include textboxes on same lines
-            self._extend_headers_footers_by_line(page_elements, LINE_TOLERANCE)
-            
-            # Step 7: Apply the detected headers and footers to pages
-            self._apply_adaptive_headers_footers()
-            
+
+            self._pending_page_elements = page_elements
+            self._pending_line_tolerance = LINE_TOLERANCE
+
         except Exception as e:
             self.logger.exception("Error during adaptive header/footer detection: %s", e)
+
+    def finalize_adaptive_header_footer_detection(self):
+        page_elements = getattr(self, '_pending_page_elements', None)
+        line_tolerance = getattr(self, '_pending_line_tolerance', 0.02)
+        if page_elements is None:
+            return
+
+        try:
+            page_elements = [
+                elem for elem in page_elements
+                if self.all_pgs[elem['page_num']].all_tbs.get(elem['textbox']) is None
+            ]
+            for group in self.adaptive_headers + self.adaptive_footers:
+                group['elements'] = [
+                    elem for elem in group['elements']
+                    if self.all_pgs[elem['page_num']].all_tbs.get(elem['textbox']) is None
+                ]
+
+            self._extend_headers_footers_by_line(page_elements, line_tolerance)
+            self._apply_adaptive_headers_footers()
+        except Exception as e:
+            self.logger.exception("Error finalizing adaptive header/footer detection: %s", e)
+        finally:
+            self._pending_page_elements = None
     
     
     def _analyze_header_footer_content(self, text):
@@ -1199,32 +3078,46 @@ class Main:
                     
         return False
 
+    def get_protected_running_headers_footers(self, min_pages=2):
+        protected = set()
+        try:
+            for group in getattr(self, 'adaptive_headers', []) + getattr(self, 'adaptive_footers', []):
+                elements = group.get('elements', [])
+                pages_seen = set(e.get('page_num') for e in elements)
+                if len(pages_seen) < min_pages:
+                    continue
+                for e in elements:
+                    tb = e.get('textbox')
+                    if tb is not None:
+                        protected.add(id(tb))
+        except Exception as e:
+            self.logger.debug("Could not build protected running header/footer set: %s", e)
+        return protected
+
     def _apply_adaptive_headers_footers(self):
         try:
-            # Apply headers
             for header_group in self.adaptive_headers:
                 for element in header_group['elements']:
                     page_num = element['page_num']
                     textbox = element['textbox']
-                    
+
                     if page_num in self.all_pgs and textbox in self.all_pgs[page_num].all_tbs:
                         self.all_pgs[page_num].all_tbs[textbox] = "header"
-                        self.logger.debug("Applied adaptive header on page %d: '%s'", 
+                        self.logger.debug("Applied adaptive header on page %d: '%s'",
                                         page_num, element['text'][:50])
-            
-            # Apply footers
+
             for footer_group in self.adaptive_footers:
                 for element in footer_group['elements']:
                     page_num = element['page_num']
                     textbox = element['textbox']
-                    
+
                     if page_num in self.all_pgs and textbox in self.all_pgs[page_num].all_tbs:
                         self.all_pgs[page_num].all_tbs[textbox] = "footer"
-                        self.logger.debug("Applied adaptive footer on page %d: '%s'", 
+                        self.logger.debug("Applied adaptive footer on page %d: '%s'",
                                         page_num, element['text'][:50])
-            
+
             self.logger.info("Successfully applied adaptive headers and footers to pages")
-            
+
         except Exception as e:
             self.logger.exception("Error applying adaptive headers and footers: %s", e)
     
@@ -1255,11 +3148,23 @@ class Main:
         else:
             self.html_builder = self.get_htmlBuilder(self.pdf_type)
 
+    def get_scanned_copy_parser_engine(self, pdf_type):
+        if self.ocr_engine_pdf_parser is not None:
+            return self.ocr_engine_pdf_parser
+        if pdf_type in {'egazette', 'acts', 'sebi_circulars'}:
+            return "chromelens"
+        return "tesseract"
+
     def process_scanned_copy(self, pdf_type, base_name_of_file, start_page,
                              end_page):
-        pages = ChromeLensParserTool(self.pdf_path)\
-                            .build_xml(start_page, end_page)
-        # self.print_page_xml(pages)
+        parser_engine = self.get_scanned_copy_parser_engine(pdf_type)
+        if parser_engine == "chromelens":
+            pages = ChromeLensParserTool(self.pdf_path)\
+                                .build_xml(start_page, end_page)
+        else:
+            pages = TesseractParserTool(self.pdf_path, self.ocr_language)\
+                                            .build_xml(start_page, end_page)
+        self.print_page_xml(pages)
         self.set_htmlbuilder()
         self.logger.debug("Extracting header and footer info...")
         self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
@@ -1270,12 +3175,26 @@ class Main:
             self.process_pages_sebi_circulars(pdf_type)
         elif pdf_type == 'sebi':
             self.process_pages_sebi(pdf_type)
+        elif pdf_type == 'judgments':
+            self.process_pages_judgments(pdf_type)
         else:
             self.process_pages(pdf_type)
         self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
     
     # --- parse pdf using pdfminer to convert to XML ---       
     def parsePDF(self, pdf_type, char_margin, word_margin, line_margin, \
+                start_page, end_page):
+        # a font whose ToUnicode map is broken is repaired in a copy of the pdf
+        # before anything reads it, so that the xml parsed here and camelot
+        # both get the characters that are really on the page
+        self.repair_tounicode()
+        # camelot reads the pdf itself rather than the xml parsed here, so the
+        # legacy indic font conversion is installed into it for the whole run
+        with self.camelot_font_conversion():
+            return self.parse_pdf_pages(pdf_type, char_margin, word_margin,
+                                        line_margin, start_page, end_page)
+
+    def parse_pdf_pages(self, pdf_type, char_margin, word_margin, line_margin, \
                 start_page, end_page):
         try:
             if not os.path.exists(self.pdf_path):
@@ -1305,7 +3224,9 @@ class Main:
                 return True
             
             cache_xml_path = self.get_path_cache_xml()
-            self.xml_path =  cache_xml_path / f"{base_name_of_file}.xml"
+            # named for this run as well as for the document, for the reason
+            # get_run_cache_pdf() gives
+            self.xml_path =  cache_xml_path / f"{base_name_of_file}-{self.run_id}.xml"
             self.logger.debug("Converting PDF to XML...")
             self.parserTool.convert_to_xml(self.pdf_path,self.xml_path, self.pdf_type, \
                                            char_margin, word_margin, line_margin)
@@ -1318,6 +3239,12 @@ class Main:
             self.logger.debug("Parsing pages from XML: %s", self.xml_path)
             pages = self.parserTool.get_pages_from_xml(self.xml_path, start_page, end_page)
             if pages:
+                self.logger.debug("Removing spaces overprinted by the next glyph...")
+                self.drop_overlapping_spaces(pages)
+                self.logger.debug("Detecting what the fonts that name no encoding draw...")
+                self.detect_unknown_fonts(pages)
+                self.logger.debug("Converting text in legacy indic fonts to unicode...")
+                self.convert_indic_fonts(pages)
                 self.set_htmlbuilder()
                 self.logger.debug("Extracting header and footer info...")
                 self.get_page_header_footer(pages, base_name_of_file, self.output_dir)
@@ -1328,6 +3255,8 @@ class Main:
                     self.process_pages_sebi_circulars(pdf_type)
                 elif pdf_type == 'sebi':
                     self.process_pages_sebi(pdf_type)
+                elif pdf_type == 'judgments':
+                    self.process_pages_judgments(pdf_type)
                 else:
                     self.process_pages(pdf_type)
                 self.logger.info("Finished Processing of pages for: %s", self.pdf_path)
@@ -1342,6 +3271,8 @@ class Main:
 
             if pdf_type in {'egazette', 'sebi'}:
                 self.write_manifest()
+
+            self.remove_empty_manifest_dir(base_name_of_file, self.output_dir)
 
             return True
         except Exception as e:
@@ -1563,21 +3494,882 @@ class Main:
         cache_xml_dir.mkdir(parents=True, exist_ok=True)  
         return cache_xml_dir
 
+    def get_run_cache_pdf(self):
+        """This run's own directory under cache_pdf, created on first use.
+
+        Several runs can be converting at once (egazette's pdf2html runs a
+        pool of them in one tree) and two different documents often share a
+        file name - every issue of a weekly gazette has its 9.pdf - so a copy
+        named after the document alone was written over by the other run, and
+        deleted by it when that run finished, leaving each to read the other's
+        pdf or none at all. A copy is still named after the document, since
+        everything written out is named after it, but in a directory no other
+        run uses.
+        """
+        run_dir = self.get_path_cache_pdf() / self.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
     def clear_cache_pdf(self):
-        cache_dir = self.get_path_cache_pdf()
-        if not os.path.exists(self.pdf_path):
-            self.logger.warning("File was not created or already deleted: %s", self.pdf_path)
-        else:
-            if os.path.commonpath([os.path.abspath(self.pdf_path), os.path.abspath(cache_dir)]) == os.path.abspath(cache_dir):
-                try:
-                    os.remove(self.pdf_path)
-                    self.logger.info("Successfully removed cached_pdf: %s", self.pdf_path)
-                except OSError as e:
-                    self.logger.error("Error deleting cached file %s: %s", self.pdf_path, e)
-            else:
-                self.logger.debug("Skipping delete, file not in cache_pdf: %s", self.pdf_path)
+        # every pdf this run cached is in its own directory, and nothing of
+        # another run's is
+        run_dir = self.get_path_cache_pdf() / self.run_id
+        if not run_dir.exists():
+            self.logger.debug("No pdf was cached for this run: %s", run_dir)
+            return
+        try:
+            shutil.rmtree(run_dir)
+            self.logger.info("Successfully removed cached pdf(s): %s", run_dir)
+        except OSError as e:
+            self.logger.error("Error deleting cached pdf(s) %s: %s", run_dir, e)
+
+    def clear_camelot_cache(self):
+        try:
+            from .TableExtraction import cleanup_camelot_temp_dirs
+            cleanup_camelot_temp_dirs()
+        except Exception as e:
+            self.logger.debug("Skipping camelot temp cleanup: %s", e)
+
+    def clear_ocr_engines(self):
+        if self.ocr_engine_image_text == "paddleocr":
+            clear_paddle_ocr_engines()
+            self.logger.info("Released paddleocr model(s) held by this run")
+
+    def cleanup_run(self, keep_xml=None):
+        if keep_xml is None:
+            keep_xml = getattr(self, "keep_xml", False)
+        try:
+            self.clear_cache_pdf()
+        except Exception as e:
+            self.logger.debug("cache_pdf cleanup failed: %s", e)
+        if not keep_xml:
+            try:
+                self.clear_xml_cache()
+            except Exception as e:
+                self.logger.debug("cache_xml cleanup failed: %s", e)
+        try:
+            self.clear_camelot_cache()
+        except Exception as e:
+            self.logger.debug("camelot temp cleanup failed: %s", e)
+        try:
+            self.clear_ocr_engines()
+        except Exception as e:
+            self.logger.debug("ocr engine cleanup failed: %s", e)
+        _unregister_run(self.run_id)
+
+
+    def detect_header_pre(self, pages):
+
+        def parse_bbox(elem):
+            try:
+                return tuple(map(float, elem.attrib["bbox"].split(",")))
+            except:
+                return None
+
+        def norm(txt):
+            return re.sub(r"[\s_]+", " ", txt or "").strip()
+
+        def tl_text(tl):
+            vals = []
+            for t in tl.findall(".//text"):
+                if t.text:
+                    vals.append(t.text)
+            return norm("".join(vals))
+
+        def spaced(word):
+            chars = []
+            for ch in word:
+                if ch.isspace():
+                    chars.append(r'[\s_]+')
+                else:
+                    chars.append(re.escape(ch))
+            return r'[\s_]*'.join(chars)
+
+
+        def phrase(txt):
+            return r'[\s_]+'.join(spaced(x) for x in txt.split())
+
+
+        months = (
+            f"{spaced('January')}|{spaced('February')}|{spaced('March')}|"
+            f"{spaced('April')}|{spaced('May')}|{spaced('June')}|"
+            f"{spaced('July')}|{spaced('August')}|{spaced('September')}|"
+            f"{spaced('October')}|{spaced('November')}|{spaced('December')}"
+        )
 
         
+        # TIER 1
+        tier1 = [
+
+            re.compile(
+                rf'\n[\s_]*({phrase("THE")}[\s_]+)?'
+                rf'({phrase("BRIEF")}[\s_]+)?'
+                rf'({phrase("REASONS FOR THE")}[\s_]+)?'
+                rf'{spaced("JUDGMENT")}[\s_]*:?[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*({spaced("JUDGMENT")}|{spaced("JUDGEMENT")})'
+                rf'[\s_]*(\(.+\))?[\s_]*(:|\n)?',
+                re.I
+            ),
+
+            re.compile(
+                rf'^[\s_]*({spaced("JUDGMENT")}|{spaced("JUDGEMENT")})',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*[-:]*[\s_]*{spaced("JUDGMENT")}[\s_]*[-:]*[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*[-:]*[\s_]*{spaced("JUDGEMENT")}[\s_]*[-:]*[\s_]*\n?',
+                re.I
+            ),
+
+
+            re.compile(
+                rf'\n[\s_]*{phrase("EX PARTE JUDGMENT")}[\s_]*\n?',
+                re.I
+            ),
+
+
+            re.compile(
+                rf'\n[\s_]*[-:]*[\s_]*{spaced("\u0ca4\u0cc0\u0cb0\u0ccd\u0caa\u0cc1")}[\s_]*[-:]*[\s_]*\n?',   # ತೀರ್ಪು
+                re.I
+            ),
+
+            re.compile(
+                rf'^[\s_]*{spaced("\u0ca4\u0cc0\u0cb0\u0ccd\u0caa\u0cc1")}[\s_]*$',   # ತೀರ್ಪು
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*[-:]*[\s_]*{spaced("\u0906\u0926\u0947\u0936")}[\s_]*[-:]*[\s_]*\n?',   # आदेश
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0928\u094d\u092f\u093e\u092f\u0928\u093f\u0930\u094d\u0923\u092f")}[\s_]*\n?',   # न्यायनिर्णय
+                re.I
+            ),
+
+            
+            re.compile(
+                rf'\n[\s_]*[-:]*[\s_]*{spaced("\u0928\u093f\u0915\u093e\u0932\u092a\u0924\u094d\u0930")}[\s_]*[-:]*[\s_]*\n?',   # निकालपत्र
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("\u090f\u0915\u0924\u0930\u094d\u092b\u0940 \u0928\u093f\u0915\u093e\u0932\u092a\u0924\u094d\u0930")}[\s_]*\n?',   # एकतर्फी निकालपत्र
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("\u090f\u0915\u0924\u0930\u094d\u092b\u093e \u0928\u093f\u0915\u093e\u0932\u092a\u0924\u094d\u0930")}[\s_]*\n?',   # एकतर्फा निकालपत्र
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("\u0935\u093e\u091f\u092a \u0906\u0926\u0947\u0936")}[\s_]*\n?',   # वाटप आदेश
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("\u090f\u0915\u0924\u0930\u094d\u092b\u093e \u0906\u0926\u0947\u0936")}[\s_]*\n?',   # एकतर्फा आदेश
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("\u090f\u0915\u0924\u0930\u094d\u092b\u0940 \u0906\u0926\u0947\u0936")}[\s_]*\n?',   # एकतर्फी आदेश
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0ba4\u0bc0\u0bb0\u0bcd\u0baa\u0bc1\u0bb0\u0bc8")}[\s_]*\n?',   # தீர்ப்புரை
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0ba4\u0bc0\u0bb0\u0bcd\u0baa\u0bcd\u0baa\u0bc1")}[\s_]*\n?',   # தீர்ப்பு
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0b89\u0ba4\u0bcd\u0ba4\u0bbf\u0bb0\u0bb5\u0bc1")}[\s_]*\n?',   # உத்திரவு
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0b89\u0ba4\u0bcd\u0ba4\u0bb0\u0bb5\u0bc1")}[\s_]*\n?',   # உத்தரவு
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0d35\u0d3f\u0d27\u0d3f\u0d28\u0d4d\u0d2f\u0d3e\u0d2f\u0d02")}[\s_]*\n?',   # വിധിന്യായം
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("\u0d09\u0d24\u0d4d\u0d24\u0d30\u0d35\u0d4d")}[\s_]*\n?',   # ഉത്തരവ്
+                re.I
+            ),
+
+
+
+            # AWARD
+            re.compile(
+                rf'\n[\s_]*({phrase("FINAL AWARD")}|{phrase("INTERIM AWARD")}|{spaced("AWARD")})[\s_]*(:|\n)?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*({phrase("ORAL AWARD")}|{spaced("AWARD")}[\s_]*\([\s_]*{spaced("ORAL")}[\s_]*\))',
+                re.I
+            ),
+
+            # P.C.
+            re.compile(
+                r'\n[\s_]*((P[\s_]*\.?[\s_]*C[\s_]*\.?)|(P[\s_]*E[\s_]*R[\s_]*C[\s_]*O[\s_]*U[\s_]*R[\s_]*T))[\s_]*(:|-)?[\s_]*\n?',
+                re.I
+            ),
+
+            # ORDER
+            re.compile(
+                rf'\n[\s_]*({spaced("ORDER")}|{phrase("COMMON ORDER")}|'
+                rf'{phrase("FINAL ORDER")}|{phrase("INTERIM ORDER")})'
+                rf'[\s_]*(\(.+\))?[\s_]*(:|\n)?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("DISTRIBUTION ORDER")}[\s_]*\n?',
+                re.I
+            ),
+
+
+            re.compile(
+                rf'^[\s_]*{spaced("ORDER")}',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("ORDER UNDER")}.*',
+                re.I
+            ),
+
+            # ORAL ORDER / ORAL JUDGMENT
+            re.compile(
+                rf'\n[\s_]*(({spaced("ORAL")}[\s_]+({spaced("ORDER")}|{spaced("JUDGMENT")}))|'
+                rf'(({spaced("ORDER")}|{spaced("JUDGMENT")})[\s_]*\([\s_]*{spaced("ORAL")}[\s_]*\)))',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("ORDER BELOW EXH")}[\s_]*\n?',
+                re.I
+            ),
+
+
+            # COMMON
+            re.compile(
+                rf'\n[\s_]*{phrase("COMMON")}[\s_]+'
+                rf'({spaced("JUDGMENT")}|{spaced("ORDER")})[\s_]*(\n|:)?',
+                re.I
+            ),
+        ]
+
+        
+        # TIER 2
+
+        tier2 = [
+
+            # MANDEEP PANNU, J. (ORAL)
+            re.compile(
+                rf'\n?[A-Z .]{{3,120}},[\s_]*J\.?[\s_]*\(?{spaced("ORAL")}\)?[\s_]*\n?',
+                re.I
+            ),
+
+            # XYZ, J.
+            re.compile(
+                r',[ ]*(J|Judge|Justice|Chief Justice|C\.J\.?)'
+                r'([. ]+\(?(Oral|ORAL|oral)\)?)?:?[ ]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                r',[ \xa0]*(((C\.|J)?(J[. \r\t]+:?|Judge:)'
+                r'([ ]*\(?(Oral|ORAL)\)?)?)|(J[\s_]*\(Oral\)))'
+                r'[. \r\t:]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                r'\n[\s_]*(Per|PER).+,[\s_]*J[\s_]*(:[\s_]*)?\n?',
+                re.I
+            ),
+
+            # CORAM
+            re.compile(
+                rf'\n[\s_]*({spaced("PER")}|{spaced("CORAM")})[\s_]*:[\s_]*{spaced("JUSTICE")}.*',
+                re.I
+            ),
+
+            # "HON'BLE" (straight or curly apostrophe) is the near-universal
+            # spelling in Indian court captions (apostrophe elided from
+            # "Honourable") - spaced("HONBLE") doesn't tolerate it, so this
+            # never matched that spelling and fell through to the much
+            # weaker generic comma-based fallback below.
+            re.compile(
+                rf"\n[\s_]*(H[\s_]*O[\s_]*N[\s_]*['’]?[\s_]*B[\s_]*L[\s_]*E|{spaced('HONOURABLE')}).{{3,20}}{spaced('JUSTICE')}.*",
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("JUSTICE")}.{{0,30}}',
+                re.I
+            ),
+
+            # PRESENT
+            re.compile(
+                rf'\n[\s_]*{spaced("PRESENT")}[\s_]*\n?',
+                re.I
+            ),
+
+            # PRONOUNCED
+            re.compile(
+                rf'\n[\s_]*({spaced("PRONOUNCED")}|{spaced("DICTATED")})'
+                rf'([\s_]+{phrase("IN COURT")})?',
+                re.I
+            ),
+        ]
+
+
+        # TIER 3
+
+        tier3 = [
+
+            re.compile(
+                rf'\n[\s_]*(({spaced("MEMBER")})[\s_]*\((J|A|T)\)|'
+                rf'({spaced("CHAIRMAN")})([\s_]*\((A|J)\))?|'
+                rf'(({phrase("JUDICIAL MEMBER")}|{phrase("ADMINISTRATIVE MEMBER")}|{phrase("TECHNICAL MEMBER")})))'
+                rf'[\s_]*:?[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("MEMBER")}[ .:-]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[ \r\t]*{spaced("PER")}[ \r\t]+.*,[ \r\t]+'
+                rf'({phrase("JUDICIAL MEMBER")}|A\.?M|J\.?M|{phrase("ACCOUNTANT MEMBER")}).*',
+                re.I
+            ),
+        ]
+
+
+        # TIER 4
+
+        tier4 = [
+
+            # Arabic numerals
+            re.compile(
+                r'\n[ ]*[12]\.',
+                re.I
+            ),
+
+            # Devanagari / Marathi / Hindi : १ २
+            re.compile(
+                r'\n[ ]*[\u0967\u0968]\.',
+                re.I
+            ),
+
+            # Kannada : ೧ ೨
+            re.compile(
+                r'\n[ ]*[\u0ce7\u0ce8]\.',
+                re.I
+            ),
+
+            # Tamil : ௧ ௨
+            re.compile(
+                r'\n[ ]*[\u0be7\u0be8]\.',
+                re.I
+            ),
+
+            # Malayalam : ൧ ൨
+            re.compile(
+                r'\n[ ]*[\u0d67\u0d68]\.',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[ ]*((({phrase("BRIEF FACTS")})|{spaced("BACKGROUND")}|({phrase("FACTUAL BACKGROUND")}))).*',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("FACT OF THE CASE")}[\s_]*:?[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("EXORDIUM")}[\s_]*:?[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[ \r]*{phrase("INFORMATION SOUGHT")}',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("RESPONDENT")}(S)?.{{0,15}}',
+                re.I
+            ),
+        ]
+
+        # TIER 5
+
+        tier5 = [
+
+            re.compile(
+                rf'\n[\s_]*({spaced("DATED")}[\s:,]+({spaced("THE")}[\s_]+)?)'
+                rf'\d{{1,2}}[\s_]*(th|rd|nd|st)[\s_]+({months})[,\s]+\d{{4}}[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{spaced("DATED")}[\s_]*:.*',
+                re.I
+            ),
+
+            re.compile(
+                r'\n(\d+[ /]+)?\d+[/.-]\d+[/.-]\d+',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("ORDER DATED")}[\s_]*:[\s_]*\d{{1,2}}[./-]\d{{1,2}}[./-]\d{{2,4}}[\s_]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("ORDER DATED")}[\s_]*:[\s_]*\n?',
+                re.I
+            ),
+        ]
+
+        # TIER 6
+        tier6 = [
+
+            re.compile(
+                rf'\n[\s_]*({phrase("BY THE COURT")}|{phrase("BY COURT")}|{phrase("PER COURT")}).*',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*{phrase("FOR THE PETITIONER")}(S)?[\s.]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                rf'\n[\s_]*({phrase("PUBLIC PROSECUTOR")}|{phrase("FOR THE RESPONDENT")})(S)?[\s.]*\n?',
+                re.I
+            ),
+
+            re.compile(
+                r'\n[ \t]*([-]+|=+|\*+|[.]+)[ \t]*\n?',
+                re.I
+            ),
+        ]
+
+
+       
+        # FINAL PRIORITY
+        
+
+        tiers = [tier1, tier2, tier3, tier4, tier5, tier6]
+
+        # COLLECT ROWS
+
+
+        rows = []
+
+        for pg_idx, pg in enumerate(pages):
+
+            page_num = pg_idx + 1
+
+            if page_num not in self.all_pgs:
+                continue
+
+            page_obj = self.all_pgs[page_num]
+
+            for tb, label in page_obj.all_tbs.items():
+
+                if label is not None:
+                    continue
+
+                for tl in tb.tbox.findall(".//textline"):
+
+                    bb = parse_bbox(tl)
+                    if not bb:
+                        continue
+
+                    txt = tl_text(tl)
+                    if not txt:
+                        continue
+
+                    x0, y0, x1, y1 = bb
+
+                    rows.append({
+                        "page": page_num,
+                        "tb": tb,
+                        "text": txt,
+                        "x0": x0,
+                        "y0": y0,
+                        "x1": x1,
+                        "y1": y1,
+                    })
+
+        if not rows:
+            return
+
+
+        # top to bottom
+        rows.sort(key=lambda z: (z["page"], -z["y0"], z["x0"]))
+
+
+        # SEARCH TIER BY TIER
+
+        hit = None
+        hit_row = None
+
+        for tier_idx, tier in enumerate(tiers, start=1):
+
+            built = ""
+
+            for i, row in enumerate(rows):
+
+                built += "\n" + row["text"]
+
+                matched = False
+
+                # A real heading occupies its own row - nothing of substance
+                # follows it there. A tier regex is anchored to the *start* of
+                # a row (via the "\n" every row is joined with) but has no
+                # matching guarantee at the other end, so it can just as
+                # easily match the first word of an ordinary sentence that
+                # happens to line-wrap onto its own row (e.g. a body
+                # paragraph reading "judgment of the Supreme Court does not
+                # apply..." - "judgment" alone satisfies the JUDGMENT tier1
+                # pattern). Requiring the match to reach (within a small
+                # trailing-punctuation/whitespace slack of) the end of the
+                # text built so far rules that out: it forces the matched
+                # row to be essentially *only* the heading, not a sentence
+                # that merely starts with the heading word.
+                trailing_slack = 3
+
+                for rgx in tier:
+                    m = rgx.search(built)
+                    if m and (len(built) - m.end()) <= trailing_slack:
+                        hit = i
+                        hit_row = row
+                        matched = True
+
+                        self.logger.info(
+                            f"Matched tier {tier_idx} regex: {rgx.pattern}"
+                        )
+                        break
+
+                if matched:
+                    break
+
+            if hit is not None:
+                break
+
+
+        if hit is None:
+            return
+
+        # FIND ALL ROWS WITH EXACT SAME y0,y1 AS MATCHED ROW
+
+        same_line_idx = set()
+
+        target_page = hit_row["page"]
+        target_y0 = hit_row["y0"]
+        target_y1 = hit_row["y1"]
+
+        for j, r in enumerate(rows):
+
+            if r["page"] != target_page:
+                continue
+
+            if r["y0"] == target_y0 and r["y1"] == target_y1:
+                same_line_idx.add(j)
+
+
+        # LABEL
+        # 1) all rows upto hit
+        # 2) all rows having exact same y0,y1 as matched row
+
+        mark_indexes = set(range(hit + 1)) | same_line_idx
+
+        seen = set()
+
+        for i in sorted(mark_indexes):
+
+            row = rows[i]
+
+            page_obj = self.all_pgs[row["page"]]
+            tb = row["tb"]
+
+            key = (row["page"], id(tb))
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+
+            if page_obj.all_tbs[tb] is None:
+                page_obj.all_tbs[tb] = "pre_header"
+
+    def detect_sebi_header_pre(self, pages):
+        body_start_re = re.compile(
+            r'^(?!\s*\d{1,4}\.\d{1,4}\.\d{2,4})\s*[1-9' + INDIC_NONZERO_DIGIT_CHARS + r']\d{0,2}[A-Z' + INDIC_LETTER_CHARS + r']?\.(?!\))(?:\s+.*)?$',
+        )
+
+        rows = []
+        for pg_idx, pg in enumerate(pages):
+            page_num = pg_idx + 1
+            if page_num not in self.all_pgs:
+                continue
+            page_obj = self.all_pgs[page_num]
+            for tb, label in page_obj.all_tbs.items():
+                if label is not None:
+                    continue
+                text = re.sub(r'\s+', ' ', tb.extract_text_from_tb()).strip()
+                if not text:
+                    continue
+                x0, y0, x1, y1 = tb.coords
+                rows.append({"page": page_num, "tb": tb, "text": text, "y0": y0})
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda z: (z["page"], -z["y0"]))
+
+        body_start_idx = None
+        for i, row in enumerate(rows):
+            if body_start_re.match(row["text"]):
+                body_start_idx = i
+                break
+
+        if not body_start_idx:
+            return
+
+        for row in rows[:body_start_idx]:
+            page_obj = self.all_pgs[row["page"]]
+            if page_obj.all_tbs[row["tb"]] is None:
+                page_obj.all_tbs[row["tb"]] = "pre_header"
+
+    def extract_toc_lines(self, tb):
+        lines = []
+        for textline in tb.tbox.findall('.//textline'):
+            bbox = textline.attrib.get('bbox')
+            if not bbox:
+                continue
+            try:
+                x0, y0, x1, y1 = map(float, bbox.split(','))
+            except ValueError:
+                continue
+            chars = [t.text for t in textline.findall('.//text') if t.text]
+            text = re.sub(r'\s+', ' ', ''.join(chars)).strip()
+            if not text:
+                continue
+            lines.append({'x0': x0, 'y0': y0, 'x1': x1, 'y1': y1, 'text': text})
+        return lines
+
+    def detect_toc(self, pages):
+        TOC_HEADING_RE = re.compile(
+            r'^\s*(TABLE\s+OF\s+CONTENTS?|INDEX|CONTENTS?|SYNOPSIS|'
+            r'LIST\s+OF\s+CONTENTS?|'
+            r'ARRANGEMENT\s+OF\s+(?:SECTIONS?|CLAUSES?|PARAGRAPHS?|REGULATIONS?))\s*$',
+            re.I
+        )
+        PAGE_NO_HEADER_RE = re.compile(r'^\s*PAGE\s*(?:NO\.?|NUMBER)\s*$', re.I)
+        ROMAN_RE = re.compile(r'^M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$', re.I)
+        TOC_PAGE_REF_RE = re.compile(
+            r'[.․…\s]*[.․…]{2,}[.․…\s]*(\(?[A-Za-z0-9' + INDIC_LETTER_CHARS + INDIC_DIGIT_CHARS + r']{1,7}\)?)\.?(?=\s|$)'
+        )
+        MAX_MISS_STREAK = 3
+        MAX_CONTINUATION_LEN = 160
+        LEVEL_TOL = 10.0
+        MIN_ENTRIES = 3
+        ROW_Y_TOL = 0.6
+
+        def page_token(raw):
+            token = raw.strip().strip('().').strip()
+            if not token:
+                return None
+            if token.isdigit() and len(token) <= 4:
+                return token
+            if ROMAN_RE.match(token):
+                return token
+            return None
+
+        def split_entries(text):
+            found = []
+            last = 0
+            for match in TOC_PAGE_REF_RE.finditer(text):
+                token = page_token(match.group(1))
+                if not token:
+                    continue
+                body = text[last:match.start()].strip()
+                found.append((body, token))
+                last = match.end()
+            remainder = text[last:].strip()
+            return found, remainder
+
+        rows = []
+        for pg_idx, pg in enumerate(pages):
+            page_num = pg_idx + 1
+            if page_num not in self.all_pgs:
+                continue
+            page_obj = self.all_pgs[page_num]
+            for tb, label in page_obj.all_tbs.items():
+                if label is not None:
+                    continue
+                for line in self.extract_toc_lines(tb):
+                    rows.append({
+                        "page": page_num, "tbs": [tb], "texts": [line["text"]],
+                        "text": line["text"],
+                        "x0": line["x0"], "y0": line["y0"],
+                        "x1": line["x1"], "y1": line["y1"],
+                    })
+
+        if not rows:
+            return
+
+        rows.sort(key=lambda z: (z["page"], -z["y0"], z["x0"]))
+
+        merged_rows = []
+        i = 0
+        while i < len(rows):
+            group = [rows[i]]
+            j = i + 1
+            while j < len(rows) and rows[j]["page"] == group[0]["page"]:
+                row_height = max(group[-1]["y1"] - group[-1]["y0"], rows[j]["y1"] - rows[j]["y0"], 1.0)
+                if abs(rows[j]["y0"] - group[-1]["y0"]) <= row_height * ROW_Y_TOL:
+                    group.append(rows[j])
+                    j += 1
+                    continue
+                break
+            if len(group) > 1:
+                merged_rows.append({
+                    "page": group[0]["page"],
+                    "tbs": [g["tbs"][0] for g in group],
+                    "texts": [g["text"] for g in group],
+                    "text": " ".join(g["text"] for g in group),
+                    "x0": group[0]["x0"], "y0": group[0]["y0"],
+                    "x1": group[-1]["x1"], "y1": group[0]["y1"],
+                })
+            else:
+                merged_rows.append(rows[i])
+            i = j
+        rows = merged_rows
+
+        heading_idx = None
+        heading_text = None
+        for idx, row in enumerate(rows):
+            for t in row["texts"]:
+                if TOC_HEADING_RE.match(t):
+                    heading_idx = idx
+                    heading_text = t.strip()
+                    break
+            if heading_idx is not None:
+                break
+
+        if heading_idx is None:
+            return
+
+        heading_row = rows[heading_idx]
+        consumed_tbs = [(heading_row["page"], tb) for tb in heading_row["tbs"]]
+
+        entries = []
+        pending_prefix = ""
+        pending_start_x0 = None
+        pending_tbs = []
+        miss_streak = 0
+
+        i = heading_idx + 1
+        while i < len(rows):
+            row = rows[i]
+            text = row["text"]
+
+            if len(row["tbs"]) == 1 and PAGE_NO_HEADER_RE.match(text):
+                consumed_tbs.extend((row["page"], tb) for tb in row["tbs"])
+                i += 1
+                continue
+
+            found, remainder = split_entries(text)
+            if found:
+                for idx, (body, page_no) in enumerate(found):
+                    if idx == 0 and pending_prefix:
+                        body = f"{pending_prefix} {body}".strip()
+                    entry_x0 = pending_start_x0 if (idx == 0 and pending_start_x0 is not None) else row["x0"]
+                    if body:
+                        entries.append({"text": body, "page_no": page_no, "x0": entry_x0})
+                consumed_tbs.extend((row["page"], tb) for tb in row["tbs"])
+                consumed_tbs.extend(pending_tbs)
+                pending_prefix = remainder
+                pending_start_x0 = row["x0"] if remainder else None
+                pending_tbs = []
+                miss_streak = 0
+                i += 1
+                continue
+
+            if len(text) <= MAX_CONTINUATION_LEN and miss_streak < MAX_MISS_STREAK:
+                if pending_start_x0 is None:
+                    pending_start_x0 = row["x0"]
+                pending_prefix = f"{pending_prefix} {text}".strip()
+                pending_tbs.extend((row["page"], tb) for tb in row["tbs"])
+                miss_streak += 1
+                i += 1
+                continue
+
+            break
+
+        if len(entries) < MIN_ENTRIES:
+            return
+
+        stack = []
+        for entry in entries:
+            x0 = entry["x0"]
+            while stack and x0 < stack[-1][0] - LEVEL_TOL:
+                stack.pop()
+            if stack and abs(x0 - stack[-1][0]) <= LEVEL_TOL:
+                level = stack[-1][1]
+            elif stack and x0 > stack[-1][0] + LEVEL_TOL:
+                level = stack[-1][1] + 1
+                stack.append((x0, level))
+            else:
+                level = 1
+                stack = [(x0, level)]
+            entry["level"] = level
+
+        self.html_builder.toc_entries = entries
+        self.html_builder.toc_title = heading_text
+
+        for page_num, tb in consumed_tbs:
+            page_obj = self.all_pgs[page_num]
+            if page_obj.all_tbs[tb] is None:
+                page_obj.all_tbs[tb] = "toc"
+
 # --- func to define argument parser required for the tool ---
 def get_arg_parser():
     parser = argparse.ArgumentParser(description="To automate pdf Parse and Convert to structured", add_help=True)
@@ -1615,8 +4407,23 @@ def get_arg_parser():
     parser.add_argument('-mip', '--min-img-pixels', dest = 'min_img_pixels', action = 'store', \
                       required = False,  default = 0,  help = 'minimum pixel area threshold for initial filtering (area = dimension^2). Images are further filtered based on text content detection.')
     parser.add_argument('-ol', '--ocr-language', dest='ocr_language', action='store', \
-                      required=False, default='eng', choices=TESSERACT_LANGUAGES,
-                      help=f'tesseract language code for OCR (default: eng). One of: {", ".join(TESSERACT_LANGUAGES)}')
+                      required=False, default='eng',
+                      help=f'tesseract language code for OCR (default: eng), or several joined '
+                           f'with "+" (tesseract\'s own multi-language syntax, e.g. hin+eng) - '
+                           f'only the tesseract engine (-op tesseract / -oe tesseract) honours a '
+                           f'combination; paddleocr takes a single language and degrades a '
+                           f'combination to the first language in it it supports; chromelens '
+                           f'ignores this option entirely (it auto-detects language). One of: '
+                           f'{", ".join(TESSERACT_LANGUAGES)}')
+    parser.add_argument('-oe', '--ocr-engine-image-text', dest='ocr_engine_image_text', action='store', \
+                      required=False, default='tesseract', choices=OCR_ENGINES_AVAILABLE,
+                      help=f'OCR engine to use for figure/image text extraction (default: tesseract). One of: {", ".join(OCR_ENGINES_AVAILABLE)}')
+    parser.add_argument('-op', '--ocr-engine-pdf-parser', dest='ocr_engine_pdf_parser', action='store', \
+                      required=False, default=None, choices=OCR_PDF_PARSERS_AVAILABLE,
+                      help='OCR engine used to parse a scanned-copy PDF into text (page-text extraction path, '
+                           'distinct from -oe/--ocr-engine-image-text which is for figure/image text). Default: '
+                           'chromelens for egazette/acts/sebi_circulars, tesseract otherwise; pass explicitly to '
+                           f'override that default in either direction. One of: {", ".join(OCR_PDF_PARSERS_AVAILABLE)}')
     parser.add_argument('-sc', '--scanned-copy', dest = 'scanned_copy', action = 'store_true',
                         required = False, default = False, help = 'mention if the pdf copy is scanned')
     parser.add_argument('-te', '--table-extract', dest = 'table_extract', action = 'store_true',
@@ -1661,6 +4468,47 @@ def get_arg_parser():
                         required = False, default = None,
                         help = 'Attribution text for the IIIF manifest\'s "requiredStatement" (egazette/sebi '
                                'types only). Omitted entirely if not supplied.')
+    parser.add_argument('-fc', '--font-conv', dest = 'font_conv_map', action = 'append',
+                        required = False, default = None, metavar = 'FONT=CONVERTER',
+                        help = 'Convert text in FONT to unicode using CONVERTER, for legacy indic '
+                               'fonts whose name does not say which one they are (e.g. '
+                               '-fc TT572t00=chanakya). FONT is matched against the pdf font name '
+                               'the same way the built-in ones are, i.e. anywhere in it and '
+                               'ignoring case, and takes precedence over them. Repeat the option '
+                               'or separate the mappings with commas. Fonts named after a '
+                               'supported converter are converted anyway and need no mapping.')
+    parser.add_argument('-fm', '--font-model', dest = 'font_model', action = 'store',
+                        required = False, default = None, metavar = 'MODEL',
+                        help = 'Model that says what a font whose name identifies no '
+                               f'encoding is drawing, as written by machinelearning/'
+                               f'training.py (default {FONT_MODEL_PATH}, and detection '
+                               'is simply skipped when there is no model there). A font '
+                               'the model places needs no -fc mapping; a -fc mapping '
+                               'wins over the model for the font it names.')
+    parser.add_argument('-fl', '--font-lang', dest = 'font_lang', action = 'store',
+                        required = False, default = None, metavar = 'LANG',
+                        choices = sorted(FONT_LANG_MODELS),
+                        help = 'Language of the text the fonts of this pdf draw, which '
+                               'picks the model that says what a font whose name '
+                               'identifies no encoding is drawing: '
+                               + ', '.join('%s -> %s' % (lang, FONT_LANG_MODELS[lang])
+                                           for lang in sorted(FONT_LANG_MODELS))
+                               + f' (default {DEFAULT_FONT_LANG}). A model named with '
+                               '-fm wins over this.')
+    parser.add_argument('-nfd', '--no-font-detect', dest = 'font_detect',
+                        action = 'store_false',
+                        help = 'Do not detect the encoding of the fonts whose name does '
+                               'not give it away, i.e. use nothing but the font names '
+                               'and the -fc mappings, as before the model existed.')
+    parser.add_argument('-fn', '--font-names', dest = 'show_fonts',
+                        action = 'store_true', required = False, default = False,
+                        help = 'Name the pdf font every run of text is drawn in, in the '
+                               'output itself: each contiguous piece of text drawn in one '
+                               'font is wrapped in <span data-font="FONT">...</span>, and '
+                               'a font the detector was run on also carries what the model '
+                               'made of it, as data-detected-font="CLASS". '
+                               'Html output only, so it does nothing for the types written '
+                               'as bluebell (%s).' % ' | '.join(sorted(BLUEBELL_PDF_TYPES)))
     return parser
 
 
@@ -1722,6 +4570,8 @@ if __name__ == "__main__":
     if min_img_pixels and isinstance(min_img_pixels, str):
         min_img_pixels = int(min_img_pixels)
     ocr_language = args.ocr_language
+    ocr_engine_image_text = args.ocr_engine_image_text
+    ocr_engine_pdf_parser = args.ocr_engine_pdf_parser
     is_scanned_copy = args.scanned_copy
     table_extract = args.table_extract
     figure_text = args.figure_text
@@ -1731,20 +4581,26 @@ if __name__ == "__main__":
     provider_id = args.provider_id
     provider_name = args.provider_name
     attribution = args.attribution
-    main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type, has_sidenotes, has_doc_end,
+    main = Main(pdf_path,is_amendment_pdf,output_dir, args.pdf_type,
+                has_sidenotes, has_doc_end,
                 is_footnote_continuation, min_img_pixels, ocr_language,
                 is_scanned_copy, table_extract, public_base_url, server_root,
                 rights, provider_id, provider_name, attribution,
-                figure_text)#start,end,is_amendment_pdf,output_dir, args.pdf_type)
+                figure_text, args.font_conv_map, ocr_engine_image_text,
+                args.font_model, args.font_lang, args.font_detect, args.show_fonts,
+                ocr_engine_pdf_parser, args.keep_xml)
     # margins = compute_optimal_char_margin(pdf_path)
     char_margin = args.char_margin # str(margins)
     word_margin = args.word_margin # str(margins['word_margin'])
     line_margin = args.line_margin # str(margins['line_margin'])
     logger.info(f'char_margin : {char_margin}, word_margin: {word_margin}, line_margin: {line_margin}')
-    is_success = main.parsePDF(args.pdf_type, char_margin, word_margin, line_margin, \
-                               start_page, end_page)
-    if is_success:
-        main.buildHTML(start_page, end_page) #end)
-    main.clear_cache_pdf()
-    if not args.keep_xml:
-        main.clear_xml_cache()
+
+    install_cleanup_signal_handlers((signal.SIGINT, signal.SIGTERM))
+
+    try:
+        is_success = main.parsePDF(args.pdf_type, char_margin, word_margin, line_margin, \
+                                   start_page, end_page)
+        if is_success:
+            main.buildHTML(start_page, end_page) #end)
+    finally:
+        main.cleanup_run(keep_xml=args.keep_xml)

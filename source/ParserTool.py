@@ -1,14 +1,52 @@
 import xml.etree.ElementTree as ET
 import subprocess
 import logging
+import re
 import asyncio
 import io
+import tempfile
 from html import escape
 
 import pymupdf
-from PIL import Image
+from PIL import Image, ImageOps
 from chrome_lens_py import LensAPI
 from statistics import median
+import pytesseract
+
+TESSERACT_LANG_MAP = {
+    "en": "eng",
+    "hi": "hin",
+    "mr": "mar",
+    "ne": "nep",
+    "sa": "san",
+    "ta": "tam",
+    "te": "tel",
+    "as": "asm",
+    "bn": "ben",
+    "gu": "guj",
+    "kn": "kan",
+    "ml": "mal",
+    "or": "ori",
+    "pa": "pan",
+    "sd": "snd",
+    "ur": "urd",
+}
+
+
+def resolve_tesseract_lang(ocr_language):
+    if not ocr_language:
+        return "eng"
+    return TESSERACT_LANG_MAP.get(ocr_language, ocr_language)
+
+# XML 1.0 permits only tab, newline, carriage return and the printable ranges
+# below as character data. pdfminer writes each glyph's decoded character
+# straight through, so a font whose ToUnicode map has a hole - the glyph maps to
+# U+0000 - puts a raw NUL in the xml and makes the whole document unparseable
+# (seen in the Mangal subset of gazette pdfs, mid-word among real devanagari).
+ILLEGAL_XML_CHARS_RE = re.compile(
+    '[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD'
+    '\U00010000-\U0010FFFF]'
+)
 
 class ParserTool:
     def __init__(self):
@@ -17,6 +55,7 @@ class ParserTool:
     def add_opt(self, cmd, flag, value):
         if value is not None:
             cmd.extend([flag, str(value)])
+        
 
     def convert_to_xml(self,pdf_path, xml_path, pdf_type, \
                        char_margin, word_margin, line_margin):
@@ -47,9 +86,35 @@ class ParserTool:
         except subprocess.CalledProcessError as e:
             self.logger.error(f"[✖] Parse failed: {e}")
     
+    def parse_xml(self, xml_path):
+        """Parse the pdfminer xml, dropping characters XML 1.0 forbids.
+
+        A plain parse is tried first, so a well-formed file - the overwhelming
+        majority - pays nothing for this. Only when that fails is the file
+        re-read and stripped, and a failure that stripping does not explain is
+        re-raised untouched.
+        """
+        try:
+            return ET.parse(xml_path)
+        except ET.ParseError:
+            with open(xml_path, encoding='utf-8', errors='replace') as f:
+                raw = f.read()
+
+            cleaned, removed = ILLEGAL_XML_CHARS_RE.subn('', raw)
+            if not removed:
+                raise
+
+            self.logger.warning(
+                f"Dropped {removed} character(s) illegal in XML from "
+                f"{xml_path}. These are glyphs the pdf font's ToUnicode map "
+                f"does not resolve; the text they stood for is lost."
+            )
+            # back to bytes so the file's own encoding declaration still holds
+            return ET.ElementTree(ET.fromstring(cleaned.encode('utf-8')))
+
     def get_pages_from_xml(self,xml_path,start_page,end_page):
         try:
-            tree = ET.parse(xml_path)
+            tree = self.parse_xml(xml_path)
             root = tree.getroot()
             pages = root.findall(".//page")
             if not pages:
@@ -514,6 +579,9 @@ class ChromeLensParserTool:
                     f"(Attempt {attempt + 1}/{retries}): {e}"
                 )
 
+                if attempt + 1 < retries:
+                    await asyncio.sleep((attempt + 1) * 5)
+
         raise last_exception
 
     async def _build_async(self, doc, start_page, end_page):
@@ -756,6 +824,293 @@ class ChromeLensParserTool:
                                 "bbox": self._bbox_string(
                                     char_left, ch_y0, char_right, ch_y1
                                 )
+                            }
+                        )
+
+                        char_node.text = ch
+
+                        current_x = char_right
+
+                    previous_word = word
+
+        return page_el
+
+
+class TesseractParserTool:
+
+    GAP_EPSILON = 0.5
+
+    def __init__(self, pdf_path, ocr_language="en"):
+        self.logger = logging.getLogger(__name__)
+        self.pdf_path = pdf_path
+        self.tesseract_lang = resolve_tesseract_lang(ocr_language)
+        self.xml = []
+        self.total_pages = 0
+
+    def build_xml(self, start_page=None, end_page=None):
+
+        self.xml.clear()
+
+        doc = pymupdf.open(self.pdf_path)
+
+        try:
+            self.total_pages = len(doc)
+
+            if start_page is None:
+                start_page = 1
+
+            if end_page is None:
+                end_page = self.total_pages
+
+            start_page = max(1, start_page)
+            end_page = min(self.total_pages, end_page)
+
+            for page_num in range(start_page, end_page + 1):
+
+                page = doc[page_num - 1]
+
+                words = self._ocr_page(page)
+
+                page_xml = self.build_page_xml(
+                    words=words,
+                    page_number=page_num,
+                    page_width=page.rect.width,
+                    page_height=page.rect.height,
+                )
+
+                self.xml.append(page_xml)
+
+            return self.xml
+
+        finally:
+            doc.close()
+
+    def _ocr_page(self, page, dpi=300):
+
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+
+        scale = 72.0 / dpi
+        page_number = page.number + 1
+
+        words = self._words_from_png_bytes(pix.tobytes("png"), scale, page_number)
+
+        if len(words) < 3:
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            binarized = self._binarize(image)
+            buf = io.BytesIO()
+            binarized.save(buf, format="PNG")
+            words = self._words_from_png_bytes(buf.getvalue(), scale, page_number)
+
+        if len(words) < 3:
+            words = self._words_from_ghostscript(page_number, dpi)
+
+        return words
+
+    def _words_from_ghostscript(self, page_number, dpi):
+
+        scale = 72.0 / dpi
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as f:
+            command = [
+                "gs", "-q", "-dNOPAUSE", "-dBATCH", "-dSAFER",
+                f"-dFirstPage={page_number}", f"-dLastPage={page_number}",
+                f"-r{dpi}", "-sDEVICE=pnggray", "-dTextAlphaBits=4",
+                f"-sOutputFile={f.name}",
+                "-c", "save", "pop", "-f", self.pdf_path,
+            ]
+
+            try:
+                subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            except Exception as e:
+                self.logger.warning(f"Ghostscript rendering failed on page {page_number}: {e}")
+                return []
+
+            binarized = self._binarize(Image.open(f.name))
+            buf = io.BytesIO()
+            binarized.save(buf, format="PNG")
+
+        return self._words_from_png_bytes(buf.getvalue(), scale, page_number)
+
+    def _words_from_png_bytes(self, png_bytes, scale, page_number):
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=True) as f:
+            f.write(png_bytes)
+            f.flush()
+            return self._words_from_path(f.name, scale, page_number)
+
+    def _words_from_path(self, path, scale, page_number):
+
+        try:
+            data = pytesseract.image_to_data(
+                path, lang=self.tesseract_lang, output_type=pytesseract.Output.DICT
+            )
+        except Exception as e:
+            self.logger.warning(f"Tesseract OCR failed on page {page_number}: {e}")
+            return []
+
+        words = []
+
+        for i in range(len(data["text"])):
+
+            text = data["text"][i].strip()
+
+            if not text:
+                continue
+
+            left = data["left"][i] * scale
+            top = data["top"][i] * scale
+            width = data["width"][i] * scale
+            height = data["height"][i] * scale
+
+            words.append({
+                "text": text,
+                "left": left,
+                "top": top,
+                "right": left + width,
+                "bottom": top + height,
+                "block": data["block_num"][i],
+                "par": data["par_num"][i],
+                "line": data["line_num"][i],
+            })
+
+        return words
+
+    @staticmethod
+    def _binarize(image, threshold=150):
+        gray = ImageOps.autocontrast(image.convert("L"), cutoff=1)
+        return gray.point(lambda x: 0 if x < threshold else 255, "1").convert("L")
+
+    @staticmethod
+    def _flip_y(top, bottom, page_height):
+        return page_height - bottom, page_height - top
+
+    @staticmethod
+    def _bbox_string(left, top, right, bottom):
+        return f"{left:.2f},{top:.2f},{right:.2f},{bottom:.2f}"
+
+    def build_page_xml(self, words, page_number, page_width=None, page_height=None):
+
+        page_attrs = {"id": str(page_number)}
+
+        if page_width is not None and page_height is not None:
+            page_attrs["bbox"] = self._bbox_string(0, 0, page_width, page_height)
+
+        page_el = ET.Element("page", page_attrs)
+
+        if not words:
+            return page_el
+
+        blocks = {}
+        for w in words:
+            blocks.setdefault((w["block"], w["par"]), []).append(w)
+
+        textbox_id = 0
+
+        for block_key in sorted(blocks):
+
+            block_words = blocks[block_key]
+
+            block_left = min(w["left"] for w in block_words)
+            block_top = min(w["top"] for w in block_words)
+            block_right = max(w["right"] for w in block_words)
+            block_bottom = max(w["bottom"] for w in block_words)
+
+            if page_height is not None:
+                tb_y0, tb_y1 = self._flip_y(block_top, block_bottom, page_height)
+            else:
+                tb_y0, tb_y1 = block_top, block_bottom
+
+            textbox = ET.SubElement(
+                page_el,
+                "textbox",
+                {
+                    "id": str(textbox_id),
+                    "bbox": self._bbox_string(block_left, tb_y0, block_right, tb_y1),
+                }
+            )
+
+            textbox_id += 1
+
+            lines = {}
+            for w in block_words:
+                lines.setdefault(w["line"], []).append(w)
+
+            line_id = 0
+
+            for line_key in sorted(lines):
+
+                line_words = sorted(lines[line_key], key=lambda w: w["left"])
+
+                line_left = min(w["left"] for w in line_words)
+                line_top = min(w["top"] for w in line_words)
+                line_right = max(w["right"] for w in line_words)
+                line_bottom = max(w["bottom"] for w in line_words)
+
+                if page_height is not None:
+                    ln_y0, ln_y1 = self._flip_y(line_top, line_bottom, page_height)
+                else:
+                    ln_y0, ln_y1 = line_top, line_bottom
+
+                textline = ET.SubElement(
+                    textbox,
+                    "textline",
+                    {
+                        "id": str(line_id),
+                        "bbox": self._bbox_string(line_left, ln_y0, line_right, ln_y1),
+                    }
+                )
+
+                line_id += 1
+
+                previous_word = None
+
+                for word in line_words:
+
+                    left, top, right, bottom = word["left"], word["top"], word["right"], word["bottom"]
+
+                    if previous_word is not None and left > previous_word["right"] - self.GAP_EPSILON:
+
+                        sp_top = min(top, previous_word["top"])
+                        sp_bottom = max(bottom, previous_word["bottom"])
+                        sp_left = min(previous_word["right"], left)
+                        sp_right = max(previous_word["right"], left)
+
+                        if page_height is not None:
+                            sp_y0, sp_y1 = self._flip_y(sp_top, sp_bottom, page_height)
+                        else:
+                            sp_y0, sp_y1 = sp_top, sp_bottom
+
+                        space = ET.SubElement(
+                            textline,
+                            "text",
+                            {
+                                "bbox": self._bbox_string(sp_left, sp_y0, sp_right, sp_y1),
+                            }
+                        )
+
+                        space.text = " "
+
+                    text = word["text"]
+                    n_chars = len(text)
+                    word_width = max(right - left, 0.01)
+                    char_width = word_width / n_chars
+                    current_x = left
+
+                    if page_height is not None:
+                        ch_y0, ch_y1 = self._flip_y(top, bottom, page_height)
+                    else:
+                        ch_y0, ch_y1 = top, bottom
+
+                    for ch in text:
+
+                        char_left = current_x
+                        char_right = current_x + char_width
+
+                        char_node = ET.SubElement(
+                            textline,
+                            "text",
+                            {
+                                "bbox": self._bbox_string(char_left, ch_y0, char_right, ch_y1),
                             }
                         )
 
